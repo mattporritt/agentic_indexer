@@ -27,12 +27,16 @@ def test_cli_index_and_file_context(tmp_path: Path, capsys) -> None:
             str(FIXTURE_ROOT),
             "--db-path",
             str(db_path),
+            "--workers",
+            "2",
         ]
     )
     assert exit_code == 0
-    index_payload = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    index_payload = json.loads(captured.out)
     assert index_payload["status"] == "ok"
     assert index_payload["data"]["database"] == str(db_path.resolve())
+    assert "Indexing files" in captured.err
 
     exit_code = main(
         [
@@ -136,6 +140,8 @@ def test_file_context_cli_requires_only_db_path_and_file(tmp_path: Path, capsys)
             str(FIXTURE_ROOT),
             "--db-path",
             str(db_path),
+            "--workers",
+            "2",
         ]
     )
     assert exit_code == 0
@@ -156,3 +162,35 @@ def test_file_context_cli_requires_only_db_path_and_file(tmp_path: Path, capsys)
     assert payload["data"]["file"] == "mod/forum/lib.php"
     assert payload["data"]["absolute_path"] == str((FIXTURE_ROOT / "mod/forum/lib.php").resolve())
     assert "/public/" not in payload["data"]["absolute_path"]
+
+
+def test_index_cli_parallel_workers_persist_expected_components(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "parallel-index.sqlite"
+    exit_code = main(
+        [
+            "index",
+            "--moodle-path",
+            str(WRAPPER_PARENT_ROOT),
+            "--db-path",
+            str(db_path),
+            "--workers",
+            "2",
+        ]
+    )
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["components"] > 2
+    assert "Indexing files" in captured.err
+
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        components = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
+        }
+        assert {"mod_forum", "mod_assign", "tool_phpunit", "theme_boost", "enrol_manual"} <= components
+    finally:
+        connection.close()

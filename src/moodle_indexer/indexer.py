@@ -7,6 +7,8 @@ extraction, and SQLite persistence for the Phase 1 MVP.
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from moodle_indexer.extractors import (
 )
 from moodle_indexer.file_roles import classify_file_role
 from moodle_indexer.paths import normalize_relative_path
+from moodle_indexer.progress import ProgressBar
 from moodle_indexer.scanner import scan_repository
 from moodle_indexer.store import (
     initialize_database,
@@ -49,6 +52,7 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
     LOGGER.info("Scanning Moodle repository at %s", repository_root)
     files = scan_repository(repository_root)
     LOGGER.info("Discovered %d candidate files", len(files))
+    LOGGER.info("Using %d worker(s) for extraction", config.workers)
 
     connection = initialize_database(config.database_path)
     repository_id = insert_repository(connection, str(repository_root))
@@ -64,72 +68,63 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
         "tests": 0,
     }
 
-    for file_path in files:
-        relative_path = normalize_relative_path(repository_root, file_path)
-        component = infer_component(relative_path)
-        file_role = classify_file_role(relative_path)
-        if component.name not in component_cache:
-            component_id = insert_component(
+    progress = ProgressBar(total=len(files))
+    try:
+        for file_payload in _iter_file_payloads(repository_root, files, config.workers):
+            relative_path = file_payload["relative_path"]
+            component = file_payload["component"]
+            file_role = file_payload["file_role"]
+            absolute_path = file_payload["absolute_path"]
+            if component.name not in component_cache:
+                component_id = insert_component(
+                    connection,
+                    repository_id=repository_id,
+                    name=component.name,
+                    component_type=component.component_type,
+                    root_path=component.root_path,
+                )
+                component_cache[component.name] = component_id
+                counts["components"] += 1
+            component_id = component_cache[component.name]
+
+            file_id = insert_file(
                 connection,
                 repository_id=repository_id,
-                name=component.name,
-                component_type=component.component_type,
-                root_path=component.root_path,
+                component_id=component_id,
+                relative_path=relative_path,
+                absolute_path=absolute_path,
+                file_role=file_role,
+                extension=file_payload["extension"],
             )
-            component_cache[component.name] = component_id
-            counts["components"] += 1
-        component_id = component_cache[component.name]
+            counts["files"] += 1
 
-        file_id = insert_file(
-            connection,
-            repository_id=repository_id,
-            component_id=component_id,
-            relative_path=relative_path,
-            absolute_path=str(file_path.resolve()),
-            file_role=file_role,
-            extension=file_path.suffix.lower(),
-        )
-        counts["files"] += 1
-
-        source = file_path.read_text(encoding="utf-8", errors="ignore")
-
-        if is_php_file(file_path):
-            symbols, relationships = extract_php_artifacts(source, relative_path, component.name)
-            for symbol in symbols:
+            for symbol in file_payload["symbols"]:
                 insert_symbol(connection, file_id, component_id, asdict(symbol))
-            for relationship in relationships:
+            for relationship in file_payload["relationships"]:
                 insert_relationship(connection, file_id, asdict(relationship))
-            counts["symbols"] += len(symbols)
-            counts["relationships"] += len(relationships)
+            counts["symbols"] += len(file_payload["symbols"])
+            counts["relationships"] += len(file_payload["relationships"])
 
-            capabilities = extract_capabilities(source, relative_path, component.name)
-            for capability in capabilities:
+            for capability in file_payload["capabilities"]:
                 insert_capability(connection, file_id, component_id, asdict(capability))
-            counts["capabilities"] += len(capabilities)
+            counts["capabilities"] += len(file_payload["capabilities"])
 
-            capability_usages = extract_capability_usages(source, relative_path, component.name)
-            for usage in capability_usages:
+            for usage in file_payload["capability_usages"]:
                 insert_capability_usage(connection, file_id, component_id, asdict(usage))
 
-            language_string_usages = extract_language_string_usages(source, relative_path)
-            for usage in language_string_usages:
+            for usage in file_payload["language_string_usages"]:
                 insert_language_string_usage(connection, file_id, asdict(usage))
 
-            tests = extract_tests(source, relative_path, component.name)
-            for test_record in tests:
+            for test_record in file_payload["tests"]:
                 insert_test(connection, file_id, component_id, asdict(test_record))
-            counts["tests"] += len(tests)
+            counts["tests"] += len(file_payload["tests"])
 
-        strings = extract_language_strings(source, relative_path, component.name)
-        for language_string in strings:
-            insert_language_string(connection, file_id, component_id, asdict(language_string))
-        counts["language_strings"] += len(strings)
-
-        if file_role in {"behat_feature", "behat_context"} and not is_php_file(file_path):
-            tests = extract_tests(source, relative_path, component.name)
-            for test_record in tests:
-                insert_test(connection, file_id, component_id, asdict(test_record))
-            counts["tests"] += len(tests)
+            for language_string in file_payload["language_strings"]:
+                insert_language_string(connection, file_id, component_id, asdict(language_string))
+            counts["language_strings"] += len(file_payload["language_strings"])
+            progress.advance()
+    finally:
+        progress.close()
 
     connection.commit()
     connection.close()
@@ -138,4 +133,72 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
         "repository": str(repository_root),
         "database": str(config.database_path),
         **counts,
+    }
+
+
+def _iter_file_payloads(
+    repository_root: Path,
+    files: list[Path],
+    workers: int,
+):
+    """Yield extracted file payloads in input order.
+
+    Extraction work benefits from concurrent file I/O and parsing, while the
+    main process keeps SQLite writes serialized and deterministic.
+    """
+
+    if workers == 1:
+        for file_path in files:
+            yield _process_file_for_indexing(repository_root, file_path)
+        return
+
+    max_workers = max(1, min(workers, len(files), os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        yield from executor.map(
+            _process_file_for_indexing,
+            [repository_root] * len(files),
+            files,
+            chunksize=32,
+        )
+
+
+def _process_file_for_indexing(repository_root: Path, file_path: Path) -> dict:
+    """Extract all indexable artifacts for one file."""
+
+    relative_path = normalize_relative_path(repository_root, file_path)
+    component = infer_component(relative_path)
+    file_role = classify_file_role(relative_path)
+    source = file_path.read_text(encoding="utf-8", errors="ignore")
+
+    symbols = []
+    relationships = []
+    capabilities = []
+    capability_usages = []
+    language_string_usages = []
+    tests = []
+
+    if is_php_file(file_path):
+        symbols, relationships = extract_php_artifacts(source, relative_path, component.name)
+        capabilities = extract_capabilities(source, relative_path, component.name)
+        capability_usages = extract_capability_usages(source, relative_path, component.name)
+        language_string_usages = extract_language_string_usages(source, relative_path)
+        tests = extract_tests(source, relative_path, component.name)
+
+    language_strings = extract_language_strings(source, relative_path, component.name)
+    if file_role in {"behat_feature", "behat_context"} and not is_php_file(file_path):
+        tests = extract_tests(source, relative_path, component.name)
+
+    return {
+        "absolute_path": str(file_path.resolve()),
+        "capabilities": capabilities,
+        "capability_usages": capability_usages,
+        "component": component,
+        "extension": file_path.suffix.lower(),
+        "file_role": file_role,
+        "language_strings": language_strings,
+        "language_string_usages": language_string_usages,
+        "relative_path": relative_path,
+        "relationships": relationships,
+        "symbols": symbols,
+        "tests": tests,
     }

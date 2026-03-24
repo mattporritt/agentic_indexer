@@ -14,12 +14,13 @@ class IndexConfig:
 
     moodle_root: Path
     database_path: Path
+    workers: int = 1
 
 
 MOODLE_ROOT_MARKERS = ("admin", "lib", "mod")
 
 
-def build_index_config(moodle_root: str, database_path: str) -> IndexConfig:
+def build_index_config(moodle_root: str, database_path: str, workers: int = 1) -> IndexConfig:
     """Validate CLI arguments and return a normalized index configuration.
 
     The CLI prefers the exact Moodle webroot. If the supplied path is a wrapper
@@ -37,8 +38,10 @@ def build_index_config(moodle_root: str, database_path: str) -> IndexConfig:
     db_path = Path(database_path).expanduser().resolve()
     if db_path.exists() and db_path.is_dir():
         raise ValidationError(f"Database path points to a directory: {db_path}")
+    if workers < 1:
+        raise ValidationError(f"Worker count must be at least 1, got: {workers}")
 
-    return IndexConfig(moodle_root=root, database_path=db_path)
+    return IndexConfig(moodle_root=root, database_path=db_path, workers=workers)
 
 
 def _detect_effective_moodle_root(candidate: Path) -> Path:

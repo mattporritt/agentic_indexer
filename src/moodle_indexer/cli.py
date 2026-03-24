@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     index_parser = subparsers.add_parser("index", help="Build or rebuild the SQLite index.")
     index_parser.add_argument("--moodle-path", required=True, help="Path to the local Moodle checkout.")
     index_parser.add_argument("--db-path", required=True, help="Path to the SQLite database file to create.")
+    index_parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(8, os.cpu_count() or 1)),
+        help="Number of worker processes to use for parallel extraction. Higher values use more CPU.",
+    )
 
     find_parser = subparsers.add_parser("find-symbol", help="Find symbol definitions by name or fully qualified name.")
     find_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
@@ -67,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "index":
-            payload = run_index(args.moodle_path, args.db_path)
+            payload = run_index(args.moodle_path, args.db_path, args.workers)
         elif args.command == "find-symbol":
             payload = run_find_symbol(args.db_path, args.symbol)
         elif args.command == "file-context":
@@ -89,10 +96,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def run_index(moodle_path: str, db_path: str) -> dict:
+def run_index(moodle_path: str, db_path: str, workers: int) -> dict:
     """Execute the ``index`` command."""
 
-    config = build_index_config(moodle_path, db_path)
+    config = build_index_config(moodle_path, db_path, workers=workers)
     result = build_index(config)
     return success_payload("index", result)
 

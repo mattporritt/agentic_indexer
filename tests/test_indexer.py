@@ -87,7 +87,7 @@ def test_capability_and_language_string_extractors_capture_metadata() -> None:
 
 def test_build_index_and_query_endpoints(tmp_path: Path) -> None:
     db_path = tmp_path / "moodle-index.sqlite"
-    result = build_index(build_index_config(str(FIXTURE_ROOT), str(db_path)))
+    result = build_index(build_index_config(str(FIXTURE_ROOT), str(db_path), workers=2))
 
     assert result["files"] >= 10
     assert result["components"] >= 2
@@ -169,7 +169,7 @@ def test_build_index_and_query_endpoints(tmp_path: Path) -> None:
 
 def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefixes(tmp_path: Path) -> None:
     db_path = tmp_path / "wrapped.sqlite"
-    result = build_index(build_index_config(str(WRAPPED_FIXTURE_ROOT), str(db_path)))
+    result = build_index(build_index_config(str(WRAPPED_FIXTURE_ROOT), str(db_path), workers=2))
     assert result["components"] >= 6
 
     connection = open_database(db_path)
@@ -235,7 +235,7 @@ def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefix
 
 def test_index_pipeline_detects_nested_public_moodle_root(tmp_path: Path) -> None:
     db_path = tmp_path / "detected.sqlite"
-    result = build_index(build_index_config(str(WRAPPER_PARENT_ROOT), str(db_path)))
+    result = build_index(build_index_config(str(WRAPPER_PARENT_ROOT), str(db_path), workers=2))
 
     assert result["repository"] == str(WRAPPED_FIXTURE_ROOT.resolve())
 

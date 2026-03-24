@@ -113,7 +113,8 @@ Build a fresh index:
 ```bash
 moodle-indexer index \
   --moodle-path /path/to/moodle \
-  --db-path /path/to/moodle-index.sqlite
+  --db-path /path/to/moodle-index.sqlite \
+  --workers 8
 ```
 
 Find a symbol:
@@ -233,6 +234,8 @@ JSON output is deterministic:
 - predictable list ordering in query responses
 
 `file-context` uses the repository metadata stored in the SQLite index. After indexing, it only needs `--db-path` and a repo-relative `--file` value such as `mod/forum/lib.php`.
+
+During `index`, the CLI now emits a progress bar on stderr so long-running rebuilds are easier to monitor. The `--workers` option controls parallel extraction throughput; higher values usually improve indexing speed at the cost of more CPU usage.
 
 ## Moodle Component Coverage
 
