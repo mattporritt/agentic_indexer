@@ -106,6 +106,8 @@ The tool does not assume it lives beside the Moodle checkout. Always pass the Mo
 
 The path you pass with `--moodle-path` is the source of truth for stored file paths. If you point the CLI at the actual Moodle web root, indexed paths are stored relative to that exact directory, for example `mod/forum/lib.php` rather than an accidental wrapper prefix such as `public/mod/forum/lib.php`.
 
+If you accidentally point the CLI at a one-level hosting wrapper that contains a single obvious Moodle root such as `public/`, the indexer will detect that nested Moodle root and still persist repo-relative paths like `mod/forum/lib.php`.
+
 Build a fresh index:
 
 ```bash

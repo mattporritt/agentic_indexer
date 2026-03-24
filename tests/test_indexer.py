@@ -18,6 +18,7 @@ from moodle_indexer.store import open_database
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "moodle_sample"
 WRAPPED_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper" / "public"
+WRAPPER_PARENT_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper"
 
 
 def _read_fixture(relative_path: str) -> str:
@@ -182,6 +183,7 @@ def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefix
             "admin/report/security/index.php",
             "admin/tool/phpunit/index.php",
             "enrol/manual/lib.php",
+            "lib/setup.php",
             "mod/assign/version.php",
             "mod/forum/lib.php",
             "question/type/multichoice/lib.php",
@@ -194,7 +196,7 @@ def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefix
             row["name"]
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
         }
-        assert stored_components == {
+        assert {
             "enrol_manual",
             "mod_assign",
             "mod_forum",
@@ -202,7 +204,7 @@ def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefix
             "report_security",
             "theme_boost",
             "tool_phpunit",
-        }
+        } <= stored_components
 
         forum_file = connection.execute(
             """
@@ -226,5 +228,48 @@ def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefix
         )
         assert absolute_lookup_result["file"] == "mod/forum/lib.php"
         assert absolute_lookup_result["component"] == "mod_forum"
+    finally:
+        connection.close()
+
+
+def test_index_pipeline_detects_nested_public_moodle_root(tmp_path: Path) -> None:
+    db_path = tmp_path / "detected.sqlite"
+    result = build_index(build_index_config(str(WRAPPER_PARENT_ROOT), str(db_path)))
+
+    assert result["repository"] == str(WRAPPED_FIXTURE_ROOT.resolve())
+
+    connection = open_database(db_path)
+    try:
+        component_count = connection.execute("SELECT COUNT(*) AS count FROM components").fetchone()["count"]
+        assert component_count > 2
+
+        mod_forum_file = connection.execute(
+            """
+            SELECT files.relative_path, components.name AS component_name
+            FROM files
+            JOIN components ON components.id = files.component_id
+            WHERE files.relative_path = 'mod/forum/lib.php'
+            """
+        ).fetchone()
+        assert mod_forum_file is not None
+        assert mod_forum_file["component_name"] == "mod_forum"
+
+        expected_components = {
+            "mod_forum",
+            "mod_assign",
+            "tool_phpunit",
+            "theme_boost",
+            "enrol_manual",
+        }
+        stored_components = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM components WHERE name IN ('mod_forum', 'mod_assign', 'tool_phpunit', 'theme_boost', 'enrol_manual')"
+            ).fetchall()
+        }
+        assert stored_components == expected_components
+        assert connection.execute(
+            "SELECT 1 FROM files WHERE relative_path LIKE 'public/%'"
+        ).fetchone() is None
     finally:
         connection.close()

@@ -135,7 +135,7 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
     connection.close()
 
     return {
-        "repository": str(config.moodle_root),
+        "repository": str(repository_root),
         "database": str(config.database_path),
         **counts,
     }

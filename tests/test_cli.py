@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 from moodle_indexer.cli import main
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "moodle_sample"
+WRAPPER_PARENT_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_cli_index_and_file_context(tmp_path: Path, capsys) -> None:
@@ -64,3 +70,58 @@ def test_cli_index_and_file_context(tmp_path: Path, capsys) -> None:
         item["type"] == "extends" and item["target"] == "\\external_api"
         for item in symbol_payload["data"]["matches"][0]["relationships"]
     )
+
+
+def test_python_module_index_command_persists_plugin_components_from_wrapper_root(tmp_path: Path) -> None:
+    db_path = tmp_path / "cli-wrapper.sqlite"
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    src_path = str(PROJECT_ROOT / "src")
+    env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}{os.pathsep}{existing_pythonpath}"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "moodle_indexer",
+            "index",
+            "--moodle-path",
+            str(WRAPPER_PARENT_ROOT),
+            "--db-path",
+            str(db_path),
+        ],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "ok"
+    assert payload["data"]["repository"].endswith("tests/fixtures/hosting_wrapper/public")
+
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        components = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM components ORDER BY name"
+            ).fetchall()
+        }
+        assert {"mod_forum", "mod_assign", "tool_phpunit", "theme_boost", "enrol_manual"} <= components
+
+        forum_row = connection.execute(
+            """
+            SELECT files.relative_path, components.name AS component_name
+            FROM files
+            JOIN components ON components.id = files.component_id
+            WHERE files.relative_path = 'mod/forum/lib.php'
+            """
+        ).fetchone()
+        assert forum_row is not None
+        assert forum_row["component_name"] == "mod_forum"
+    finally:
+        connection.close()
