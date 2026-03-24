@@ -117,18 +117,19 @@ def test_build_index_and_query_endpoints(tmp_path: Path) -> None:
             for item in method_result["matches"][0]["relationships"]
         )
 
-        access_context = file_context(connection, FIXTURE_ROOT, "mod/forum/db/access.php")
+        access_context = file_context(connection, "mod/forum/db/access.php")
         assert access_context["component"] == "mod_forum"
         assert access_context["file_role"] == "access_definition"
         assert access_context["capabilities"][0]["name"] == "mod/forum:viewdiscussion"
         assert access_context["capabilities"][0]["archetypes"]["student"] == "CAP_ALLOW"
+        assert access_context["absolute_path"] == str((FIXTURE_ROOT / "mod/forum/db/access.php").resolve())
         assert any(
             suggestion["path"] == "mod/forum/lang/en/mod_forum.php"
             and suggestion["reason"]
             for suggestion in access_context["related_suggestions"]
         )
 
-        renderer_context = file_context(connection, FIXTURE_ROOT, "mod/forum/renderer.php")
+        renderer_context = file_context(connection, "mod/forum/renderer.php")
         assert renderer_context["string_usages"] == [
             {"component_name": "mod_forum", "line": 8, "string_key": "pluginname"}
         ]
@@ -137,7 +138,7 @@ def test_build_index_and_query_endpoints(tmp_path: Path) -> None:
             for relationship in renderer_context["relationships"]
         )
 
-        lib_context = file_context(connection, FIXTURE_ROOT, "mod/forum/lib.php")
+        lib_context = file_context(connection, "mod/forum/lib.php")
         assert lib_context["capability_checks"] == [
             {
                 "capability_name": "mod/forum:viewdiscussion",
@@ -217,13 +218,13 @@ def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefix
         assert forum_file is not None
         assert forum_file["component_name"] == "mod_forum"
 
-        file_context_result = file_context(connection, WRAPPED_FIXTURE_ROOT, "mod/forum/lib.php")
+        file_context_result = file_context(connection, "mod/forum/lib.php")
         assert file_context_result["file"] == "mod/forum/lib.php"
         assert file_context_result["component"] == "mod_forum"
+        assert file_context_result["absolute_path"] == str((WRAPPED_FIXTURE_ROOT / "mod/forum/lib.php").resolve())
 
         absolute_lookup_result = file_context(
             connection,
-            WRAPPED_FIXTURE_ROOT,
             str(WRAPPED_FIXTURE_ROOT / "mod" / "forum" / "lib.php"),
         )
         assert absolute_lookup_result["file"] == "mod/forum/lib.php"

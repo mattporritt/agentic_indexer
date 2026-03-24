@@ -39,8 +39,6 @@ def test_cli_index_and_file_context(tmp_path: Path, capsys) -> None:
             "file-context",
             "--db-path",
             str(db_path),
-            "--moodle-path",
-            str(FIXTURE_ROOT),
             "--file",
             "mod/forum/renderer.php",
         ]
@@ -50,6 +48,8 @@ def test_cli_index_and_file_context(tmp_path: Path, capsys) -> None:
     assert context_payload["status"] == "ok"
     assert context_payload["data"]["file_role"] == "renderer_file"
     assert context_payload["data"]["component"] == "mod_forum"
+    assert context_payload["data"]["absolute_path"] == str((FIXTURE_ROOT / "mod/forum/renderer.php").resolve())
+    assert "/public/" not in context_payload["data"]["absolute_path"]
     assert context_payload["data"]["string_usages"] == [
         {"component_name": "mod_forum", "line": 8, "string_key": "pluginname"}
     ]
@@ -125,3 +125,34 @@ def test_python_module_index_command_persists_plugin_components_from_wrapper_roo
         assert forum_row["component_name"] == "mod_forum"
     finally:
         connection.close()
+
+
+def test_file_context_cli_requires_only_db_path_and_file(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "index.sqlite"
+    exit_code = main(
+        [
+            "index",
+            "--moodle-path",
+            str(FIXTURE_ROOT),
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    assert exit_code == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "file-context",
+            "--db-path",
+            str(db_path),
+            "--file",
+            "mod/forum/lib.php",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["file"] == "mod/forum/lib.php"
+    assert payload["data"]["absolute_path"] == str((FIXTURE_ROOT / "mod/forum/lib.php").resolve())
+    assert "/public/" not in payload["data"]["absolute_path"]

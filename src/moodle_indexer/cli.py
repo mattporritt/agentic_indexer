@@ -38,7 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
-    file_parser.add_argument("--moodle-path", required=True, help="Path to the indexed Moodle checkout.")
     file_parser.add_argument("--file", required=True, help="Repository-relative or absolute file path.")
 
     component_parser = subparsers.add_parser("component-summary", help="Summarize one Moodle component.")
@@ -72,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "find-symbol":
             payload = run_find_symbol(args.db_path, args.symbol)
         elif args.command == "file-context":
-            payload = run_file_context(args.db_path, args.moodle_path, args.file)
+            payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
             payload = run_component_summary(args.db_path, args.component)
         elif args.command == "suggest-related":
@@ -108,15 +107,12 @@ def run_find_symbol(db_path: str, symbol: str) -> dict:
         connection.close()
 
 
-def run_file_context(db_path: str, moodle_path: str, file_path: str) -> dict:
+def run_file_context(db_path: str, file_path: str) -> dict:
     """Execute the ``file-context`` command."""
 
     connection = open_database(Path(db_path).expanduser().resolve())
     try:
-        return success_payload(
-            "file-context",
-            file_context(connection, Path(moodle_path).expanduser().resolve(), file_path),
-        )
+        return success_payload("file-context", file_context(connection, file_path))
     finally:
         connection.close()
 

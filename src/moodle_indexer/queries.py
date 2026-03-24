@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 from moodle_indexer.errors import ValidationError
-from moodle_indexer.paths import normalize_relative_lookup_path, resolve_user_file_input
+from moodle_indexer.paths import normalize_relative_lookup_path
 from moodle_indexer.suggestions import suggest_related_files
 
 
@@ -91,9 +91,15 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
     return {"query": symbol_name, "matches": matches}
 
 
-def file_context(connection: sqlite3.Connection, repository_root: Path, file_path: str) -> dict:
-    """Return indexed metadata for one repository file."""
+def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
+    """Return indexed metadata for one repository file.
 
+    Query-time path resolution uses the repository metadata stored in SQLite so
+    the CLI does not depend on a fresh ``--moodle-path`` argument after the
+    index has been built.
+    """
+
+    repository_root = _get_indexed_repository_root(connection)
     relative_path = _resolve_lookup_relative_path(connection, repository_root, file_path)
 
     row = connection.execute(
@@ -186,7 +192,7 @@ def file_context(connection: sqlite3.Connection, repository_root: Path, file_pat
 
     return {
         "file": row["relative_path"],
-        "absolute_path": row["absolute_path"],
+        "absolute_path": str((repository_root / row["relative_path"]).resolve()),
         "component": row["component_name"],
         "file_role": row["file_role"],
         "extension": row["extension"],
@@ -357,17 +363,21 @@ def _resolve_lookup_relative_path(
         return normalize_relative_lookup_path(file_path)
 
     resolved = candidate.resolve()
-    roots_to_try = [repository_root.resolve()]
-    stored_root_row = connection.execute("SELECT root_path FROM repositories ORDER BY id LIMIT 1").fetchone()
-    if stored_root_row is not None:
-        stored_root = Path(stored_root_row["root_path"]).resolve()
-        if stored_root not in roots_to_try:
-            roots_to_try.append(stored_root)
-
-    for root in roots_to_try:
+    for root in [repository_root.resolve()]:
         try:
             return resolved.relative_to(root).as_posix()
         except ValueError:
             continue
 
     raise ValidationError(f"File path is outside the indexed repository: {resolved}")
+
+
+def _get_indexed_repository_root(connection: sqlite3.Connection) -> Path:
+    """Return the repository root recorded in the SQLite index."""
+
+    row = connection.execute(
+        "SELECT root_path FROM repositories ORDER BY id LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise ValidationError("Indexed repository metadata not found in database.")
+    return Path(row["root_path"]).resolve()

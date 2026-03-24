@@ -129,7 +129,6 @@ Inspect a file:
 ```bash
 moodle-indexer file-context \
   --db-path /path/to/moodle-index.sqlite \
-  --moodle-path /path/to/moodle \
   --file mod/forum/renderer.php
 ```
 
@@ -232,6 +231,8 @@ JSON output is deterministic:
 - stable top-level success/error envelopes
 - sorted object keys
 - predictable list ordering in query responses
+
+`file-context` uses the repository metadata stored in the SQLite index. After indexing, it only needs `--db-path` and a repo-relative `--file` value such as `mod/forum/lib.php`.
 
 ## Moodle Component Coverage
 
