@@ -19,7 +19,10 @@ SCHEMA_STATEMENTS = [
     """
     CREATE TABLE repositories (
         id INTEGER PRIMARY KEY,
-        root_path TEXT NOT NULL UNIQUE,
+        input_path TEXT NOT NULL,
+        repository_root TEXT NOT NULL UNIQUE,
+        application_root TEXT NOT NULL,
+        layout_type TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """,
@@ -38,11 +41,13 @@ SCHEMA_STATEMENTS = [
         id INTEGER PRIMARY KEY,
         repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
         component_id INTEGER NOT NULL REFERENCES components(id) ON DELETE CASCADE,
-        relative_path TEXT NOT NULL,
+        repository_relative_path TEXT NOT NULL,
+        moodle_path TEXT NOT NULL,
+        path_scope TEXT NOT NULL,
         absolute_path TEXT NOT NULL,
         file_role TEXT NOT NULL,
         extension TEXT NOT NULL,
-        UNIQUE(repository_id, relative_path)
+        UNIQUE(repository_id, repository_relative_path)
     );
     """,
     """
@@ -125,7 +130,10 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX idx_files_component_id ON files(component_id);
     """,
     """
-    CREATE INDEX idx_files_relative_path ON files(relative_path);
+    CREATE INDEX idx_files_repository_relative_path ON files(repository_relative_path);
+    """,
+    """
+    CREATE INDEX idx_files_moodle_path ON files(moodle_path);
     """,
     """
     CREATE INDEX idx_symbols_name ON symbols(name);
@@ -170,10 +178,22 @@ def open_database(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def insert_repository(connection: sqlite3.Connection, root_path: str) -> int:
+def insert_repository(
+    connection: sqlite3.Connection,
+    input_path: str,
+    repository_root: str,
+    application_root: str,
+    layout_type: str,
+) -> int:
     """Insert the repository row and return its id."""
 
-    cursor = connection.execute("INSERT INTO repositories (root_path) VALUES (?)", (root_path,))
+    cursor = connection.execute(
+        """
+        INSERT INTO repositories (input_path, repository_root, application_root, layout_type)
+        VALUES (?, ?, ?, ?)
+        """,
+        (input_path, repository_root, application_root, layout_type),
+    )
     return int(cursor.lastrowid)
 
 
@@ -206,7 +226,9 @@ def insert_file(
     connection: sqlite3.Connection,
     repository_id: int,
     component_id: int,
-    relative_path: str,
+    repository_relative_path: str,
+    moodle_path: str,
+    path_scope: str,
     absolute_path: str,
     file_role: str,
     extension: str,
@@ -215,10 +237,28 @@ def insert_file(
 
     cursor = connection.execute(
         """
-        INSERT INTO files (repository_id, component_id, relative_path, absolute_path, file_role, extension)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO files (
+            repository_id,
+            component_id,
+            repository_relative_path,
+            moodle_path,
+            path_scope,
+            absolute_path,
+            file_role,
+            extension
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (repository_id, component_id, relative_path, absolute_path, file_role, extension),
+        (
+            repository_id,
+            component_id,
+            repository_relative_path,
+            moodle_path,
+            path_scope,
+            absolute_path,
+            file_role,
+            extension,
+        ),
     )
     return int(cursor.lastrowid)
 

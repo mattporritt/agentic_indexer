@@ -104,9 +104,33 @@ pip install -e .
 
 The tool does not assume it lives beside the Moodle checkout. Always pass the Moodle repository path explicitly.
 
-The path you pass with `--moodle-path` is the source of truth for stored file paths. If you point the CLI at the actual Moodle web root, indexed paths are stored relative to that exact directory, for example `mod/forum/lib.php` rather than an accidental wrapper prefix such as `public/mod/forum/lib.php`.
+The path you pass with `--moodle-path` is always treated as the repository root.
 
-If you accidentally point the CLI at a one-level hosting wrapper that contains a single obvious Moodle root such as `public/`, the indexer will detect that nested Moodle root and still persist repo-relative paths like `mod/forum/lib.php`.
+The indexer separately detects an application root:
+
+- classic Moodle 5.0-style layout:
+  repository root and application root are the same directory
+- split Moodle 5.1-style layout:
+  repository root is the checkout path you passed, while application root is typically `<repository_root>/public`
+
+This means the index stores two path views for each file:
+
+- `repository_relative_path`: the real on-disk path relative to the repository root
+- `moodle_path`: the Moodle-native path relative to the application root when the file lives under it
+
+Examples:
+
+- classic layout:
+  - repository-relative `mod/forum/lib.php`
+  - moodle path `mod/forum/lib.php`
+- split layout:
+  - repository-relative `public/mod/forum/lib.php`
+  - moodle path `mod/forum/lib.php`
+- repository-level file outside `public/`:
+  - repository-relative `admin/cli/install_database.php`
+  - moodle path `admin/cli/install_database.php`
+
+User-facing lookups such as `file-context` prefer the Moodle-native path where that is the most natural interface, so `mod/forum/lib.php` continues to work in both classic and split layouts.
 
 Build a fresh index:
 
@@ -131,6 +155,14 @@ Inspect a file:
 moodle-indexer file-context \
   --db-path /path/to/moodle-index.sqlite \
   --file mod/forum/renderer.php
+```
+
+Files outside the application root can also be queried directly:
+
+```bash
+moodle-indexer file-context \
+  --db-path /path/to/moodle-index.sqlite \
+  --file admin/cli/install_database.php
 ```
 
 Summarize a component:
@@ -198,9 +230,15 @@ python -m moodle_indexer --help
   "command": "file-context",
   "status": "ok",
   "data": {
+    "application_root": "/path/to/moodle/public",
+    "repository_root": "/path/to/moodle",
     "component": "mod_forum",
     "file": "mod/forum/lib.php",
+    "absolute_path": "/path/to/moodle/public/mod/forum/lib.php",
     "file_role": "lib_file",
+    "moodle_path": "mod/forum/lib.php",
+    "path_scope": "application",
+    "repository_relative_path": "public/mod/forum/lib.php",
     "capability_checks": [
       {
         "capability_name": "mod/forum:viewdiscussion",
@@ -233,7 +271,18 @@ JSON output is deterministic:
 - sorted object keys
 - predictable list ordering in query responses
 
-`file-context` uses the repository metadata stored in the SQLite index. After indexing, it only needs `--db-path` and a repo-relative `--file` value such as `mod/forum/lib.php`.
+`index` reports the paths it detected so you can see exactly what was indexed:
+
+- `input_path`: the raw CLI value passed to `--moodle-path`
+- `repository_root`: the normalized checkout root used for scanning
+- `application_root`: the detected Moodle application root used for Moodle-native paths
+- `layout_type`: `classic` or `split_public`
+
+`file-context` uses the repository metadata stored in the SQLite index. After indexing, it only needs `--db-path` and a `--file` value that is either:
+
+- a Moodle-native path such as `mod/forum/lib.php`
+- a repository-relative path such as `public/mod/forum/lib.php`
+- an absolute path inside the indexed repository
 
 During `index`, the CLI now emits a progress bar on stderr so long-running rebuilds are easier to monitor. The `--workers` option controls parallel extraction throughput; higher values usually improve indexing speed at the cost of more CPU usage.
 
@@ -268,7 +317,7 @@ For non-plugin paths, the indexer falls back to sensible core subsystem mapping 
 
 ## Testing
 
-The test suite uses a synthetic Moodle-like fixture tree under `tests/fixtures/moodle_sample/`. It does not require a full Moodle checkout.
+The test suite uses synthetic Moodle-like fixture trees for both classic and split layouts under `tests/fixtures/`. It does not require a full Moodle checkout.
 
 Run tests with:
 
@@ -284,6 +333,7 @@ The current suite validates:
 - capability extraction
 - language string extraction
 - file-context output
+- repository-root vs application-root path semantics
 - component-summary output
 - related-file suggestion explanations
 - CLI JSON output
@@ -294,7 +344,7 @@ The repository also includes a root `_smoke_test/` directory reserved for genera
 
 - PHP parsing is pragmatic rather than fully semantic. The project prefers parser-based extraction when available and falls back to resilient text-based extraction when needed.
 - Relationship extraction is structural, not a full call graph.
-- Component inference covers common Moodle layouts and core subsystem mappings, but it is not yet a complete model of every Moodle convention.
+- Component inference covers common Moodle layouts, split `public/` application roots, and core subsystem mappings, but it is not yet a complete model of every Moodle convention.
 - Related-file suggestions are deterministic heuristics, not ranked by usage data.
 - Indexing is rebuild-only in Phase 1.
 

@@ -24,7 +24,7 @@ from moodle_indexer.extractors import (
     is_php_file,
 )
 from moodle_indexer.file_roles import classify_file_role
-from moodle_indexer.paths import normalize_relative_path
+from moodle_indexer.paths import build_indexed_paths
 from moodle_indexer.progress import ProgressBar
 from moodle_indexer.scanner import scan_repository
 from moodle_indexer.store import (
@@ -48,14 +48,22 @@ LOGGER = logging.getLogger(__name__)
 def build_index(config: IndexConfig) -> dict[str, int | str]:
     """Build a fresh SQLite index for the target Moodle repository."""
 
-    repository_root = config.moodle_root.resolve(strict=True)
+    repository_root = config.repository_root.resolve(strict=True)
+    application_root = config.application_root.resolve(strict=True)
     LOGGER.info("Scanning Moodle repository at %s", repository_root)
+    LOGGER.info("Application root detected at %s", application_root)
     files = scan_repository(repository_root)
     LOGGER.info("Discovered %d candidate files", len(files))
     LOGGER.info("Using %d worker(s) for extraction", config.workers)
 
     connection = initialize_database(config.database_path)
-    repository_id = insert_repository(connection, str(repository_root))
+    repository_id = insert_repository(
+        connection,
+        input_path=config.input_path,
+        repository_root=str(repository_root),
+        application_root=str(application_root),
+        layout_type=config.layout_type,
+    )
 
     component_cache: dict[str, int] = {}
     counts = {
@@ -70,8 +78,9 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
 
     progress = ProgressBar(total=len(files))
     try:
-        for file_payload in _iter_file_payloads(repository_root, files, config.workers):
-            relative_path = file_payload["relative_path"]
+        for file_payload in _iter_file_payloads(repository_root, application_root, files, config.workers):
+            repository_relative_path = file_payload["repository_relative_path"]
+            moodle_path = file_payload["moodle_path"]
             component = file_payload["component"]
             file_role = file_payload["file_role"]
             absolute_path = file_payload["absolute_path"]
@@ -91,7 +100,9 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
                 connection,
                 repository_id=repository_id,
                 component_id=component_id,
-                relative_path=relative_path,
+                repository_relative_path=repository_relative_path,
+                moodle_path=moodle_path,
+                path_scope=file_payload["path_scope"],
                 absolute_path=absolute_path,
                 file_role=file_role,
                 extension=file_payload["extension"],
@@ -131,6 +142,10 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
 
     return {
         "repository": str(repository_root),
+        "input_path": config.input_path,
+        "repository_root": str(repository_root),
+        "application_root": str(application_root),
+        "layout_type": config.layout_type,
         "database": str(config.database_path),
         **counts,
     }
@@ -138,6 +153,7 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
 
 def _iter_file_payloads(
     repository_root: Path,
+    application_root: Path,
     files: list[Path],
     workers: int,
 ):
@@ -149,7 +165,7 @@ def _iter_file_payloads(
 
     if workers == 1:
         for file_path in files:
-            yield _process_file_for_indexing(repository_root, file_path)
+            yield _process_file_for_indexing(repository_root, application_root, file_path)
         return
 
     max_workers = max(1, min(workers, len(files), os.cpu_count() or 1))
@@ -157,17 +173,18 @@ def _iter_file_payloads(
         yield from executor.map(
             _process_file_for_indexing,
             [repository_root] * len(files),
+            [application_root] * len(files),
             files,
             chunksize=32,
         )
 
 
-def _process_file_for_indexing(repository_root: Path, file_path: Path) -> dict:
+def _process_file_for_indexing(repository_root: Path, application_root: Path, file_path: Path) -> dict:
     """Extract all indexable artifacts for one file."""
 
-    relative_path = normalize_relative_path(repository_root, file_path)
-    component = infer_component(relative_path)
-    file_role = classify_file_role(relative_path)
+    indexed_paths = build_indexed_paths(repository_root, application_root, file_path)
+    component = infer_component(indexed_paths.moodle_path)
+    file_role = classify_file_role(indexed_paths.moodle_path)
     source = file_path.read_text(encoding="utf-8", errors="ignore")
 
     symbols = []
@@ -178,15 +195,15 @@ def _process_file_for_indexing(repository_root: Path, file_path: Path) -> dict:
     tests = []
 
     if is_php_file(file_path):
-        symbols, relationships = extract_php_artifacts(source, relative_path, component.name)
-        capabilities = extract_capabilities(source, relative_path, component.name)
-        capability_usages = extract_capability_usages(source, relative_path, component.name)
-        language_string_usages = extract_language_string_usages(source, relative_path)
-        tests = extract_tests(source, relative_path, component.name)
+        symbols, relationships = extract_php_artifacts(source, indexed_paths.moodle_path, component.name)
+        capabilities = extract_capabilities(source, indexed_paths.moodle_path, component.name)
+        capability_usages = extract_capability_usages(source, indexed_paths.moodle_path, component.name)
+        language_string_usages = extract_language_string_usages(source, indexed_paths.moodle_path)
+        tests = extract_tests(source, indexed_paths.moodle_path, component.name)
 
-    language_strings = extract_language_strings(source, relative_path, component.name)
+    language_strings = extract_language_strings(source, indexed_paths.moodle_path, component.name)
     if file_role in {"behat_feature", "behat_context"} and not is_php_file(file_path):
-        tests = extract_tests(source, relative_path, component.name)
+        tests = extract_tests(source, indexed_paths.moodle_path, component.name)
 
     return {
         "absolute_path": str(file_path.resolve()),
@@ -197,7 +214,9 @@ def _process_file_for_indexing(repository_root: Path, file_path: Path) -> dict:
         "file_role": file_role,
         "language_strings": language_strings,
         "language_string_usages": language_string_usages,
-        "relative_path": relative_path,
+        "moodle_path": indexed_paths.moodle_path,
+        "path_scope": indexed_paths.path_scope,
+        "repository_relative_path": indexed_paths.repository_relative_path,
         "relationships": relationships,
         "symbols": symbols,
         "tests": tests,

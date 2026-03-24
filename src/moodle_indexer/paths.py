@@ -1,4 +1,4 @@
-"""Utilities for normalizing repository-relative paths.
+"""Utilities for repository-relative and Moodle-native paths.
 
 Moodle indexing should be independent of the process working directory, so all
 path transformations flow through this module.
@@ -6,17 +6,23 @@ path transformations flow through this module.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from moodle_indexer.errors import ValidationError
 
 
-def normalize_relative_path(root: Path, file_path: Path) -> str:
-    """Return a stable POSIX-style path relative to the repository root.
+@dataclass(slots=True)
+class IndexedPaths:
+    """Both path views stored for one indexed file."""
 
-    Both paths are resolved before comparison so the index stores one canonical
-    repo-relative path shape regardless of the current working directory.
-    """
+    repository_relative_path: str
+    moodle_path: str
+    path_scope: str
+
+
+def normalize_relative_path(root: Path, file_path: Path) -> str:
+    """Return a stable POSIX-style path relative to a chosen root."""
 
     resolved_root = root.resolve(strict=True)
     resolved_file = file_path.resolve(strict=True)
@@ -37,10 +43,28 @@ def normalize_relative_lookup_path(file_path: str) -> str:
     return normalized.lstrip("/")
 
 
-def resolve_user_file_input(root: Path, file_path: str) -> Path:
-    """Resolve a CLI file input relative to the indexed Moodle root."""
+def build_indexed_paths(repository_root: Path, application_root: Path, file_path: Path) -> IndexedPaths:
+    """Build both repository-relative and Moodle-native paths for one file."""
 
-    candidate = Path(file_path).expanduser()
-    if candidate.is_absolute():
-        return candidate.resolve()
-    return (root / candidate).resolve()
+    repository_relative_path = normalize_relative_path(repository_root, file_path)
+    if _is_within(application_root, file_path):
+        return IndexedPaths(
+            repository_relative_path=repository_relative_path,
+            moodle_path=normalize_relative_path(application_root, file_path),
+            path_scope="application",
+        )
+    return IndexedPaths(
+        repository_relative_path=repository_relative_path,
+        moodle_path=repository_relative_path,
+        path_scope="repository",
+    )
+
+
+def _is_within(root: Path, file_path: Path) -> bool:
+    """Return whether ``file_path`` is inside ``root``."""
+
+    try:
+        file_path.resolve(strict=True).relative_to(root.resolve(strict=True))
+        return True
+    except ValueError:
+        return False

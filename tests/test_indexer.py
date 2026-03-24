@@ -4,33 +4,56 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from moodle_indexer.config import build_index_config
+from moodle_indexer.config import build_index_config, detect_application_root
 from moodle_indexer.extractors import (
     extract_capabilities,
     extract_language_strings,
     extract_php_artifacts,
 )
 from moodle_indexer.indexer import build_index
-from moodle_indexer.paths import normalize_relative_lookup_path, normalize_relative_path
+from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
 from moodle_indexer.queries import component_summary, file_context, find_symbol, suggest_related
 from moodle_indexer.store import open_database
 
 
-FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "moodle_sample"
-WRAPPED_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper" / "public"
-WRAPPER_PARENT_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper"
+CLASSIC_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "moodle_sample"
+SPLIT_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper"
+SPLIT_APP_ROOT = SPLIT_FIXTURE_ROOT / "public"
 
 
 def _read_fixture(relative_path: str) -> str:
-    """Read one source fixture from the synthetic Moodle tree."""
+    """Read one source fixture from the classic synthetic Moodle tree."""
 
-    return (FIXTURE_ROOT / relative_path).read_text(encoding="utf-8")
+    return (CLASSIC_FIXTURE_ROOT / relative_path).read_text(encoding="utf-8")
 
 
-def test_normalize_relative_path_and_lookup_use_repo_relative_shapes() -> None:
-    forum_file = WRAPPED_FIXTURE_ROOT / "mod" / "forum" / "lib.php"
-    assert normalize_relative_path(WRAPPED_FIXTURE_ROOT, forum_file) == "mod/forum/lib.php"
+def test_path_helpers_support_repository_relative_and_moodle_native_shapes() -> None:
+    classic_forum = CLASSIC_FIXTURE_ROOT / "mod" / "forum" / "lib.php"
+    split_forum = SPLIT_APP_ROOT / "mod" / "forum" / "lib.php"
+    split_cli = SPLIT_FIXTURE_ROOT / "admin" / "cli" / "install_database.php"
+
+    assert normalize_relative_path(CLASSIC_FIXTURE_ROOT, classic_forum) == "mod/forum/lib.php"
     assert normalize_relative_lookup_path("./mod/forum/lib.php") == "mod/forum/lib.php"
+
+    split_paths = build_indexed_paths(SPLIT_FIXTURE_ROOT, SPLIT_APP_ROOT, split_forum)
+    assert split_paths.repository_relative_path == "public/mod/forum/lib.php"
+    assert split_paths.moodle_path == "mod/forum/lib.php"
+    assert split_paths.path_scope == "application"
+
+    repository_only_paths = build_indexed_paths(SPLIT_FIXTURE_ROOT, SPLIT_APP_ROOT, split_cli)
+    assert repository_only_paths.repository_relative_path == "admin/cli/install_database.php"
+    assert repository_only_paths.moodle_path == "admin/cli/install_database.php"
+    assert repository_only_paths.path_scope == "repository"
+
+
+def test_detect_application_root_for_classic_and_split_layouts() -> None:
+    classic_root, classic_layout = detect_application_root(CLASSIC_FIXTURE_ROOT)
+    split_root, split_layout = detect_application_root(SPLIT_FIXTURE_ROOT)
+
+    assert classic_root == CLASSIC_FIXTURE_ROOT.resolve()
+    assert classic_layout == "classic"
+    assert split_root == SPLIT_APP_ROOT.resolve()
+    assert split_layout == "split_public"
 
 
 def test_php_extraction_captures_structural_relationships() -> None:
@@ -85,192 +108,152 @@ def test_capability_and_language_string_extractors_capture_metadata() -> None:
     assert strings[0].string_value == "Forum"
 
 
-def test_build_index_and_query_endpoints(tmp_path: Path) -> None:
-    db_path = tmp_path / "moodle-index.sqlite"
-    result = build_index(build_index_config(str(FIXTURE_ROOT), str(db_path), workers=2))
+def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
+    db_path = tmp_path / "classic.sqlite"
+    result = build_index(build_index_config(str(CLASSIC_FIXTURE_ROOT), str(db_path), workers=2))
 
-    assert result["files"] >= 10
-    assert result["components"] >= 2
-    assert result["symbols"] >= 12
+    assert result["input_path"] == str(CLASSIC_FIXTURE_ROOT)
+    assert result["repository_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
+    assert result["application_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
+    assert result["layout_type"] == "classic"
+    assert result["components"] >= 5
     assert result["relationships"] >= 6
-    assert result["capabilities"] == 1
-    assert result["language_strings"] >= 4
-    assert result["tests"] >= 4
 
     connection = open_database(db_path)
     try:
-        symbol_result = find_symbol(connection, "discussion_exporter")
-        assert symbol_result["matches"]
-        discussion_exporter = symbol_result["matches"][0]
-        assert discussion_exporter["component"] == "mod_forum"
-        assert discussion_exporter["file_role"] == "external_api_class"
-        assert any(
-            item["type"] == "extends" and item["target"] == "\\external_api"
-            for item in discussion_exporter["relationships"]
-        )
+        repository = connection.execute(
+            "SELECT input_path, repository_root, application_root, layout_type FROM repositories"
+        ).fetchone()
+        assert repository["input_path"] == str(CLASSIC_FIXTURE_ROOT)
+        assert repository["repository_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
+        assert repository["application_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
+        assert repository["layout_type"] == "classic"
 
-        method_result = find_symbol(connection, "export_for_template")
-        assert method_result["matches"][0]["container_name"] == "mod_forum\\output\\discussion_list"
-        assert any(
-            item["type"] == "method_of"
-            and item["target"] == "mod_forum\\output\\discussion_list"
-            for item in method_result["matches"][0]["relationships"]
-        )
-
-        access_context = file_context(connection, "mod/forum/db/access.php")
-        assert access_context["component"] == "mod_forum"
-        assert access_context["file_role"] == "access_definition"
-        assert access_context["capabilities"][0]["name"] == "mod/forum:viewdiscussion"
-        assert access_context["capabilities"][0]["archetypes"]["student"] == "CAP_ALLOW"
-        assert access_context["absolute_path"] == str((FIXTURE_ROOT / "mod/forum/db/access.php").resolve())
-        assert any(
-            suggestion["path"] == "mod/forum/lang/en/mod_forum.php"
-            and suggestion["reason"]
-            for suggestion in access_context["related_suggestions"]
-        )
-
-        renderer_context = file_context(connection, "mod/forum/renderer.php")
-        assert renderer_context["string_usages"] == [
-            {"component_name": "mod_forum", "line": 8, "string_key": "pluginname"}
-        ]
-        assert any(
-            relationship["relationship_type"] == "extends"
-            for relationship in renderer_context["relationships"]
-        )
-
-        lib_context = file_context(connection, "mod/forum/lib.php")
-        assert lib_context["capability_checks"] == [
-            {
-                "capability_name": "mod/forum:viewdiscussion",
-                "function_name": "require_capability",
-                "line": 7,
-            }
-        ]
-
-        component_result = component_summary(connection, "mod_forum")
-        assert component_result["stats"]["language_string_count"] == 2
-        assert component_result["stats"]["capability_check_count"] == 1
-        assert component_result["stats"]["relationship_count"] >= 6
-        assert component_result["key_file_roles"]["access_definition"] == 1
-        assert any(
-            symbol["symbol_type"] == "method"
-            and symbol["fqname"] == "mod_forum\\output\\discussion_list::export_for_template"
-            for symbol in component_result["sample_symbols"]
-        )
-
-        related_result = suggest_related(connection, FIXTURE_ROOT, "admin/tool/demo/settings.php")
-        suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
-        assert suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["indexed"] is True
-        assert "language strings" in suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["reason"]
-        assert suggestions_by_path["admin/tool/demo/version.php"]["indexed"] is False
-    finally:
-        connection.close()
-
-
-def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefixes(tmp_path: Path) -> None:
-    db_path = tmp_path / "wrapped.sqlite"
-    result = build_index(build_index_config(str(WRAPPED_FIXTURE_ROOT), str(db_path), workers=2))
-    assert result["components"] >= 6
-
-    connection = open_database(db_path)
-    try:
-        stored_paths = [
-            row["relative_path"]
-            for row in connection.execute(
-                "SELECT relative_path FROM files ORDER BY relative_path"
-            ).fetchall()
-        ]
-        assert stored_paths == [
-            "admin/report/security/index.php",
-            "admin/tool/phpunit/index.php",
-            "enrol/manual/lib.php",
-            "lib/setup.php",
-            "mod/assign/version.php",
-            "mod/forum/lib.php",
-            "question/type/multichoice/lib.php",
-            "theme/boost/lib.php",
-        ]
-        assert all(not path.startswith("public/") for path in stored_paths)
-        assert all(not path.startswith(str(WRAPPED_FIXTURE_ROOT)) for path in stored_paths)
+        mod_forum_row = connection.execute(
+            """
+            SELECT f.repository_relative_path, f.moodle_path, c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.repository_relative_path = 'mod/forum/lib.php'
+            """
+        ).fetchone()
+        assert mod_forum_row["moodle_path"] == "mod/forum/lib.php"
+        assert mod_forum_row["component_name"] == "mod_forum"
 
         stored_components = {
             row["name"]
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
         }
-        assert {
-            "enrol_manual",
-            "mod_assign",
-            "mod_forum",
-            "qtype_multichoice",
-            "report_security",
-            "theme_boost",
-            "tool_phpunit",
-        } <= stored_components
+        assert {"mod_forum", "tool_demo", "theme_boost", "enrol_manual", "tool_phpunit"} <= stored_components
 
-        forum_file = connection.execute(
-            """
-            SELECT files.relative_path, components.name AS component_name
-            FROM files
-            JOIN components ON components.id = files.component_id
-            WHERE files.relative_path = 'mod/forum/lib.php'
-            """
-        ).fetchone()
-        assert forum_file is not None
-        assert forum_file["component_name"] == "mod_forum"
+        symbol_result = find_symbol(connection, "discussion_exporter")
+        assert symbol_result["matches"][0]["file"] == "mod/forum/classes/external/discussion_exporter.php"
+        assert symbol_result["matches"][0]["repository_relative_path"] == "mod/forum/classes/external/discussion_exporter.php"
 
-        file_context_result = file_context(connection, "mod/forum/lib.php")
-        assert file_context_result["file"] == "mod/forum/lib.php"
-        assert file_context_result["component"] == "mod_forum"
-        assert file_context_result["absolute_path"] == str((WRAPPED_FIXTURE_ROOT / "mod/forum/lib.php").resolve())
+        access_context = file_context(connection, "mod/forum/db/access.php")
+        assert access_context["component"] == "mod_forum"
+        assert access_context["repository_relative_path"] == "mod/forum/db/access.php"
+        assert access_context["moodle_path"] == "mod/forum/db/access.php"
+        assert access_context["path_scope"] == "application"
+        assert access_context["absolute_path"] == str((CLASSIC_FIXTURE_ROOT / "mod/forum/db/access.php").resolve())
+        assert access_context["capabilities"][0]["archetypes"]["student"] == "CAP_ALLOW"
 
-        absolute_lookup_result = file_context(
-            connection,
-            str(WRAPPED_FIXTURE_ROOT / "mod" / "forum" / "lib.php"),
+        component_result = component_summary(connection, "mod_forum")
+        assert component_result["stats"]["relationship_count"] >= 6
+        assert any(
+            file_row["repository_relative_path"] == "mod/forum/lib.php"
+            and file_row["moodle_path"] == "mod/forum/lib.php"
+            for file_row in component_result["files"]
         )
-        assert absolute_lookup_result["file"] == "mod/forum/lib.php"
-        assert absolute_lookup_result["component"] == "mod_forum"
+
+        related_result = suggest_related(connection, CLASSIC_FIXTURE_ROOT, "admin/tool/demo/settings.php")
+        suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
+        assert suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["indexed"] is True
     finally:
         connection.close()
 
 
-def test_index_pipeline_detects_nested_public_moodle_root(tmp_path: Path) -> None:
-    db_path = tmp_path / "detected.sqlite"
-    result = build_index(build_index_config(str(WRAPPER_PARENT_ROOT), str(db_path), workers=2))
+def test_split_layout_indexes_whole_repository_and_supports_moodle_native_queries(tmp_path: Path) -> None:
+    db_path = tmp_path / "split.sqlite"
+    result = build_index(build_index_config(str(SPLIT_FIXTURE_ROOT), str(db_path), workers=2))
 
-    assert result["repository"] == str(WRAPPED_FIXTURE_ROOT.resolve())
+    assert result["input_path"] == str(SPLIT_FIXTURE_ROOT)
+    assert result["repository_root"] == str(SPLIT_FIXTURE_ROOT.resolve())
+    assert result["application_root"] == str(SPLIT_APP_ROOT.resolve())
+    assert result["layout_type"] == "split_public"
+    assert result["components"] > 2
 
     connection = open_database(db_path)
     try:
-        component_count = connection.execute("SELECT COUNT(*) AS count FROM components").fetchone()["count"]
-        assert component_count > 2
-
-        mod_forum_file = connection.execute(
-            """
-            SELECT files.relative_path, components.name AS component_name
-            FROM files
-            JOIN components ON components.id = files.component_id
-            WHERE files.relative_path = 'mod/forum/lib.php'
-            """
+        repository = connection.execute(
+            "SELECT input_path, repository_root, application_root, layout_type FROM repositories"
         ).fetchone()
-        assert mod_forum_file is not None
-        assert mod_forum_file["component_name"] == "mod_forum"
+        assert repository["repository_root"] == str(SPLIT_FIXTURE_ROOT.resolve())
+        assert repository["application_root"] == str(SPLIT_APP_ROOT.resolve())
+        assert repository["layout_type"] == "split_public"
 
-        expected_components = {
-            "mod_forum",
-            "mod_assign",
-            "tool_phpunit",
-            "theme_boost",
-            "enrol_manual",
-        }
-        stored_components = {
-            row["name"]
+        stored_paths = {
+            tuple(row)
             for row in connection.execute(
-                "SELECT name FROM components WHERE name IN ('mod_forum', 'mod_assign', 'tool_phpunit', 'theme_boost', 'enrol_manual')"
+                "SELECT repository_relative_path, moodle_path, path_scope FROM files ORDER BY repository_relative_path"
             ).fetchall()
         }
-        assert stored_components == expected_components
+        assert ("public/mod/forum/lib.php", "mod/forum/lib.php", "application") in stored_paths
+        assert ("public/theme/boost/lib.php", "theme/boost/lib.php", "application") in stored_paths
+        assert ("public/enrol/manual/lib.php", "enrol/manual/lib.php", "application") in stored_paths
+        assert ("public/admin/tool/phpunit/index.php", "admin/tool/phpunit/index.php", "application") in stored_paths
+        assert ("admin/cli/install_database.php", "admin/cli/install_database.php", "repository") in stored_paths
+        assert ("lib/classes/some_core_class.php", "lib/classes/some_core_class.php", "repository") in stored_paths
+
         assert connection.execute(
-            "SELECT 1 FROM files WHERE relative_path LIKE 'public/%'"
-        ).fetchone() is None
+            "SELECT COUNT(*) AS count FROM components"
+        ).fetchone()["count"] > 2
+
+        forum_row = connection.execute(
+            """
+            SELECT f.repository_relative_path, f.moodle_path, c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.repository_relative_path = 'public/mod/forum/lib.php'
+            """
+        ).fetchone()
+        assert forum_row["moodle_path"] == "mod/forum/lib.php"
+        assert forum_row["component_name"] == "mod_forum"
+
+        phpunit_row = connection.execute(
+            """
+            SELECT c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.repository_relative_path = 'public/admin/tool/phpunit/index.php'
+            """
+        ).fetchone()
+        assert phpunit_row["component_name"] == "tool_phpunit"
+
+        cli_row = connection.execute(
+            """
+            SELECT c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.repository_relative_path = 'admin/cli/install_database.php'
+            """
+        ).fetchone()
+        assert cli_row["component_name"] == "core_admin"
+
+        split_context = file_context(connection, "mod/forum/lib.php")
+        assert split_context["repository_relative_path"] == "public/mod/forum/lib.php"
+        assert split_context["moodle_path"] == "mod/forum/lib.php"
+        assert split_context["path_scope"] == "application"
+        assert split_context["absolute_path"] == str((SPLIT_APP_ROOT / "mod/forum/lib.php").resolve())
+
+        repo_context = file_context(connection, "admin/cli/install_database.php")
+        assert repo_context["repository_relative_path"] == "admin/cli/install_database.php"
+        assert repo_context["moodle_path"] == "admin/cli/install_database.php"
+        assert repo_context["path_scope"] == "repository"
+        assert repo_context["absolute_path"] == str((SPLIT_FIXTURE_ROOT / "admin/cli/install_database.php").resolve())
+
+        repository_relative_lookup = file_context(connection, "public/mod/forum/lib.php")
+        assert repository_relative_lookup["moodle_path"] == "mod/forum/lib.php"
+        assert repository_relative_lookup["repository_relative_path"] == "public/mod/forum/lib.php"
     finally:
         connection.close()

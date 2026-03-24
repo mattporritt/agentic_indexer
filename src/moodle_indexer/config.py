@@ -12,28 +12,31 @@ from moodle_indexer.errors import ValidationError
 class IndexConfig:
     """Top-level index build configuration."""
 
-    moodle_root: Path
+    input_path: str
+    repository_root: Path
+    application_root: Path
+    layout_type: str
     database_path: Path
     workers: int = 1
 
 
-MOODLE_ROOT_MARKERS = ("admin", "lib", "mod")
+APPLICATION_ROOT_MARKERS = ("admin", "mod", "theme")
 
 
 def build_index_config(moodle_root: str, database_path: str, workers: int = 1) -> IndexConfig:
     """Validate CLI arguments and return a normalized index configuration.
 
-    The CLI prefers the exact Moodle webroot. If the supplied path is a wrapper
-    directory that contains a single obvious nested Moodle root such as
-    ``public/``, the nested root is selected so persisted file paths remain
-    repository-relative from the actual Moodle codebase.
+    The repository root is always the exact checkout path supplied by the user.
+    A separate application root is detected for split layouts such as Moodle
+    5.1, where the main web application lives under ``public/``.
     """
 
-    root = _detect_effective_moodle_root(Path(moodle_root).expanduser())
-    if not root.exists():
-        raise ValidationError(f"Moodle path does not exist: {root}")
-    if not root.is_dir():
-        raise ValidationError(f"Moodle path is not a directory: {root}")
+    repository_root = Path(moodle_root).expanduser().resolve()
+    if not repository_root.exists():
+        raise ValidationError(f"Moodle path does not exist: {repository_root}")
+    if not repository_root.is_dir():
+        raise ValidationError(f"Moodle path is not a directory: {repository_root}")
+    application_root, layout_type = detect_application_root(repository_root)
 
     db_path = Path(database_path).expanduser().resolve()
     if db_path.exists() and db_path.is_dir():
@@ -41,31 +44,36 @@ def build_index_config(moodle_root: str, database_path: str, workers: int = 1) -
     if workers < 1:
         raise ValidationError(f"Worker count must be at least 1, got: {workers}")
 
-    return IndexConfig(moodle_root=root, database_path=db_path, workers=workers)
+    return IndexConfig(
+        input_path=moodle_root,
+        repository_root=repository_root,
+        application_root=application_root,
+        layout_type=layout_type,
+        database_path=db_path,
+        workers=workers,
+    )
 
 
-def _detect_effective_moodle_root(candidate: Path) -> Path:
-    """Return the actual Moodle root for a user-supplied path.
+def detect_application_root(repository_root: Path) -> tuple[Path, str]:
+    """Return the application root and layout type for a repository.
 
-    This keeps the pipeline robust when a hosting checkout wraps Moodle one
-    level deeper inside a directory such as ``public/``.
+    ``repository_root`` is never rewritten. In classic layouts the application
+    root is the repository root; in split layouts it is ``repository_root /
+    "public"``.
     """
 
-    resolved = candidate.resolve()
-    if _looks_like_moodle_root(resolved):
-        return resolved
+    resolved = repository_root.resolve()
+    if _looks_like_application_root(resolved):
+        return resolved, "classic"
 
-    child_candidates = [
-        child.resolve()
-        for child in resolved.iterdir()
-        if child.is_dir() and _looks_like_moodle_root(child)
-    ]
-    if len(child_candidates) == 1:
-        return child_candidates[0]
-    return resolved
+    public_root = (resolved / "public").resolve()
+    if public_root.is_dir() and _looks_like_application_root(public_root):
+        return public_root, "split_public"
+
+    return resolved, "classic"
 
 
-def _looks_like_moodle_root(path: Path) -> bool:
-    """Return whether a directory looks like a Moodle codebase root."""
+def _looks_like_application_root(path: Path) -> bool:
+    """Return whether a directory looks like the main Moodle application root."""
 
-    return all((path / marker).exists() for marker in MOODLE_ROOT_MARKERS)
+    return all((path / marker).exists() for marker in APPLICATION_ROOT_MARKERS)

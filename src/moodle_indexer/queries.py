@@ -27,14 +27,15 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
             s.namespace,
             s.container_name,
             s.line,
-            f.relative_path,
+            f.repository_relative_path,
+            f.moodle_path,
             f.file_role,
             c.name AS component_name
         FROM symbols s
         JOIN files f ON f.id = s.file_id
         JOIN components c ON c.id = s.component_id
         WHERE s.name = ? OR s.fqname = ?
-        ORDER BY s.fqname, f.relative_path, s.line
+        ORDER BY s.fqname, f.moodle_path, s.line
         """,
         (symbol_name, symbol_name),
     ).fetchall()
@@ -67,7 +68,8 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
                 "namespace": row["namespace"],
                 "container_name": row["container_name"],
                 "component": row["component_name"],
-                "file": row["relative_path"],
+                "file": row["moodle_path"],
+                "repository_relative_path": row["repository_relative_path"],
                 "file_role": row["file_role"],
                 "line": row["line"],
                 "relationships": [
@@ -99,100 +101,82 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     index has been built.
     """
 
-    repository_root = _get_indexed_repository_root(connection)
-    relative_path = _resolve_lookup_relative_path(connection, repository_root, file_path)
+    repository = _get_indexed_repository_metadata(connection)
+    row = _resolve_file_row(connection, repository, file_path)
 
-    row = connection.execute(
-        """
-        SELECT
-            f.relative_path,
-            f.absolute_path,
-            f.file_role,
-            f.extension,
-            c.name AS component_name
-        FROM files f
-        JOIN components c ON c.id = f.component_id
-        WHERE f.relative_path = ?
-        """,
-        (relative_path,),
-    ).fetchone()
-    if row is None:
-        raise ValidationError(f"File not found in index: {relative_path}")
+    file_id = row["id"]
+    moodle_path = row["moodle_path"]
 
     symbols = connection.execute(
         """
         SELECT name, fqname, symbol_type, namespace, line
         FROM symbols
-        JOIN files ON files.id = symbols.file_id
-        WHERE files.relative_path = ?
+        WHERE symbols.file_id = ?
         ORDER BY line, fqname
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
     capabilities = connection.execute(
         """
         SELECT name, line, captype, contextlevel, archetypes_json, riskbitmask
         FROM capabilities
-        JOIN files ON files.id = capabilities.file_id
-        WHERE files.relative_path = ?
+        WHERE capabilities.file_id = ?
         ORDER BY name
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
     strings = connection.execute(
         """
         SELECT string_key, string_value, line
         FROM language_strings
-        JOIN files ON files.id = language_strings.file_id
-        WHERE files.relative_path = ?
+        WHERE language_strings.file_id = ?
         ORDER BY string_key
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
     tests = connection.execute(
         """
         SELECT name, test_type, line
         FROM tests
-        JOIN files ON files.id = tests.file_id
-        WHERE files.relative_path = ?
+        WHERE tests.file_id = ?
         ORDER BY test_type, name
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
     capability_checks = connection.execute(
         """
         SELECT capability_name, function_name, line
         FROM capability_usages
-        JOIN files ON files.id = capability_usages.file_id
-        WHERE files.relative_path = ?
+        WHERE capability_usages.file_id = ?
         ORDER BY line, capability_name
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
     string_usages = connection.execute(
         """
         SELECT string_key, component_name, line
         FROM language_string_usages
-        JOIN files ON files.id = language_string_usages.file_id
-        WHERE files.relative_path = ?
+        WHERE language_string_usages.file_id = ?
         ORDER BY line, string_key
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
     relationships = connection.execute(
         """
         SELECT source_fqname, target_name, relationship_type, line
         FROM relationships
-        JOIN files ON files.id = relationships.file_id
-        WHERE files.relative_path = ?
+        WHERE relationships.file_id = ?
         ORDER BY line, relationship_type, source_fqname, target_name
         """,
-        (relative_path,),
+        (file_id,),
     ).fetchall()
 
     return {
-        "file": row["relative_path"],
-        "absolute_path": str((repository_root / row["relative_path"]).resolve()),
+        "file": moodle_path,
+        "repository_relative_path": row["repository_relative_path"],
+        "moodle_path": moodle_path,
+        "path_scope": row["path_scope"],
+        "absolute_path": str((Path(repository["repository_root"]) / row["repository_relative_path"]).resolve()),
         "component": row["component_name"],
         "file_role": row["file_role"],
         "extension": row["extension"],
@@ -215,8 +199,10 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         "relationships": [dict(item) for item in relationships],
         "related_suggestions": [
             {"path": item.path, "reason": item.reason}
-            for item in suggest_related_files(row["relative_path"])
+            for item in suggest_related_files(moodle_path)
         ],
+        "repository_root": repository["repository_root"],
+        "application_root": repository["application_root"],
     }
 
 
@@ -236,10 +222,10 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
 
     files = connection.execute(
         """
-        SELECT relative_path, file_role
+        SELECT repository_relative_path, moodle_path, file_role
         FROM files
         WHERE component_id = ?
-        ORDER BY relative_path
+        ORDER BY moodle_path, repository_relative_path
         """,
         (component["id"],),
     ).fetchall()
@@ -324,22 +310,21 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
 
 
 def suggest_related(connection: sqlite3.Connection, repository_root: Path, file_path: str) -> dict:
-    """Return related-file suggestions for a repository file path."""
+    """Return related-file suggestions for a repository file path.
 
-    relative_path = _resolve_lookup_relative_path(connection, repository_root, file_path)
+    ``repository_root`` is accepted for CLI compatibility, but the indexed
+    repository metadata remains the source of truth for path resolution.
+    """
 
-    indexed = connection.execute(
-        "SELECT 1 FROM files WHERE relative_path = ?",
-        (relative_path,),
-    ).fetchone()
-    if indexed is None:
-        raise ValidationError(f"File not found in index: {relative_path}")
+    repository = _get_indexed_repository_metadata(connection)
+    row = _resolve_file_row(connection, repository, file_path)
+    moodle_path = row["moodle_path"]
 
     suggestions = []
-    for suggestion in suggest_related_files(relative_path):
+    for suggestion in suggest_related_files(moodle_path):
         exists = connection.execute(
-            "SELECT 1 FROM files WHERE relative_path = ?",
-            (suggestion.path,),
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (suggestion.path, suggestion.path),
         ).fetchone()
         suggestions.append(
             {
@@ -348,36 +333,108 @@ def suggest_related(connection: sqlite3.Connection, repository_root: Path, file_
                 "indexed": bool(exists),
             }
         )
-    return {"file": relative_path, "suggestions": suggestions}
+    return {
+        "file": moodle_path,
+        "repository_relative_path": row["repository_relative_path"],
+        "moodle_path": moodle_path,
+        "suggestions": suggestions,
+    }
 
 
-def _resolve_lookup_relative_path(
+def _resolve_file_row(
     connection: sqlite3.Connection,
-    repository_root: Path,
+    repository: sqlite3.Row,
     file_path: str,
-) -> str:
-    """Resolve a CLI file argument into the repo-relative path stored in SQLite."""
+) -> sqlite3.Row:
+    """Resolve a CLI file argument into the indexed file row."""
 
     candidate = Path(file_path).expanduser()
     if not candidate.is_absolute():
-        return normalize_relative_lookup_path(file_path)
+        lookup = normalize_relative_lookup_path(file_path)
+        row = connection.execute(
+            """
+            SELECT
+                f.id,
+                f.repository_relative_path,
+                f.moodle_path,
+                f.path_scope,
+                f.absolute_path,
+                f.file_role,
+                f.extension,
+                c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.moodle_path = ?
+            ORDER BY CASE WHEN f.path_scope = 'application' THEN 0 ELSE 1 END, f.repository_relative_path
+            LIMIT 1
+            """,
+            (lookup,),
+        ).fetchone()
+        if row is not None:
+            return row
+
+        row = connection.execute(
+            """
+            SELECT
+                f.id,
+                f.repository_relative_path,
+                f.moodle_path,
+                f.path_scope,
+                f.absolute_path,
+                f.file_role,
+                f.extension,
+                c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.repository_relative_path = ?
+            LIMIT 1
+            """,
+            (lookup,),
+        ).fetchone()
+        if row is not None:
+            return row
+        raise ValidationError(f"File not found in index: {lookup}")
 
     resolved = candidate.resolve()
-    for root in [repository_root.resolve()]:
-        try:
-            return resolved.relative_to(root).as_posix()
-        except ValueError:
-            continue
-
-    raise ValidationError(f"File path is outside the indexed repository: {resolved}")
-
-
-def _get_indexed_repository_root(connection: sqlite3.Connection) -> Path:
-    """Return the repository root recorded in the SQLite index."""
+    repository_root = Path(repository["repository_root"]).resolve()
+    try:
+        repository_relative_path = resolved.relative_to(repository_root).as_posix()
+    except ValueError as exc:
+        raise ValidationError(f"File path is outside the indexed repository: {resolved}") from exc
 
     row = connection.execute(
-        "SELECT root_path FROM repositories ORDER BY id LIMIT 1"
+        """
+        SELECT
+            f.id,
+            f.repository_relative_path,
+            f.moodle_path,
+            f.path_scope,
+            f.absolute_path,
+            f.file_role,
+            f.extension,
+            c.name AS component_name
+        FROM files f
+        JOIN components c ON c.id = f.component_id
+        WHERE f.repository_relative_path = ?
+        LIMIT 1
+        """,
+        (repository_relative_path,),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(f"File not found in index: {repository_relative_path}")
+    return row
+
+
+def _get_indexed_repository_metadata(connection: sqlite3.Connection) -> sqlite3.Row:
+    """Return repository metadata recorded in the SQLite index."""
+
+    row = connection.execute(
+        """
+        SELECT input_path, repository_root, application_root, layout_type
+        FROM repositories
+        ORDER BY id LIMIT 1
+        """
     ).fetchone()
     if row is None:
         raise ValidationError("Indexed repository metadata not found in database.")
-    return Path(row["root_path"]).resolve()
+    return row

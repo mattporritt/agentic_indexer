@@ -14,7 +14,10 @@ from pathlib import Path
 class RepositoryRecord:
     """A repository being indexed."""
 
-    root_path: Path
+    input_path: str
+    repository_root: Path
+    application_root: Path
+    layout_type: str
 
 
 @dataclass(slots=True)
@@ -30,7 +33,9 @@ class ComponentRecord:
 class FileRecord:
     """Represents one indexed file and its Moodle-specific metadata."""
 
-    relative_path: str
+    repository_relative_path: str
+    moodle_path: str
+    path_scope: str
     absolute_path: str
     component_name: str
     file_role: str

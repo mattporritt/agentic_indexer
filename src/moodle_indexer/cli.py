@@ -45,7 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
-    file_parser.add_argument("--file", required=True, help="Repository-relative or absolute file path.")
+    file_parser.add_argument(
+        "--file",
+        required=True,
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
 
     component_parser = subparsers.add_parser("component-summary", help="Summarize one Moodle component.")
     component_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
@@ -54,7 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     related_parser = subparsers.add_parser("suggest-related", help="Suggest likely companion files.")
     related_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     related_parser.add_argument("--moodle-path", required=True, help="Path to the indexed Moodle checkout.")
-    related_parser.add_argument("--file", required=True, help="Repository-relative or absolute file path.")
+    related_parser.add_argument(
+        "--file",
+        required=True,
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
 
     return parser
 
