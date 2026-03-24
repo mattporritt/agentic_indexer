@@ -11,17 +11,25 @@ from moodle_indexer.extractors import (
     extract_php_artifacts,
 )
 from moodle_indexer.indexer import build_index
+from moodle_indexer.paths import normalize_relative_lookup_path, normalize_relative_path
 from moodle_indexer.queries import component_summary, file_context, find_symbol, suggest_related
 from moodle_indexer.store import open_database
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "moodle_sample"
+WRAPPED_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "hosting_wrapper" / "public"
 
 
 def _read_fixture(relative_path: str) -> str:
     """Read one source fixture from the synthetic Moodle tree."""
 
     return (FIXTURE_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def test_normalize_relative_path_and_lookup_use_repo_relative_shapes() -> None:
+    forum_file = WRAPPED_FIXTURE_ROOT / "mod" / "forum" / "lib.php"
+    assert normalize_relative_path(WRAPPED_FIXTURE_ROOT, forum_file) == "mod/forum/lib.php"
+    assert normalize_relative_lookup_path("./mod/forum/lib.php") == "mod/forum/lib.php"
 
 
 def test_php_extraction_captures_structural_relationships() -> None:
@@ -153,5 +161,70 @@ def test_build_index_and_query_endpoints(tmp_path: Path) -> None:
         assert suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["indexed"] is True
         assert "language strings" in suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["reason"]
         assert suggestions_by_path["admin/tool/demo/version.php"]["indexed"] is False
+    finally:
+        connection.close()
+
+
+def test_index_pipeline_stores_repo_relative_paths_and_components_without_prefixes(tmp_path: Path) -> None:
+    db_path = tmp_path / "wrapped.sqlite"
+    result = build_index(build_index_config(str(WRAPPED_FIXTURE_ROOT), str(db_path)))
+    assert result["components"] >= 6
+
+    connection = open_database(db_path)
+    try:
+        stored_paths = [
+            row["relative_path"]
+            for row in connection.execute(
+                "SELECT relative_path FROM files ORDER BY relative_path"
+            ).fetchall()
+        ]
+        assert stored_paths == [
+            "admin/report/security/index.php",
+            "admin/tool/phpunit/index.php",
+            "enrol/manual/lib.php",
+            "mod/assign/version.php",
+            "mod/forum/lib.php",
+            "question/type/multichoice/lib.php",
+            "theme/boost/lib.php",
+        ]
+        assert all(not path.startswith("public/") for path in stored_paths)
+        assert all(not path.startswith(str(WRAPPED_FIXTURE_ROOT)) for path in stored_paths)
+
+        stored_components = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
+        }
+        assert stored_components == {
+            "enrol_manual",
+            "mod_assign",
+            "mod_forum",
+            "qtype_multichoice",
+            "report_security",
+            "theme_boost",
+            "tool_phpunit",
+        }
+
+        forum_file = connection.execute(
+            """
+            SELECT files.relative_path, components.name AS component_name
+            FROM files
+            JOIN components ON components.id = files.component_id
+            WHERE files.relative_path = 'mod/forum/lib.php'
+            """
+        ).fetchone()
+        assert forum_file is not None
+        assert forum_file["component_name"] == "mod_forum"
+
+        file_context_result = file_context(connection, WRAPPED_FIXTURE_ROOT, "mod/forum/lib.php")
+        assert file_context_result["file"] == "mod/forum/lib.php"
+        assert file_context_result["component"] == "mod_forum"
+
+        absolute_lookup_result = file_context(
+            connection,
+            WRAPPED_FIXTURE_ROOT,
+            str(WRAPPED_FIXTURE_ROOT / "mod" / "forum" / "lib.php"),
+        )
+        assert absolute_lookup_result["file"] == "mod/forum/lib.php"
+        assert absolute_lookup_result["component"] == "mod_forum"
     finally:
         connection.close()

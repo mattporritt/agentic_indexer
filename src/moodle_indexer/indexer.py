@@ -45,12 +45,13 @@ LOGGER = logging.getLogger(__name__)
 def build_index(config: IndexConfig) -> dict[str, int | str]:
     """Build a fresh SQLite index for the target Moodle repository."""
 
-    LOGGER.info("Scanning Moodle repository at %s", config.moodle_root)
-    files = scan_repository(config.moodle_root)
+    repository_root = config.moodle_root.resolve(strict=True)
+    LOGGER.info("Scanning Moodle repository at %s", repository_root)
+    files = scan_repository(repository_root)
     LOGGER.info("Discovered %d candidate files", len(files))
 
     connection = initialize_database(config.database_path)
-    repository_id = insert_repository(connection, str(config.moodle_root))
+    repository_id = insert_repository(connection, str(repository_root))
 
     component_cache: dict[str, int] = {}
     counts = {
@@ -64,7 +65,7 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
     }
 
     for file_path in files:
-        relative_path = normalize_relative_path(config.moodle_root, file_path)
+        relative_path = normalize_relative_path(repository_root, file_path)
         component = infer_component(relative_path)
         file_role = classify_file_role(relative_path)
         if component.name not in component_cache:

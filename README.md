@@ -104,6 +104,8 @@ pip install -e .
 
 The tool does not assume it lives beside the Moodle checkout. Always pass the Moodle repository path explicitly.
 
+The path you pass with `--moodle-path` is the source of truth for stored file paths. If you point the CLI at the actual Moodle web root, indexed paths are stored relative to that exact directory, for example `mod/forum/lib.php` rather than an accidental wrapper prefix such as `public/mod/forum/lib.php`.
+
 Build a fresh index:
 
 ```bash

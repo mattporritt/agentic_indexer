@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 from moodle_indexer.errors import ValidationError
-from moodle_indexer.paths import resolve_user_file_input
+from moodle_indexer.paths import normalize_relative_lookup_path, resolve_user_file_input
 from moodle_indexer.suggestions import suggest_related_files
 
 
@@ -94,11 +94,7 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
 def file_context(connection: sqlite3.Connection, repository_root: Path, file_path: str) -> dict:
     """Return indexed metadata for one repository file."""
 
-    resolved = resolve_user_file_input(repository_root, file_path)
-    try:
-        relative_path = resolved.relative_to(repository_root).as_posix()
-    except ValueError as exc:
-        raise ValidationError(f"File path is outside the indexed repository: {resolved}") from exc
+    relative_path = _resolve_lookup_relative_path(connection, repository_root, file_path)
 
     row = connection.execute(
         """
@@ -324,11 +320,7 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
 def suggest_related(connection: sqlite3.Connection, repository_root: Path, file_path: str) -> dict:
     """Return related-file suggestions for a repository file path."""
 
-    resolved = resolve_user_file_input(repository_root, file_path)
-    try:
-        relative_path = resolved.relative_to(repository_root).as_posix()
-    except ValueError as exc:
-        raise ValidationError(f"File path is outside the indexed repository: {resolved}") from exc
+    relative_path = _resolve_lookup_relative_path(connection, repository_root, file_path)
 
     indexed = connection.execute(
         "SELECT 1 FROM files WHERE relative_path = ?",
@@ -351,3 +343,31 @@ def suggest_related(connection: sqlite3.Connection, repository_root: Path, file_
             }
         )
     return {"file": relative_path, "suggestions": suggestions}
+
+
+def _resolve_lookup_relative_path(
+    connection: sqlite3.Connection,
+    repository_root: Path,
+    file_path: str,
+) -> str:
+    """Resolve a CLI file argument into the repo-relative path stored in SQLite."""
+
+    candidate = Path(file_path).expanduser()
+    if not candidate.is_absolute():
+        return normalize_relative_lookup_path(file_path)
+
+    resolved = candidate.resolve()
+    roots_to_try = [repository_root.resolve()]
+    stored_root_row = connection.execute("SELECT root_path FROM repositories ORDER BY id LIMIT 1").fetchone()
+    if stored_root_row is not None:
+        stored_root = Path(stored_root_row["root_path"]).resolve()
+        if stored_root not in roots_to_try:
+            roots_to_try.append(stored_root)
+
+    for root in roots_to_try:
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+
+    raise ValidationError(f"File path is outside the indexed repository: {resolved}")

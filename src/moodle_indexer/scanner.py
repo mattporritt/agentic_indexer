@@ -25,6 +25,7 @@ SKIP_DIRECTORIES = {
 def scan_repository(root: Path) -> list[Path]:
     """Return sorted repository files considered for indexing."""
 
+    root = root.resolve(strict=True)
     files: list[Path] = []
     for path in root.rglob("*"):
         if not path.is_file():

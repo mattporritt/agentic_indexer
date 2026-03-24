@@ -6,3 +6,5 @@ dist/
 build/
 *.egg-info/
 /_smoke_test/
+.DS_Store
+.db/
