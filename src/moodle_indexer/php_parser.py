@@ -22,8 +22,27 @@ except ModuleNotFoundError:  # pragma: no cover - exercised indirectly in tests
 
 
 NAMESPACE_RE = re.compile(r"namespace\s+([^;]+);")
-CLASS_RE = re.compile(r"\b(class|interface|trait)\s+([A-Za-z_][A-Za-z0-9_]*)")
+DECLARATION_RE = re.compile(
+    r"""
+    (?P<kind>class|interface|trait)\s+
+    (?P<name>[A-Za-z_][A-Za-z0-9_]*)              # symbol name
+    (?:\s+extends\s+(?P<extends>[\\A-Za-z_][\\A-Za-z0-9_]*))?
+    (?:\s+implements\s+(?P<implements>[\\A-Za-z0-9_,\s]+))?
+    \s*\{
+    """,
+    re.VERBOSE,
+)
 FUNCTION_RE = re.compile(r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+METHOD_RE = re.compile(
+    r"""
+    (?:
+        public|protected|private|static|abstract|final|\s
+    )*
+    function\s+
+    (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(
+    """,
+    re.VERBOSE,
+)
 
 
 @dataclass(slots=True)
@@ -147,29 +166,53 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
 
     namespace = _extract_namespace_from_source(source)
     results: list[ParsedSymbol] = []
-    seen_names: set[tuple[str, str]] = set()
+    seen_names: set[tuple[str, str, str | None]] = set()
+    class_ranges: list[tuple[int, int]] = []
 
-    for match in CLASS_RE.finditer(source):
-        symbol_type, name = match.groups()
+    for match in DECLARATION_RE.finditer(source):
+        symbol_type = match.group("kind").lower()
+        name = match.group("name")
         line = source.count("\n", 0, match.start()) + 1
-        key = (symbol_type.lower(), name)
+        key = (symbol_type, name, namespace)
         if key in seen_names:
             continue
         seen_names.add(key)
+        class_end = _find_matching_brace(source, match.end() - 1)
+        body = source[match.end():class_end] if class_end > match.end() else ""
+        methods = [
+            ParsedMethod(
+                name=method_match.group("name"),
+                line=source.count("\n", 0, match.end() + method_match.start()) + 1,
+            )
+            for method_match in METHOD_RE.finditer(body)
+            if method_match.group("name") != "__construct" or "__construct" in body
+        ]
+        extends = match.group("extends")
+        implements = [
+            item.strip()
+            for item in (match.group("implements") or "").split(",")
+            if item.strip()
+        ]
         results.append(
             ParsedSymbol(
-                symbol_type=symbol_type.lower(),
+                symbol_type=symbol_type,
                 name=name,
                 fqname=_qualify_name(namespace, name),
                 line=line,
                 namespace=namespace,
+                extends=extends,
+                implements=implements,
+                methods=methods,
             )
         )
+        class_ranges.append((match.start(), class_end))
 
     for match in FUNCTION_RE.finditer(source):
         name = match.group(1)
+        if _offset_within_ranges(match.start(), class_ranges):
+            continue
         line = source.count("\n", 0, match.start()) + 1
-        key = ("function", name)
+        key = ("function", name, namespace)
         if key in seen_names:
             continue
         seen_names.add(key)
@@ -184,6 +227,27 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
         )
 
     return results
+
+
+def _find_matching_brace(source: str, opening_brace_index: int) -> int:
+    """Return the index of the matching closing brace for a declaration."""
+
+    depth = 0
+    for index in range(opening_brace_index, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(source)
+
+
+def _offset_within_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:
+    """Return whether an offset lies within any class or trait body range."""
+
+    return any(start <= offset <= end for start, end in ranges)
 
 
 def _qualify_name(namespace: str | None, name: str | None) -> str:

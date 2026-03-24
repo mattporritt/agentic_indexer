@@ -25,8 +25,10 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
             s.fqname,
             s.symbol_type,
             s.namespace,
+            s.container_name,
             s.line,
             f.relative_path,
+            f.file_role,
             c.name AS component_name
         FROM symbols s
         JOIN files f ON f.id = s.file_id
@@ -39,12 +41,21 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
 
     matches = []
     for row in rows:
-        relationships = connection.execute(
+        outgoing = connection.execute(
             """
             SELECT relationship_type, target_name, line
             FROM relationships
             WHERE source_fqname = ?
             ORDER BY relationship_type, target_name, line
+            """,
+            (row["fqname"],),
+        ).fetchall()
+        incoming = connection.execute(
+            """
+            SELECT source_fqname, relationship_type, line
+            FROM relationships
+            WHERE target_name = ?
+            ORDER BY relationship_type, source_fqname, line
             """,
             (row["fqname"],),
         ).fetchall()
@@ -54,8 +65,10 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
                 "fqname": row["fqname"],
                 "symbol_type": row["symbol_type"],
                 "namespace": row["namespace"],
+                "container_name": row["container_name"],
                 "component": row["component_name"],
                 "file": row["relative_path"],
+                "file_role": row["file_role"],
                 "line": row["line"],
                 "relationships": [
                     {
@@ -63,7 +76,15 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
                         "target": item["target_name"],
                         "line": item["line"],
                     }
-                    for item in relationships
+                    for item in outgoing
+                ],
+                "referenced_by": [
+                    {
+                        "source": item["source_fqname"],
+                        "type": item["relationship_type"],
+                        "line": item["line"],
+                    }
+                    for item in incoming
                 ],
             }
         )
@@ -136,6 +157,36 @@ def file_context(connection: sqlite3.Connection, repository_root: Path, file_pat
         """,
         (relative_path,),
     ).fetchall()
+    capability_checks = connection.execute(
+        """
+        SELECT capability_name, function_name, line
+        FROM capability_usages
+        JOIN files ON files.id = capability_usages.file_id
+        WHERE files.relative_path = ?
+        ORDER BY line, capability_name
+        """,
+        (relative_path,),
+    ).fetchall()
+    string_usages = connection.execute(
+        """
+        SELECT string_key, component_name, line
+        FROM language_string_usages
+        JOIN files ON files.id = language_string_usages.file_id
+        WHERE files.relative_path = ?
+        ORDER BY line, string_key
+        """,
+        (relative_path,),
+    ).fetchall()
+    relationships = connection.execute(
+        """
+        SELECT source_fqname, target_name, relationship_type, line
+        FROM relationships
+        JOIN files ON files.id = relationships.file_id
+        WHERE files.relative_path = ?
+        ORDER BY line, relationship_type, source_fqname, target_name
+        """,
+        (relative_path,),
+    ).fetchall()
 
     return {
         "file": row["relative_path"],
@@ -156,7 +207,10 @@ def file_context(connection: sqlite3.Connection, repository_root: Path, file_pat
             for item in capabilities
         ],
         "language_strings": [dict(item) for item in strings],
+        "capability_checks": [dict(item) for item in capability_checks],
+        "string_usages": [dict(item) for item in string_usages],
         "tests": [dict(item) for item in tests],
+        "relationships": [dict(item) for item in relationships],
         "related_suggestions": [
             {"path": item.path, "reason": item.reason}
             for item in suggest_related_files(row["relative_path"])
@@ -214,6 +268,28 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
         """,
         (component["id"],),
     ).fetchall()
+    capability_checks = connection.execute(
+        "SELECT capability_name, function_name, line FROM capability_usages WHERE component_id = ? ORDER BY capability_name, line",
+        (component["id"],),
+    ).fetchall()
+    string_usages = connection.execute(
+        "SELECT string_key, component_name, line FROM language_string_usages JOIN files ON files.id = language_string_usages.file_id WHERE files.component_id = ? ORDER BY string_key, line",
+        (component["id"],),
+    ).fetchall()
+    symbols = connection.execute(
+        """
+        SELECT name, fqname, symbol_type, container_name, line
+        FROM symbols
+        WHERE component_id = ?
+        ORDER BY symbol_type, fqname, line
+        LIMIT 20
+        """,
+        (component["id"],),
+    ).fetchall()
+    relationship_count = connection.execute(
+        "SELECT COUNT(*) AS count FROM relationships JOIN files ON files.id = relationships.file_id WHERE files.component_id = ?",
+        (component["id"],),
+    ).fetchone()["count"]
 
     role_counts: dict[str, int] = {}
     for file_row in files:
@@ -228,6 +304,9 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
             "capability_count": len(capabilities),
             "language_string_count": len(strings),
             "test_count": len(tests),
+            "capability_check_count": len(capability_checks),
+            "string_usage_count": len(string_usages),
+            "relationship_count": relationship_count,
             "symbol_count": connection.execute(
                 "SELECT COUNT(*) AS count FROM symbols WHERE component_id = ?",
                 (component["id"],),
@@ -238,6 +317,7 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
         "capabilities": [{"name": item["name"], "line": item["line"]} for item in capabilities],
         "language_strings": [{"string_key": item["string_key"], "line": item["line"]} for item in strings],
         "tests": [dict(item) for item in tests],
+        "sample_symbols": [dict(item) for item in symbols],
     }
 
 

@@ -22,11 +22,11 @@ from moodle_indexer.models import (
 from moodle_indexer.php_parser import ParsedSymbol, parse_php_symbols
 
 
-CAPABILITY_BLOCK_RE = re.compile(r"'([^']+/[^']+:[^']+)'\s*=>\s*\[(.*?)\n\s*\]", re.DOTALL)
+CAPABILITY_START_RE = re.compile(r"'([^']+/[^']+:[^']+)'\s*=>\s*\[")
 CAPABILITY_FIELD_RE = re.compile(r"'(captype|contextlevel|riskbitmask)'\s*=>\s*([^,\n]+)")
 ARCHETYPE_RE = re.compile(r"'archetypes'\s*=>\s*\[(.*?)\]", re.DOTALL)
-ARCHETYPE_VALUE_RE = re.compile(r"'([^']+)'\s*=>\s*'([^']+)'")
-CAPABILITY_CALL_RE = re.compile(r"\b(has_capability|required_capability)\s*\(\s*'([^']+)'")
+ARCHETYPE_VALUE_RE = re.compile(r"'([^']+)'\s*=>\s*([A-Z_]+|'[^']+')")
+CAPABILITY_CALL_RE = re.compile(r"""\b(has_capability|require_capability)\s*\(\s*['"]([^'"]+)['"]""")
 STRING_DEF_RE = re.compile(r"\$string\['([^']+)'\]\s*=\s*'((?:\\'|[^'])*)';")
 GET_STRING_RE = re.compile(r"\bget_string\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)")
 FEATURE_SCENARIO_RE = re.compile(r"^\s*(Feature|Scenario|Scenario Outline):\s*(.+)\s*$", re.MULTILINE)
@@ -66,11 +66,33 @@ def extract_php_artifacts(
                 )
             )
         for method in parsed.methods:
+            method_fqname = f"{parsed.fqname}::{method.name}" if parsed.fqname else method.name
+            symbols.append(
+                SymbolRecord(
+                    name=method.name,
+                    fqname=method_fqname,
+                    symbol_type="method",
+                    file_path=relative_path,
+                    component_name=component_name,
+                    line=method.line,
+                    namespace=parsed.namespace,
+                    container_name=parsed.fqname,
+                )
+            )
             relationships.append(
                 RelationshipRecord(
                     source_fqname=parsed.fqname,
                     target_name=method.name,
                     relationship_type="defines_method",
+                    file_path=relative_path,
+                    line=method.line,
+                )
+            )
+            relationships.append(
+                RelationshipRecord(
+                    source_fqname=method_fqname,
+                    target_name=parsed.fqname,
+                    relationship_type="method_of",
                     file_path=relative_path,
                     line=method.line,
                 )
@@ -86,14 +108,20 @@ def extract_capabilities(source: str, relative_path: str, component_name: str) -
         return []
 
     capabilities: list[CapabilityRecord] = []
-    for match in CAPABILITY_BLOCK_RE.finditer(source):
-        name, block = match.groups()
+    for match in CAPABILITY_START_RE.finditer(source):
+        name = match.group(1)
+        block_start = match.end() - 1
+        block_end = _find_matching_square_bracket(source, block_start)
+        block = source[block_start + 1:block_end]
         line = source.count("\n", 0, match.start()) + 1
         field_map = {field: value.strip().strip("',") for field, value in CAPABILITY_FIELD_RE.findall(block)}
         archetypes: dict[str, str] = {}
         archetypes_match = ARCHETYPE_RE.search(block)
         if archetypes_match:
-            archetypes = {role: permission for role, permission in ARCHETYPE_VALUE_RE.findall(archetypes_match.group(1))}
+            archetypes = {
+                role: permission.strip("'")
+                for role, permission in ARCHETYPE_VALUE_RE.findall(archetypes_match.group(1))
+            }
         capabilities.append(
             CapabilityRecord(
                 name=name,
@@ -107,6 +135,21 @@ def extract_capabilities(source: str, relative_path: str, component_name: str) -
             )
         )
     return capabilities
+
+
+def _find_matching_square_bracket(source: str, opening_bracket_index: int) -> int:
+    """Return the index of the matching closing square bracket."""
+
+    depth = 0
+    for index in range(opening_bracket_index, len(source)):
+        char = source[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(source)
 
 
 def extract_capability_usages(source: str, relative_path: str, component_name: str) -> list[CapabilityUsageRecord]:

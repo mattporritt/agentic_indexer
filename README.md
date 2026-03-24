@@ -1,72 +1,78 @@
 # Moodle AI Indexer
 
-Moodle AI Indexer is a Phase 1, SQLite-backed code indexer for a local Moodle LMS checkout. It is designed for agentic coding systems and engineers who need better structural navigation than plain text search, without jumping straight to a complex universal code graph.
+Moodle AI Indexer is a Phase 1, SQLite-backed code indexer for a local Moodle LMS checkout. It is aimed at agentic coding systems and engineers who need Moodle-aware navigation and retrieval, not a speculative universal code graph.
 
-The MVP focuses on practical Moodle-aware indexing:
+The project focuses on practical structure that matters in Moodle work:
 
-- infer Moodle components/plugins from file paths
-- classify common Moodle file roles
-- extract useful PHP symbols and basic relationships
-- capture capabilities and language strings
-- discover PHPUnit and Behat artifacts
-- return deterministic JSON from a compact CLI
+- infer Moodle components and plugin ownership from paths
+- classify important Moodle file roles
+- extract PHP symbols and useful structural relationships
+- index capabilities, language strings, and test artifacts
+- suggest likely companion files for common Moodle change patterns
+- expose the indexed data through a small deterministic JSON CLI
 
 ## Why This Exists
 
-Moodle has strong repository conventions, rich plugin boundaries, and a lot of metadata spread across files like `db/access.php`, `lang/en/*.php`, `db/services.php`, renderers, templates, and tests. Generic code search often misses those conventions.
+Moodle development depends heavily on repository conventions. Relevant context for a change is often spread across:
 
-This project builds a small structured index so an AI agent can answer questions such as:
+- plugin/component boundaries
+- `db/access.php`, `db/services.php`, and `db/tasks.php`
+- `lang/en/*.php`
+- renderers, output classes, and templates
+- PHPUnit and Behat coverage
 
-- what is this symbol or file?
-- where is it defined?
-- which Moodle component owns it?
-- what related files are usually needed for a complete change?
-- where are the capabilities, strings, and tests?
+Plain text search can find files, but it does not reliably answer:
 
-## Phase 1 Scope
+- which component owns this file?
+- where is this symbol defined?
+- what does this class extend or implement?
+- where are the capability definitions and checks?
+- which language strings and tests are likely relevant?
 
-Phase 1 includes:
+This tool builds a compact local index so those questions become cheap and machine-friendly to answer.
+
+## What Phase 1 Includes
 
 - full rebuild indexing into SQLite
-- Moodle component inference from repository paths
-- path-based file-role classification
-- parser-first PHP symbol extraction, with fallback logic for resilience
-- basic relationship extraction for `extends`, `implements`, and defined methods
+- explicit Moodle component inference for common plugin families and core subsystems
+- deterministic file-role classification
+- parser-first PHP extraction with resilient fallback logic
+- symbol indexing for classes, interfaces, traits, functions, and methods
+- structural relationship indexing for `extends`, `implements`, and method-to-class ownership
 - capability extraction from `db/access.php`
 - language string extraction from `lang/en/*.php`
-- detection of common capability and `get_string` usages
-- discovery of PHPUnit classes/methods and Behat features/contexts
-- a small JSON CLI for indexing and querying
-- deterministic, explainable related-file suggestions
+- detection of obvious `require_capability`, `has_capability`, and `get_string` usage
+- PHPUnit and Behat discovery
+- related-file suggestions with explanation strings
+- JSON CLI commands for indexing and querying
 
-Phase 1 does not include:
+## What Phase 1 Does Not Include
 
 - embeddings or vector search
 - incremental indexing
 - a web UI
-- live editor integration
-- advanced JavaScript analysis
+- live IDE integration
+- deep JavaScript analysis
 - a precise call graph
-- runtime analysis
+- runtime tracing
+- background workers
 
 ## High-Level Design
 
-The project is structured as a clean installable Python package under [`src/moodle_indexer`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer).
+The package lives under `src/moodle_indexer/` and keeps responsibilities separated:
 
-Key modules:
+- `cli.py`: CLI entrypoint and argument handling
+- `indexer.py`: full rebuild orchestration
+- `scanner.py`: repository scanning
+- `components.py`: Moodle component inference rules
+- `file_roles.py`: path-based file-role classification
+- `php_parser.py`: parser-first PHP symbol extraction with fallback logic
+- `extractors.py`: Moodle-specific extraction for relationships, capabilities, strings, and tests
+- `store.py`: SQLite schema and persistence helpers
+- `queries.py`: query services used by the CLI
+- `suggestions.py`: deterministic related-file heuristics
 
-- [`cli.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/cli.py): CLI entrypoint and command handling
-- [`indexer.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/indexer.py): full rebuild orchestration
-- [`scanner.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/scanner.py): repository scanning
-- [`components.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/components.py): Moodle component inference
-- [`file_roles.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/file_roles.py): deterministic file-role classification
-- [`php_parser.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/php_parser.py): parser-first PHP symbol extraction
-- [`extractors.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/extractors.py): Moodle-specific metadata extraction
-- [`store.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/store.py): SQLite schema and persistence
-- [`queries.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/queries.py): query services for CLI commands
-- [`suggestions.py`](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/suggestions.py): related-file heuristics
-
-The data model stays intentionally small and normalized:
+The SQLite schema stays intentionally small and extensible:
 
 - `repositories`
 - `components`
@@ -79,39 +85,11 @@ The data model stays intentionally small and normalized:
 - `language_string_usages`
 - `tests`
 
-## Project Structure
-
-```text
-agentic_indexer/
-├── README.md
-├── requirements.txt
-├── pyproject.toml
-├── src/
-│   └── moodle_indexer/
-│       ├── cli.py
-│       ├── components.py
-│       ├── config.py
-│       ├── extractors.py
-│       ├── file_roles.py
-│       ├── indexer.py
-│       ├── json_output.py
-│       ├── models.py
-│       ├── paths.py
-│       ├── php_parser.py
-│       ├── queries.py
-│       ├── scanner.py
-│       ├── store.py
-│       └── suggestions.py
-└── tests/
-    ├── fixtures/
-    └── test_*.py
-```
-
 ## Setup
 
 Python 3.12+ is assumed.
 
-Install dependencies:
+Install dependencies and the package:
 
 ```bash
 python3 -m venv .venv
@@ -120,42 +98,42 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-`requirements.txt` is the baseline dependency file. `pyproject.toml` adds package metadata and the CLI entrypoint.
+`requirements.txt` is the baseline dependency file. `pyproject.toml` adds package metadata and the `moodle-indexer` CLI entrypoint.
 
 ## CLI Usage
 
-The tool never assumes it lives beside Moodle. Always pass the Moodle checkout path explicitly.
+The tool does not assume it lives beside the Moodle checkout. Always pass the Moodle repository path explicitly.
 
 Build a fresh index:
 
 ```bash
 moodle-indexer index \
   --moodle-path /path/to/moodle \
-  --db-path /tmp/moodle-index.sqlite
+  --db-path /path/to/moodle-index.sqlite
 ```
 
 Find a symbol:
 
 ```bash
 moodle-indexer find-symbol \
-  --db-path /tmp/moodle-index.sqlite \
+  --db-path /path/to/moodle-index.sqlite \
   --symbol discussion_exporter
 ```
 
-Inspect file context:
+Inspect a file:
 
 ```bash
 moodle-indexer file-context \
-  --db-path /tmp/moodle-index.sqlite \
+  --db-path /path/to/moodle-index.sqlite \
   --moodle-path /path/to/moodle \
-  --file mod/forum/db/access.php
+  --file mod/forum/renderer.php
 ```
 
 Summarize a component:
 
 ```bash
 moodle-indexer component-summary \
-  --db-path /tmp/moodle-index.sqlite \
+  --db-path /path/to/moodle-index.sqlite \
   --component mod_forum
 ```
 
@@ -163,7 +141,7 @@ Suggest related files:
 
 ```bash
 moodle-indexer suggest-related \
-  --db-path /tmp/moodle-index.sqlite \
+  --db-path /path/to/moodle-index.sqlite \
   --moodle-path /path/to/moodle \
   --file admin/tool/demo/settings.php
 ```
@@ -174,9 +152,9 @@ You can also run the package directly:
 python -m moodle_indexer --help
 ```
 
-## Example JSON Output
+## Example Output
 
-`find-symbol` example:
+`find-symbol` returns a compact summary of symbol definitions plus structural context:
 
 ```json
 {
@@ -187,11 +165,14 @@ python -m moodle_indexer --help
     "matches": [
       {
         "component": "mod_forum",
+        "container_name": null,
         "file": "mod/forum/classes/external/discussion_exporter.php",
+        "file_role": "external_api_class",
         "fqname": "mod_forum\\external\\discussion_exporter",
         "line": 5,
         "name": "discussion_exporter",
         "namespace": "mod_forum\\external",
+        "referenced_by": [],
         "relationships": [
           {
             "line": 5,
@@ -206,7 +187,7 @@ python -m moodle_indexer --help
 }
 ```
 
-`file-context` example:
+`file-context` surfaces the indexed data already known for a file without becoming a dump of the whole database:
 
 ```json
 {
@@ -214,34 +195,72 @@ python -m moodle_indexer --help
   "status": "ok",
   "data": {
     "component": "mod_forum",
-    "file": "mod/forum/db/access.php",
-    "file_role": "access_definition",
-    "capabilities": [
+    "file": "mod/forum/lib.php",
+    "file_role": "lib_file",
+    "capability_checks": [
       {
-        "name": "mod/forum:viewdiscussion",
-        "captype": "read",
-        "contextlevel": "CONTEXT_MODULE"
+        "capability_name": "mod/forum:viewdiscussion",
+        "function_name": "require_capability",
+        "line": 7
       }
     ],
     "related_suggestions": [
       {
-        "path": "mod/forum/lang/en/mod_forum.php",
-        "reason": "access.php changes often require new or updated language strings for mod_forum."
+        "path": "mod/forum/db/access.php",
+        "reason": "Capability-related work usually needs the component capability definition file."
+      }
+    ],
+    "symbols": [
+      {
+        "fqname": "forum_user_can_view_discussion",
+        "line": 6,
+        "name": "forum_user_can_view_discussion",
+        "namespace": null,
+        "symbol_type": "function"
       }
     ]
   }
 }
 ```
 
-JSON output is deterministic and machine-friendly:
+JSON output is deterministic:
 
-- stable top-level envelope
+- stable top-level success/error envelopes
 - sorted object keys
 - predictable list ordering in query responses
 
+## Moodle Component Coverage
+
+Phase 1 handles common Moodle conventions more carefully than a generic path prefix check. The inference rules cover, among others:
+
+- `mod/*`
+- `blocks/*`
+- `local/*`
+- `admin/tool/*`
+- `admin/report/*`
+- `auth/*`
+- `enrol/*`
+- `repository/*`
+- `question/type/*`
+- `question/behaviour/*`
+- `question/format/*`
+- `availability/condition/*`
+- `course/format/*`
+- `grade/report/*`
+- `grade/export/*`
+- `grade/import/*`
+- `editor/*`
+- `media/player/*`
+- `plagiarism/*`
+- `theme/*`
+- `payment/gateway/*`
+- `contentbank/contenttype/*`
+
+For non-plugin paths, the indexer falls back to sensible core subsystem mapping such as `core_admin`, `core_course`, and `core_question`.
+
 ## Testing
 
-The test suite uses a synthetic Moodle-like fixture tree in [`tests/fixtures/moodle_sample`](/Users/mattp/projects/agentic_indexer/tests/fixtures/moodle_sample). It does not require a real Moodle checkout.
+The test suite uses a synthetic Moodle-like fixture tree under `tests/fixtures/moodle_sample/`. It does not require a full Moodle checkout.
 
 Run tests with:
 
@@ -249,26 +268,36 @@ Run tests with:
 pytest
 ```
 
-The repository also includes a root [`_smoke_test`](/Users/mattp/projects/agentic_indexer/_smoke_test) directory reserved for any generated smoke artifacts.
+The current suite validates:
+
+- component inference across a broader set of Moodle path conventions
+- file-role classification
+- PHP symbol and relationship extraction
+- capability extraction
+- language string extraction
+- file-context output
+- component-summary output
+- related-file suggestion explanations
+- CLI JSON output
+
+The repository also includes a root `_smoke_test/` directory reserved for generated smoke artifacts.
 
 ## Current Limitations
 
-- PHP parsing uses `phply`, which is practical for an MVP but not a full modern PHP semantic engine.
-- Reference extraction is intentionally shallow; it supports likely definition and relationship lookup rather than precise call resolution.
-- Component inference covers common Moodle layouts and sensible core mappings, but it is not yet a complete convention engine.
-- Related-file suggestions are heuristic and deterministic, not learned or usage-ranked.
+- PHP parsing is pragmatic rather than fully semantic. The project prefers parser-based extraction when available and falls back to resilient text-based extraction when needed.
+- Relationship extraction is structural, not a full call graph.
+- Component inference covers common Moodle layouts and core subsystem mappings, but it is not yet a complete model of every Moodle convention.
+- Related-file suggestions are deterministic heuristics, not ranked by usage data.
 - Indexing is rebuild-only in Phase 1.
 
-## Suggested Future Phases
+## Future Directions
 
-- incremental indexing and change detection
-- richer Moodle convention extraction from more `db/*.php` files
-- improved PHP parsing with stronger modern syntax support
-- better symbol reference resolution
-- plugin-aware retrieval ranking
-- optional embeddings or hybrid retrieval
-- editor and agent workflow integrations
+- stronger PHP parsing support for more modern syntax patterns
+- broader extraction from additional Moodle `db/*.php` conventions
+- richer symbol reference resolution
+- better result ranking for retrieval workflows
+- optional hybrid retrieval layers on top of the structured index
 
 ## Development Notes
 
-The implementation aims to be easy to extend rather than exhaustive. Each major module has a short docstring describing its role, and the SQLite schema is intentionally straightforward so a new engineer can add tables, relationships, or new extractors without untangling a speculative framework.
+This project is intentionally a maintainable Phase 1 foundation. The goal is to make Moodle structure explicit in a form an agent or engineer can trust today, while keeping the codebase simple enough to extend in later phases.

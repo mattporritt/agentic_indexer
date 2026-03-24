@@ -44,3 +44,23 @@ def test_cli_index_and_file_context(tmp_path: Path, capsys) -> None:
     assert context_payload["status"] == "ok"
     assert context_payload["data"]["file_role"] == "renderer_file"
     assert context_payload["data"]["component"] == "mod_forum"
+    assert context_payload["data"]["string_usages"] == [
+        {"component_name": "mod_forum", "line": 8, "string_key": "pluginname"}
+    ]
+
+    exit_code = main(
+        [
+            "find-symbol",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "discussion_exporter",
+        ]
+    )
+    assert exit_code == 0
+    symbol_payload = json.loads(capsys.readouterr().out)
+    assert symbol_payload["status"] == "ok"
+    assert any(
+        item["type"] == "extends" and item["target"] == "\\external_api"
+        for item in symbol_payload["data"]["matches"][0]["relationships"]
+    )
