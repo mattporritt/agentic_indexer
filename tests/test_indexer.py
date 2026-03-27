@@ -10,6 +10,7 @@ from moodle_indexer.extractors import (
     extract_language_strings,
     extract_php_artifacts,
 )
+from moodle_indexer import indexer as indexer_module
 from moodle_indexer.indexer import build_index
 from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
 from moodle_indexer.queries import component_summary, file_context, find_symbol, suggest_related
@@ -118,6 +119,17 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
     assert result["layout_type"] == "classic"
     assert result["components"] >= 5
     assert result["relationships"] >= 6
+    assert result["discovered_files"] >= result["processed_files"] == result["files"]
+    assert result["persisted_files"] == result["processed_files"]
+    assert result["failed_files"] == 0
+    assert result["skipped_files"] == 0
+    assert result["worker_usage"]["requested_workers"] == 2
+    assert result["worker_usage"]["mode"] == "parallel"
+    assert result["worker_usage"]["tasks_submitted"] == result["discovered_files"]
+    assert result["timings"]["scan_seconds"] >= 0
+    assert result["timings"]["pipeline_seconds"] >= 0
+    assert result["timings"]["persistence_seconds"] >= 0
+    assert result["timings"]["total_seconds"] >= 0
 
     connection = open_database(db_path)
     try:
@@ -182,6 +194,8 @@ def test_split_layout_indexes_whole_repository_and_supports_moodle_native_querie
     assert result["application_root"] == str(SPLIT_APP_ROOT.resolve())
     assert result["layout_type"] == "split_public"
     assert result["components"] > 2
+    assert result["failed_files"] == 0
+    assert result["persisted_files"] == result["processed_files"] == result["files"]
 
     connection = open_database(db_path)
     try:
@@ -257,3 +271,24 @@ def test_split_layout_indexes_whole_repository_and_supports_moodle_native_querie
         assert repository_relative_lookup["repository_relative_path"] == "public/mod/forum/lib.php"
     finally:
         connection.close()
+
+
+def test_index_summary_reports_failed_files_without_aborting(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "failure.sqlite"
+    original = indexer_module._process_file_for_indexing
+
+    def flaky_process(repository_root: Path, application_root: Path, file_path: Path) -> dict:
+        if file_path.name == "renderer.php":
+            raise RuntimeError("synthetic extraction failure")
+        return original(repository_root, application_root, file_path)
+
+    monkeypatch.setattr(indexer_module, "_process_file_for_indexing", flaky_process)
+
+    result = build_index(build_index_config(str(CLASSIC_FIXTURE_ROOT), str(db_path), workers=2))
+
+    assert result["discovered_files"] > 0
+    assert result["failed_files"] == 1
+    assert result["processed_files"] == result["discovered_files"] - 1
+    assert result["persisted_files"] == result["processed_files"]
+    assert result["failure_examples"][0]["file"].endswith("mod/forum/renderer.php")
+    assert "synthetic extraction failure" in result["failure_examples"][0]["error"]

@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=max(1, min(8, os.cpu_count() or 1)),
-        help="Number of worker processes to use for parallel extraction. Higher values use more CPU.",
+        help="Number of worker threads to use for parallel extraction. SQLite persistence stays serial.",
     )
 
     find_parser = subparsers.add_parser("find-symbol", help="Find symbol definitions by name or fully qualified name.")
@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
 def configure_logging() -> None:
     """Configure user-friendly progress logging for CLI execution."""
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", force=True)
 
 
 def main(argv: list[str] | None = None) -> int:

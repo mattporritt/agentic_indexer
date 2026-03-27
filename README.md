@@ -100,6 +100,14 @@ pip install -e .
 
 `requirements.txt` is the baseline dependency file. `pyproject.toml` adds package metadata and the `moodle-indexer` CLI entrypoint.
 
+After `pip install -e .`, the canonical way to run the tool is:
+
+```bash
+moodle-indexer --help
+```
+
+Normal development usage should not require `PYTHONPATH=src python -m ...`.
+
 ## CLI Usage
 
 The tool does not assume it lives beside the Moodle checkout. Always pass the Moodle repository path explicitly.
@@ -182,7 +190,7 @@ moodle-indexer suggest-related \
   --file admin/tool/demo/settings.php
 ```
 
-You can also run the package directly:
+The package can still be run directly for debugging:
 
 ```bash
 python -m moodle_indexer --help
@@ -278,13 +286,32 @@ JSON output is deterministic:
 - `application_root`: the detected Moodle application root used for Moodle-native paths
 - `layout_type`: `classic` or `split_public`
 
+During indexing, human-readable diagnostics are written to stderr while the final JSON result stays on stdout. The logs distinguish:
+
+- repository scan and discovery
+- parsing/extraction progress
+- serial SQLite persistence progress
+- final counts for discovered, processed, persisted, skipped, and failed files
+- worker configuration and lightweight timing information
+
+The final `index` JSON also includes:
+
+- `discovered_files`
+- `processed_files`
+- `persisted_files`
+- `skipped_files`
+- `failed_files`
+- `ignored_files`
+- `worker_usage`
+- `timings`
+
 `file-context` uses the repository metadata stored in the SQLite index. After indexing, it only needs `--db-path` and a `--file` value that is either:
 
 - a Moodle-native path such as `mod/forum/lib.php`
 - a repository-relative path such as `public/mod/forum/lib.php`
 - an absolute path inside the indexed repository
 
-During `index`, the CLI now emits a progress bar on stderr so long-running rebuilds are easier to monitor. The `--workers` option controls parallel extraction throughput; higher values usually improve indexing speed at the cost of more CPU usage.
+During `index`, the CLI emits phase-based progress on stderr so long-running rebuilds are easier to monitor. The `--workers` option controls parallel extraction threads; SQLite persistence still happens serially in the main process, so the worker count is only one part of overall throughput.
 
 ## Moodle Component Coverage
 

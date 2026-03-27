@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from moodle_indexer.components import infer_component
 from moodle_indexer.config import IndexConfig
@@ -43,18 +45,29 @@ from moodle_indexer.store import (
 
 
 LOGGER = logging.getLogger(__name__)
+FAILURE_SAMPLE_LIMIT = 5
 
 
 def build_index(config: IndexConfig) -> dict[str, int | str]:
     """Build a fresh SQLite index for the target Moodle repository."""
 
+    started_at = time.perf_counter()
     repository_root = config.repository_root.resolve(strict=True)
     application_root = config.application_root.resolve(strict=True)
-    LOGGER.info("Scanning Moodle repository at %s", repository_root)
-    LOGGER.info("Application root detected at %s", application_root)
-    files = scan_repository(repository_root)
-    LOGGER.info("Discovered %d candidate files", len(files))
-    LOGGER.info("Using %d worker(s) for extraction", config.workers)
+    LOGGER.info("Scanning repository at %s", repository_root)
+    LOGGER.info("Application root: %s (%s layout)", application_root, config.layout_type)
+
+    scan_started_at = time.perf_counter()
+    scan_result = scan_repository(repository_root)
+    scan_seconds = time.perf_counter() - scan_started_at
+    files = scan_result.files
+    discovered_files = len(files)
+    LOGGER.info(
+        "Discovered %d candidate files in %.2fs (%d ignored during scan)",
+        discovered_files,
+        scan_seconds,
+        scan_result.ignored_files,
+    )
 
     connection = initialize_database(config.database_path)
     repository_id = insert_repository(
@@ -75,10 +88,44 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
         "language_strings": 0,
         "tests": 0,
     }
+    worker_stats = _resolve_worker_usage(config.workers, discovered_files)
+    failure_examples: list[dict[str, str]] = []
+    processed_files = 0
+    failed_files = 0
+    skipped_files = 0
+    persisted_files = 0
+    persistence_seconds = 0.0
 
-    progress = ProgressBar(total=len(files))
+    LOGGER.info(
+        "Extraction mode: %s (requested workers=%d, active workers=%d, tasks=%d)",
+        worker_stats["mode"],
+        worker_stats["requested_workers"],
+        worker_stats["active_workers"],
+        worker_stats["tasks_submitted"],
+    )
+    if worker_stats["mode"] == "parallel":
+        LOGGER.info("SQLite persistence remains serial in the main process.")
+
+    extraction_progress = ProgressBar(total=discovered_files, label="Parsing/extracting files")
+    persistence_progress = ProgressBar(total=discovered_files, label="Persisting records")
+    extraction_started_at = time.perf_counter()
     try:
-        for file_payload in _iter_file_payloads(repository_root, application_root, files, config.workers):
+        for result in _iter_file_payloads(repository_root, application_root, files, worker_stats["active_workers"]):
+            extraction_progress.advance()
+            if result["status"] == "failed":
+                failed_files += 1
+                if len(failure_examples) < FAILURE_SAMPLE_LIMIT:
+                    failure_examples.append(
+                        {
+                            "file": result["file"],
+                            "error": result["error"],
+                        }
+                    )
+                continue
+
+            processed_files += 1
+            file_payload = result["payload"]
+            persist_started_at = time.perf_counter()
             repository_relative_path = file_payload["repository_relative_path"]
             moodle_path = file_payload["moodle_path"]
             component = file_payload["component"]
@@ -133,12 +180,36 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
             for language_string in file_payload["language_strings"]:
                 insert_language_string(connection, file_id, component_id, asdict(language_string))
             counts["language_strings"] += len(file_payload["language_strings"])
-            progress.advance()
+            persisted_files += 1
+            persistence_seconds += time.perf_counter() - persist_started_at
+            persistence_progress.advance()
     finally:
-        progress.close()
+        extraction_progress.close()
+        persistence_progress.close()
 
+    pipeline_seconds = time.perf_counter() - extraction_started_at
     connection.commit()
     connection.close()
+    total_seconds = time.perf_counter() - started_at
+
+    LOGGER.info(
+        "Completed indexing in %.2fs: discovered=%d processed=%d persisted=%d skipped=%d failed=%d",
+        total_seconds,
+        discovered_files,
+        processed_files,
+        persisted_files,
+        skipped_files,
+        failed_files,
+    )
+    LOGGER.info(
+        "Phase timings: scan=%.2fs pipeline=%.2fs persistence=%.2fs total=%.2fs",
+        scan_seconds,
+        pipeline_seconds,
+        persistence_seconds,
+        total_seconds,
+    )
+    if failure_examples:
+        LOGGER.warning("Sample failures: %s", failure_examples)
 
     return {
         "repository": str(repository_root),
@@ -147,6 +218,20 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
         "application_root": str(application_root),
         "layout_type": config.layout_type,
         "database": str(config.database_path),
+        "discovered_files": discovered_files,
+        "processed_files": processed_files,
+        "persisted_files": persisted_files,
+        "skipped_files": skipped_files,
+        "failed_files": failed_files,
+        "ignored_files": scan_result.ignored_files,
+        "worker_usage": worker_stats,
+        "timings": {
+            "scan_seconds": round(scan_seconds, 4),
+            "pipeline_seconds": round(pipeline_seconds, 4),
+            "persistence_seconds": round(persistence_seconds, 4),
+            "total_seconds": round(total_seconds, 4),
+        },
+        "failure_examples": failure_examples,
         **counts,
     }
 
@@ -157,26 +242,52 @@ def _iter_file_payloads(
     files: list[Path],
     workers: int,
 ):
-    """Yield extracted file payloads in input order.
+    """Yield extraction results in input order.
 
     Extraction work benefits from concurrent file I/O and parsing, while the
     main process keeps SQLite writes serialized and deterministic.
     """
 
-    if workers == 1:
+    if workers <= 1 or len(files) <= 1:
         for file_path in files:
-            yield _process_file_for_indexing(repository_root, application_root, file_path)
+            try:
+                yield {
+                    "status": "ok",
+                    "payload": _process_file_for_indexing(repository_root, application_root, file_path),
+                }
+            except Exception as exc:  # pragma: no cover - exercised via monkeypatch tests.
+                yield {
+                    "status": "failed",
+                    "file": str(file_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
         return
 
-    max_workers = max(1, min(workers, len(files), os.cpu_count() or 1))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        yield from executor.map(
-            _process_file_for_indexing,
-            [repository_root] * len(files),
-            [application_root] * len(files),
-            files,
-            chunksize=32,
-        )
+    pending_results: dict[int, dict[str, Any]] = {}
+    next_index = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_process_file_for_indexing, repository_root, application_root, file_path): (index, file_path)
+            for index, file_path in enumerate(files)
+        }
+        for future in as_completed(futures):
+            index, file_path = futures[future]
+            try:
+                pending_results[index] = {
+                    "status": "ok",
+                    "payload": future.result(),
+                }
+            except Exception as exc:  # pragma: no cover - exercised via monkeypatch tests.
+                pending_results[index] = {
+                    "status": "failed",
+                    "file": str(file_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+
+            while next_index in pending_results:
+                yield pending_results.pop(next_index)
+                next_index += 1
 
 
 def _process_file_for_indexing(repository_root: Path, application_root: Path, file_path: Path) -> dict:
@@ -220,4 +331,16 @@ def _process_file_for_indexing(repository_root: Path, application_root: Path, fi
         "relationships": relationships,
         "symbols": symbols,
         "tests": tests,
+    }
+
+
+def _resolve_worker_usage(requested_workers: int, task_count: int) -> dict[str, int | str]:
+    """Return lightweight diagnostics about the configured extraction workers."""
+
+    active_workers = max(1, min(requested_workers, task_count or 1, os.cpu_count() or 1))
+    return {
+        "requested_workers": requested_workers,
+        "active_workers": active_workers,
+        "tasks_submitted": task_count,
+        "mode": "serial" if active_workers == 1 else "parallel",
     }

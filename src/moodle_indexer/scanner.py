@@ -6,6 +6,8 @@ while skipping common cache and VCS directories to keep rebuilds predictable.
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -22,16 +24,29 @@ SKIP_DIRECTORIES = {
 }
 
 
-def scan_repository(root: Path) -> list[Path]:
-    """Return sorted repository files considered for indexing."""
+@dataclass(slots=True)
+class ScanResult:
+    """Summary of repository discovery before extraction starts."""
+
+    files: list[Path]
+    ignored_files: int
+
+
+def scan_repository(root: Path) -> ScanResult:
+    """Return candidate files and lightweight scan diagnostics."""
 
     root = root.resolve(strict=True)
     files: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part in SKIP_DIRECTORIES for part in path.parts):
-            continue
-        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            files.append(path)
-    return sorted(files)
+    ignored_files = 0
+
+    for current_root, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in SKIP_DIRECTORIES)
+        current_dir = Path(current_root)
+        for filename in sorted(filenames):
+            path = current_dir / filename
+            if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                files.append(path)
+            else:
+                ignored_files += 1
+
+    return ScanResult(files=files, ignored_files=ignored_files)

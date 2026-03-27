@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 from moodle_indexer.cli import main
@@ -39,7 +40,14 @@ def test_cli_index_and_file_context_for_classic_layout(tmp_path: Path, capsys) -
     assert index_payload["data"]["repository_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
     assert index_payload["data"]["application_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
     assert index_payload["data"]["layout_type"] == "classic"
-    assert "Indexing files" in captured.err
+    assert index_payload["data"]["discovered_files"] >= index_payload["data"]["processed_files"]
+    assert index_payload["data"]["persisted_files"] == index_payload["data"]["processed_files"]
+    assert index_payload["data"]["failed_files"] == 0
+    assert index_payload["data"]["worker_usage"]["active_workers"] == 2
+    assert "Scanning repository" in captured.err
+    assert "Discovered" in captured.err
+    assert "Parsing/extracting files" in captured.err
+    assert "Persisting records" in captured.err
 
     exit_code = main(
         [
@@ -109,6 +117,11 @@ def test_python_module_index_command_supports_split_layout_metadata(tmp_path: Pa
         assert forum_row["component_name"] == "mod_forum"
     finally:
         connection.close()
+
+
+def test_packaging_declares_canonical_moodle_indexer_console_script() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["scripts"]["moodle-indexer"] == "moodle_indexer.cli:main"
 
 
 def test_file_context_cli_uses_moodle_native_paths_for_split_layout(tmp_path: Path, capsys) -> None:
