@@ -8,3 +8,4 @@ build/
 /_smoke_test/
 .DS_Store
 .db/
+.idea/
