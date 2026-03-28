@@ -170,6 +170,30 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         """,
         (file_id,),
     ).fetchall()
+    webservices = connection.execute(
+        """
+        SELECT
+            service_name,
+            line,
+            classpath,
+            classname,
+            methodname,
+            resolved_target_file,
+            resolution_type,
+            resolution_status
+        FROM webservices
+        WHERE webservices.file_id = ?
+        ORDER BY service_name, line
+        """,
+        (file_id,),
+    ).fetchall()
+
+    related_suggestions = [
+        {"path": item.path, "reason": item.reason}
+        for item in suggest_related_files(moodle_path)
+    ]
+    related_suggestions.extend(_service_related_suggestions(webservices))
+    related_suggestions = _deduplicate_suggestions(related_suggestions)
 
     return {
         "file": moodle_path,
@@ -197,11 +221,9 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         "capability_checks": [dict(item) for item in capability_checks],
         "string_usages": [dict(item) for item in string_usages],
         "tests": [dict(item) for item in tests],
+        "webservices": [dict(item) for item in webservices],
         "relationships": [dict(item) for item in relationships],
-        "related_suggestions": [
-            {"path": item.path, "reason": item.reason}
-            for item in suggest_related_files(moodle_path)
-        ],
+        "related_suggestions": related_suggestions,
         "repository_root": repository["repository_root"],
         "application_root": repository["application_root"],
     }
@@ -257,6 +279,23 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
         """,
         (component["id"],),
     ).fetchall()
+    webservices = connection.execute(
+        """
+        SELECT
+            service_name,
+            line,
+            classpath,
+            classname,
+            methodname,
+            resolved_target_file,
+            resolution_type,
+            resolution_status
+        FROM webservices
+        WHERE component_id = ?
+        ORDER BY service_name, line
+        """,
+        (component["id"],),
+    ).fetchall()
     capability_checks = connection.execute(
         "SELECT capability_name, function_name, line FROM capability_usages WHERE component_id = ? ORDER BY capability_name, line",
         (component["id"],),
@@ -293,6 +332,7 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
             "capability_count": len(capabilities),
             "language_string_count": len(strings),
             "test_count": len(tests),
+            "webservice_count": len(webservices),
             "capability_check_count": len(capability_checks),
             "string_usage_count": len(string_usages),
             "relationship_count": relationship_count,
@@ -312,6 +352,7 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
             for item in capabilities
         ],
         "language_strings": [{"string_key": item["string_key"], "line": item["line"]} for item in strings],
+        "webservices": [dict(item) for item in webservices],
         "tests": [dict(item) for item in tests],
         "sample_symbols": [dict(item) for item in symbols],
     }
@@ -337,6 +378,17 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
                 "indexed": bool(exists),
             }
         )
+    webservices = connection.execute(
+        """
+        SELECT service_name, classname, classpath, resolved_target_file, resolution_type
+        FROM webservices
+        WHERE file_id = ?
+        ORDER BY service_name
+        """,
+        (row["id"],),
+    ).fetchall()
+    suggestions.extend(_indexed_service_suggestions(connection, webservices))
+    suggestions = _deduplicate_indexed_suggestions(suggestions)
     return {
         "file": moodle_path,
         "repository_relative_path": row["repository_relative_path"],
@@ -442,3 +494,93 @@ def _get_indexed_repository_metadata(connection: sqlite3.Connection) -> sqlite3.
     if row is None:
         raise ValidationError("Indexed repository metadata not found in database.")
     return row
+
+
+def _service_related_suggestions(webservices: list[sqlite3.Row]) -> list[dict[str, str]]:
+    """Return non-index-aware related suggestions from resolved service targets."""
+
+    suggestions: list[dict[str, str]] = []
+    for item in webservices:
+        if not item["resolved_target_file"]:
+            continue
+        if item["resolution_type"] == "classpath":
+            reason = f"suggested because db/services.php references this file via classpath for {item['service_name']}"
+        else:
+            reason = (
+                f"suggested because db/services.php references class {item['classname']}, "
+                f"which resolves to this file"
+            )
+        suggestions.append({"path": item["resolved_target_file"], "reason": reason})
+    return suggestions
+
+
+def _indexed_service_suggestions(
+    connection: sqlite3.Connection,
+    webservices: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return indexed related-file suggestions from resolved service targets."""
+
+    target_counts: dict[str, int] = {}
+    target_reasons: dict[str, str] = {}
+    for item in webservices:
+        target_file = item["resolved_target_file"]
+        if not target_file:
+            continue
+        target_counts[target_file] = target_counts.get(target_file, 0) + 1
+        if target_file not in target_reasons:
+            if item["resolution_type"] == "classpath":
+                target_reasons[target_file] = (
+                    f"suggested because db/services.php references this file via classpath for {item['service_name']}"
+                )
+            else:
+                target_reasons[target_file] = (
+                    f"suggested because db/services.php references class {item['classname']}, "
+                    "which resolves to this file"
+                )
+
+    suggestions: list[dict[str, object]] = []
+    for target_file, count in sorted(target_counts.items()):
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (target_file, target_file),
+        ).fetchone()
+        reason = target_reasons[target_file]
+        if count > 1:
+            reason = f"{reason}; multiple services in this file resolve here"
+        suggestions.append(
+            {
+                "path": target_file,
+                "reason": reason,
+                "indexed": bool(exists),
+            }
+        )
+    return suggestions
+
+
+def _deduplicate_suggestions(suggestions: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Deduplicate non-index-aware suggestions by path and reason."""
+
+    seen: set[tuple[str, str]] = set()
+    ordered: list[dict[str, str]] = []
+    for item in suggestions:
+        key = (item["path"], item["reason"])
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(item)
+    return ordered
+
+
+def _deduplicate_indexed_suggestions(suggestions: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Deduplicate suggest-related results by path, preserving indexed truthiness."""
+
+    merged: dict[str, dict[str, object]] = {}
+    for item in suggestions:
+        existing = merged.get(item["path"])
+        if existing is None:
+            merged[item["path"]] = dict(item)
+            continue
+        existing["indexed"] = bool(existing["indexed"] or item["indexed"])
+        if item["reason"] not in str(existing["reason"]):
+            existing["reason"] = f"{existing['reason']} | {item['reason']}"
+    return [merged[path] for path in sorted(merged)]

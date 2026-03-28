@@ -23,6 +23,7 @@ from moodle_indexer.extractors import (
     extract_language_strings,
     extract_php_artifacts,
     extract_tests,
+    extract_webservices,
     is_php_file,
 )
 from moodle_indexer.file_roles import classify_file_role
@@ -41,6 +42,7 @@ from moodle_indexer.store import (
     insert_repository,
     insert_symbol,
     insert_test,
+    insert_webservice,
 )
 from moodle_indexer.subplugins import load_subplugin_mounts
 
@@ -90,6 +92,7 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
         "relationships": 0,
         "capabilities": 0,
         "language_strings": 0,
+        "webservices": 0,
         "tests": 0,
     }
     worker_stats = _resolve_worker_usage(config.workers, discovered_files)
@@ -182,6 +185,10 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
 
             for usage in file_payload["language_string_usages"]:
                 insert_language_string_usage(connection, file_id, asdict(usage))
+
+            for webservice in file_payload["webservices"]:
+                insert_webservice(connection, file_id, component_id, asdict(webservice))
+            counts["webservices"] += len(file_payload["webservices"])
 
             for test_record in file_payload["tests"]:
                 insert_test(connection, file_id, component_id, asdict(test_record))
@@ -326,12 +333,14 @@ def _process_file_for_indexing(repository_root: Path, application_root: Path, fi
     capability_usages = []
     language_string_usages = []
     tests = []
+    webservices = []
 
     if is_php_file(file_path):
         symbols, relationships = extract_php_artifacts(source, indexed_paths.moodle_path, component.name)
         capabilities = extract_capabilities(source, indexed_paths.moodle_path, component.name)
         capability_usages = extract_capability_usages(source, indexed_paths.moodle_path, component.name)
         language_string_usages = extract_language_string_usages(source, indexed_paths.moodle_path)
+        webservices = extract_webservices(source, indexed_paths.moodle_path, component.name)
         tests = extract_tests(source, indexed_paths.moodle_path, component.name)
 
     language_strings = extract_language_strings(source, indexed_paths.moodle_path, component.name)
@@ -353,6 +362,7 @@ def _process_file_for_indexing(repository_root: Path, application_root: Path, fi
         "relationships": relationships,
         "symbols": symbols,
         "tests": tests,
+        "webservices": webservices,
     }
 
 

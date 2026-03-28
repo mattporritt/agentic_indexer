@@ -115,6 +115,22 @@ class LanguageStringUsageRecord:
 
 
 @dataclass(slots=True)
+class WebServiceRecord:
+    """Represents one service function defined in ``db/services.php``."""
+
+    service_name: str
+    component_name: str
+    file_path: str
+    line: int
+    classpath: str | None = None
+    classname: str | None = None
+    methodname: str | None = None
+    resolved_target_file: str | None = None
+    resolution_type: str = "unresolved"
+    resolution_status: str = "unresolved"
+
+
+@dataclass(slots=True)
 class TestRecord:
     """Represents a discovered test artifact."""
 

@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from moodle_indexer.components import component_root_from_name
 from moodle_indexer.file_roles import classify_file_role
 from moodle_indexer.models import (
     CapabilityRecord,
@@ -19,6 +20,7 @@ from moodle_indexer.models import (
     RelationshipRecord,
     SymbolRecord,
     TestRecord,
+    WebServiceRecord,
 )
 from moodle_indexer.php_parser import ParsedSymbol, parse_php_symbols
 
@@ -27,6 +29,7 @@ STRING_DEF_RE = re.compile(r"\$string\['([^']+)'\]\s*=\s*'((?:\\'|[^'])*)';")
 GET_STRING_RE = re.compile(r"\bget_string\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)")
 FEATURE_SCENARIO_RE = re.compile(r"^\s*(Feature|Scenario|Scenario Outline):\s*(.+)\s*$", re.MULTILINE)
 CAPABILITIES_ASSIGNMENT_RE = re.compile(r"\$capabilities\s*=")
+FUNCTIONS_ASSIGNMENT_RE = re.compile(r"\$functions\s*=")
 
 
 @dataclass(slots=True)
@@ -401,6 +404,39 @@ def extract_capability_usages(source: str, relative_path: str, component_name: s
     return usages
 
 
+def extract_webservices(source: str, relative_path: str, component_name: str) -> list[WebServiceRecord]:
+    """Extract service definitions from ``db/services.php``."""
+
+    if classify_file_role(relative_path) != "services_definition":
+        return []
+
+    webservices: list[WebServiceRecord] = []
+    for entry in _parse_functions_entries(source):
+        metadata = _parse_service_metadata(source, entry)
+        classpath = metadata.get("classpath")
+        classname = metadata.get("classname")
+        resolved_target_file, resolution_type, resolution_status = _resolve_service_target(
+            component_name,
+            classpath,
+            classname,
+        )
+        webservices.append(
+            WebServiceRecord(
+                service_name=entry.key,
+                component_name=component_name,
+                file_path=relative_path,
+                line=source.count("\n", 0, entry.key_index) + 1,
+                classpath=classpath,
+                classname=classname,
+                methodname=metadata.get("methodname"),
+                resolved_target_file=resolved_target_file,
+                resolution_type=resolution_type,
+                resolution_status=resolution_status,
+            )
+        )
+    return webservices
+
+
 def extract_language_strings(source: str, relative_path: str, component_name: str) -> list[LanguageStringRecord]:
     """Extract language string definitions from ``lang/en/*.php`` files."""
 
@@ -495,6 +531,67 @@ def extract_tests(source: str, relative_path: str, component_name: str) -> list[
                     )
                 )
     return tests
+
+
+def _parse_functions_entries(source: str) -> list[PhpArrayEntry]:
+    """Return top-level service entries from the ``$functions`` array."""
+
+    match = FUNCTIONS_ASSIGNMENT_RE.search(source)
+    if match is None:
+        return []
+
+    array_start = _locate_array_start(source, match.end())
+    if array_start is None:
+        return []
+    array_end = _find_matching_delimiter(source, array_start)
+    return _parse_php_array_entries(source, array_start, array_end)
+
+
+def _parse_service_metadata(source: str, entry: PhpArrayEntry) -> dict[str, str]:
+    """Return selected metadata fields from one service definition."""
+
+    value_start = _locate_array_start(source, entry.value_start, limit=entry.value_end)
+    if value_start is None:
+        return {}
+    value_end = _find_matching_delimiter(source, value_start)
+    child_entries = _parse_php_array_entries(source, value_start, value_end)
+    metadata: dict[str, str] = {}
+    for child in child_entries:
+        normalized_key = child.key.lower()
+        if normalized_key in {"classpath", "classname", "methodname"}:
+            metadata[normalized_key] = _normalize_php_scalar(child.raw_value)
+    return metadata
+
+
+def _resolve_service_target(
+    component_name: str,
+    classpath: str | None,
+    classname: str | None,
+) -> tuple[str | None, str, str]:
+    """Resolve a service definition to its implementation file when practical."""
+
+    if classpath:
+        return Path(classpath).as_posix().lstrip("/"), "classpath", "resolved"
+    if classname:
+        resolved = _resolve_classname_to_file_path(classname)
+        if resolved is not None:
+            return resolved, "classname", "resolved"
+    return None, "unresolved", "unresolved"
+
+
+def _resolve_classname_to_file_path(classname: str) -> str | None:
+    """Resolve a Moodle class name to its expected autoloaded PHP file path."""
+
+    namespace_parts = classname.split("\\")
+    if not namespace_parts:
+        return None
+    component_root = component_root_from_name(namespace_parts[0])
+    if component_root is None or len(namespace_parts) < 2:
+        return None
+    relative_parts = [part for part in namespace_parts[1:] if part]
+    if not relative_parts:
+        return None
+    return f"{component_root}/classes/{'/'.join(relative_parts)}.php"
 
 
 def _symbol_record_from_parsed(parsed: ParsedSymbol, relative_path: str, component_name: str) -> SymbolRecord:

@@ -9,6 +9,7 @@ from moodle_indexer.extractors import (
     extract_capabilities,
     extract_language_strings,
     extract_php_artifacts,
+    extract_webservices,
 )
 from moodle_indexer import indexer as indexer_module
 from moodle_indexer.indexer import build_index
@@ -120,6 +121,23 @@ def test_capability_and_language_string_extractors_capture_metadata() -> None:
     assert strings[0].string_value == "Forum"
 
 
+def test_webservice_extractor_resolves_classpath_and_classname_targets() -> None:
+    source = _read_fixture("mod/assign/db/services.php")
+    webservices = extract_webservices(source, "mod/assign/db/services.php", "mod_assign")
+
+    service_map = {item.service_name: item for item in webservices}
+    assert set(service_map) == {
+        "mod_assign_start_submission",
+        "mod_assign_submit_grading_form",
+    }
+    assert service_map["mod_assign_submit_grading_form"].classpath == "mod/assign/externallib.php"
+    assert service_map["mod_assign_submit_grading_form"].resolved_target_file == "mod/assign/externallib.php"
+    assert service_map["mod_assign_submit_grading_form"].resolution_type == "classpath"
+    assert service_map["mod_assign_start_submission"].classname == "mod_assign\\external\\start_submission"
+    assert service_map["mod_assign_start_submission"].resolved_target_file == "mod/assign/classes/external/start_submission.php"
+    assert service_map["mod_assign_start_submission"].resolution_type == "classname"
+
+
 def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
     db_path = tmp_path / "classic.sqlite"
     result = build_index(build_index_config(str(CLASSIC_FIXTURE_ROOT), str(db_path), workers=2))
@@ -167,7 +185,15 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             row["name"]
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
         }
-        assert {"mod_forum", "forumreport_summary", "tool_demo", "theme_boost", "enrol_manual", "tool_phpunit"} <= stored_components
+        assert {
+            "mod_forum",
+            "forumreport_summary",
+            "mod_assign",
+            "tool_demo",
+            "theme_boost",
+            "enrol_manual",
+            "tool_phpunit",
+        } <= stored_components
 
         symbol_result = find_symbol(connection, "discussion_exporter")
         assert symbol_result["matches"][0]["file"] == "mod/forum/classes/external/discussion_exporter.php"
@@ -222,6 +248,42 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             "forumreport/summary:view",
             "forumreport/summary:viewall",
         }
+
+        assign_summary = component_summary(connection, "mod_assign")
+        assert {item["service_name"] for item in assign_summary["webservices"]} == {
+            "mod_assign_start_submission",
+            "mod_assign_submit_grading_form",
+        }
+        service_resolution_types = {
+            item["service_name"]: item["resolution_type"]
+            for item in assign_summary["webservices"]
+        }
+        assert service_resolution_types["mod_assign_submit_grading_form"] == "classpath"
+        assert service_resolution_types["mod_assign_start_submission"] == "classname"
+
+        services_context = file_context(connection, "mod/assign/db/services.php")
+        assert {item["service_name"] for item in services_context["webservices"]} == {
+            "mod_assign_start_submission",
+            "mod_assign_submit_grading_form",
+        }
+        assert {
+            item["resolved_target_file"] for item in services_context["webservices"]
+        } == {
+            "mod/assign/externallib.php",
+            "mod/assign/classes/external/start_submission.php",
+        }
+        service_related_paths = {item["path"] for item in services_context["related_suggestions"]}
+        assert "mod/assign/externallib.php" in service_related_paths
+        assert "mod/assign/classes/external/start_submission.php" in service_related_paths
+
+        assign_related = suggest_related(connection, "mod/assign/db/services.php")
+        assign_suggestions = {item["path"]: item for item in assign_related["suggestions"]}
+        assert "mod/assign/externallib.php" in assign_suggestions
+        assert "classpath" in assign_suggestions["mod/assign/externallib.php"]["reason"]
+        assert "mod/assign/classes/external/start_submission.php" in assign_suggestions
+        assert "mod_assign\\external\\start_submission" in assign_suggestions[
+            "mod/assign/classes/external/start_submission.php"
+        ]["reason"]
 
         related_result = suggest_related(connection, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}

@@ -117,6 +117,21 @@ SCHEMA_STATEMENTS = [
     );
     """,
     """
+    CREATE TABLE webservices (
+        id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        component_id INTEGER NOT NULL REFERENCES components(id) ON DELETE CASCADE,
+        service_name TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        classpath TEXT,
+        classname TEXT,
+        methodname TEXT,
+        resolved_target_file TEXT,
+        resolution_type TEXT NOT NULL,
+        resolution_status TEXT NOT NULL
+    );
+    """,
+    """
     CREATE TABLE tests (
         id INTEGER PRIMARY KEY,
         file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -150,6 +165,9 @@ SCHEMA_STATEMENTS = [
     """,
     """
     CREATE INDEX idx_language_strings_key ON language_strings(string_key);
+    """,
+    """
+    CREATE INDEX idx_webservices_component_id ON webservices(component_id);
     """,
     """
     CREATE INDEX idx_tests_component_id ON tests(component_id);
@@ -386,5 +404,44 @@ def insert_test(connection: sqlite3.Connection, file_id: int, component_id: int,
             test_record["test_type"],
             test_record["line"],
             test_record.get("related_symbol"),
+        ),
+    )
+
+
+def insert_webservice(
+    connection: sqlite3.Connection,
+    file_id: int,
+    component_id: int,
+    webservice: dict[str, Any],
+) -> None:
+    """Insert one service definition row."""
+
+    connection.execute(
+        """
+        INSERT INTO webservices (
+            file_id,
+            component_id,
+            service_name,
+            line,
+            classpath,
+            classname,
+            methodname,
+            resolved_target_file,
+            resolution_type,
+            resolution_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            file_id,
+            component_id,
+            webservice["service_name"],
+            webservice["line"],
+            webservice.get("classpath"),
+            webservice.get("classname"),
+            webservice.get("methodname"),
+            webservice.get("resolved_target_file"),
+            webservice["resolution_type"],
+            webservice["resolution_status"],
         ),
     )

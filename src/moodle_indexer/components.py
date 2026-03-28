@@ -33,6 +33,43 @@ def _plugin_component(
     return InferredComponent(component_name, component_type, "/".join(root_parts))
 
 
+def component_root_from_name(component_name: str) -> str | None:
+    """Return the Moodle root path for a known frankenstyle component name."""
+
+    prefix_mappings = {
+        "tool_": "admin/tool",
+        "report_": "admin/report",
+        "format_": "course/format",
+        "qtype_": "question/type",
+        "qbehaviour_": "question/behaviour",
+        "qformat_": "question/format",
+        "availability_": "availability/condition",
+        "gradereport_": "grade/report",
+        "gradeexport_": "grade/export",
+        "gradeimport_": "grade/import",
+        "media_": "media/player",
+        "paygw_": "payment/gateway",
+        "contenttype_": "contentbank/contenttype",
+        "message_": "message/output",
+        "blocks_": "blocks",
+        "mod_": "mod",
+        "local_": "local",
+        "theme_": "theme",
+        "auth_": "auth",
+        "enrol_": "enrol",
+        "repository_": "repository",
+        "filter_": "filter",
+        "editor_": "editor",
+        "portfolio_": "portfolio",
+        "plagiarism_": "plagiarism",
+    }
+    for prefix, root in prefix_mappings.items():
+        if component_name.startswith(prefix):
+            suffix = component_name.removeprefix(prefix)
+            return f"{root}/{suffix}"
+    return None
+
+
 def infer_component(relative_path: str, subplugin_mounts: Sequence[SubpluginMount] | None = None) -> InferredComponent:
     """Infer the Moodle component from a repository-relative path.
 

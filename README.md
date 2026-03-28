@@ -41,9 +41,11 @@ This tool builds a compact local index so those questions become cheap and machi
 - symbol indexing for classes, interfaces, traits, functions, and methods
 - structural relationship indexing for `extends`, `implements`, and method-to-class ownership
 - capability extraction from `db/access.php`
+- web service extraction from `db/services.php`
 - capability attribution to the owning component of the defining file
 - language string extraction from `lang/en/*.php`
 - detection of obvious `require_capability`, `has_capability`, and `get_string` usage
+- `db/services.php` extraction with support for both deprecated `classpath` implementations and modern `classname`-based external classes
 - PHPUnit and Behat discovery
 - related-file suggestions with explanation strings
 - JSON CLI commands for indexing and querying
@@ -344,6 +346,8 @@ Phase 1 handles common Moodle conventions more carefully than a generic path pre
 For non-plugin paths, the indexer falls back to sensible core subsystem mapping such as `core_admin`, `core_course`, and `core_question`.
 
 When a plugin declares subplugins in `db/subplugins.json`, files under those declared roots are attributed to the child component rather than the parent plugin. For example, `mod/forum/report/summary/...` is indexed as `forumreport_summary`, so `component-summary --component mod_forum` does not mix in `forumreport_summary` capability definitions.
+
+Service definitions in `db/services.php` are also indexed as first-class records. Older services that point at `externallib.php` through `classpath` are resolved directly to that file, while modern `classname` definitions are resolved through Moodle autoloading conventions to files such as `classes/external/start_submission.php`.
 
 ## Testing
 
