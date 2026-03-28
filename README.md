@@ -188,7 +188,6 @@ Suggest related files:
 ```bash
 moodle-indexer suggest-related \
   --db-path /path/to/moodle-index.sqlite \
-  --moodle-path /path/to/moodle \
   --file admin/tool/demo/settings.php
 ```
 

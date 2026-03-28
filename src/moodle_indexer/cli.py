@@ -57,7 +57,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     related_parser = subparsers.add_parser("suggest-related", help="Suggest likely companion files.")
     related_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
-    related_parser.add_argument("--moodle-path", required=True, help="Path to the indexed Moodle checkout.")
     related_parser.add_argument(
         "--file",
         required=True,
@@ -90,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "component-summary":
             payload = run_component_summary(args.db_path, args.component)
         elif args.command == "suggest-related":
-            payload = run_suggest_related(args.db_path, args.moodle_path, args.file)
+            payload = run_suggest_related(args.db_path, args.file)
         else:
             raise IndexerError(f"Unsupported command: {args.command}")
     except IndexerError as exc:
@@ -142,14 +141,14 @@ def run_component_summary(db_path: str, component: str) -> dict:
         connection.close()
 
 
-def run_suggest_related(db_path: str, moodle_path: str, file_path: str) -> dict:
+def run_suggest_related(db_path: str, file_path: str) -> dict:
     """Execute the ``suggest-related`` command."""
 
     connection = open_database(Path(db_path).expanduser().resolve())
     try:
         return success_payload(
             "suggest-related",
-            suggest_related(connection, Path(moodle_path).expanduser().resolve(), file_path),
+            suggest_related(connection, file_path),
         )
     finally:
         connection.close()

@@ -170,3 +170,37 @@ def test_file_context_cli_uses_moodle_native_paths_for_split_layout(tmp_path: Pa
     assert root_payload["data"]["repository_relative_path"] == "admin/cli/install_database.php"
     assert root_payload["data"]["moodle_path"] == "admin/cli/install_database.php"
     assert root_payload["data"]["absolute_path"] == str((SPLIT_FIXTURE_ROOT / "admin/cli/install_database.php").resolve())
+
+
+def test_suggest_related_cli_uses_only_db_path_and_file(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "related.sqlite"
+    exit_code = main(
+        [
+            "index",
+            "--moodle-path",
+            str(CLASSIC_FIXTURE_ROOT),
+            "--db-path",
+            str(db_path),
+            "--workers",
+            "2",
+        ]
+    )
+    assert exit_code == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "suggest-related",
+            "--db-path",
+            str(db_path),
+            "--file",
+            "mod/forum/db/access.php",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["file"] == "mod/forum/db/access.php"
+    suggestions_by_path = {item["path"]: item for item in payload["data"]["suggestions"]}
+    assert "mod/forum/lang/en/mod_forum.php" in suggestions_by_path
+    assert suggestions_by_path["mod/forum/lang/en/mod_forum.php"]["indexed"] is True

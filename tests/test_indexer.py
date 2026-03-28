@@ -223,7 +223,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             "forumreport/summary:viewall",
         }
 
-        related_result = suggest_related(connection, CLASSIC_FIXTURE_ROOT, "admin/tool/demo/settings.php")
+        related_result = suggest_related(connection, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
         assert suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["indexed"] is True
     finally:

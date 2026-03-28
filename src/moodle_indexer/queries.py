@@ -317,12 +317,8 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
     }
 
 
-def suggest_related(connection: sqlite3.Connection, repository_root: Path, file_path: str) -> dict:
-    """Return related-file suggestions for a repository file path.
-
-    ``repository_root`` is accepted for CLI compatibility, but the indexed
-    repository metadata remains the source of truth for path resolution.
-    """
+def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
+    """Return related-file suggestions for a repository file path."""
 
     repository = _get_indexed_repository_metadata(connection)
     row = _resolve_file_row(connection, repository, file_path)
