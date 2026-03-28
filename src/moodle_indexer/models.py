@@ -79,6 +79,7 @@ class CapabilityRecord:
     contextlevel: str | None = None
     archetypes: dict[str, str] = field(default_factory=dict)
     riskbitmask: str | None = None
+    clonepermissionsfrom: str | None = None
 
 
 @dataclass(slots=True)

@@ -9,6 +9,9 @@ inspection.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
+
+from moodle_indexer.subplugins import SubpluginMount
 
 
 @dataclass(slots=True)
@@ -30,7 +33,7 @@ def _plugin_component(
     return InferredComponent(component_name, component_type, "/".join(root_parts))
 
 
-def infer_component(relative_path: str) -> InferredComponent:
+def infer_component(relative_path: str, subplugin_mounts: Sequence[SubpluginMount] | None = None) -> InferredComponent:
     """Infer the Moodle component from a repository-relative path.
 
     The rules favour explicit Moodle conventions first and only fall back to
@@ -41,6 +44,11 @@ def infer_component(relative_path: str) -> InferredComponent:
     parts = [part for part in relative_path.split("/") if part]
     if not parts:
         return InferredComponent("core", "core", ".")
+
+    if subplugin_mounts:
+        subplugin_component = _infer_subplugin_component(parts, subplugin_mounts)
+        if subplugin_component is not None:
+            return subplugin_component
 
     if len(parts) >= 3 and parts[0] == "admin" and parts[1] == "tool":
         return _plugin_component(f"tool_{parts[2]}", "tool", parts[:3])
@@ -111,3 +119,26 @@ def infer_component(relative_path: str) -> InferredComponent:
         return InferredComponent(core_prefixes[parts[0]], "core", parts[0])
 
     return InferredComponent("core", "core", parts[0])
+
+
+def _infer_subplugin_component(
+    parts: list[str],
+    subplugin_mounts: Sequence[SubpluginMount],
+) -> InferredComponent | None:
+    """Return a child subplugin component when a path sits under a declared mount."""
+
+    for mount in subplugin_mounts:
+        mount_parts = [part for part in mount.mount_path.split("/") if part]
+        if parts[: len(mount_parts)] != mount_parts:
+            continue
+        if len(parts) <= len(mount_parts):
+            continue
+
+        child_name = parts[len(mount_parts)]
+        return _plugin_component(
+            f"{mount.subtype}_{child_name}",
+            mount.subtype,
+            [*mount_parts, child_name],
+        )
+
+    return None

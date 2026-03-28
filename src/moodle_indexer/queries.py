@@ -118,7 +118,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     ).fetchall()
     capabilities = connection.execute(
         """
-        SELECT name, line, captype, contextlevel, archetypes_json, riskbitmask
+        SELECT name, line, captype, contextlevel, archetypes_json, riskbitmask, clonepermissionsfrom
         FROM capabilities
         WHERE capabilities.file_id = ?
         ORDER BY name
@@ -189,6 +189,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
                 "contextlevel": item["contextlevel"],
                 "archetypes": json.loads(item["archetypes_json"]),
                 "riskbitmask": item["riskbitmask"],
+                "clonepermissionsfrom": item["clonepermissionsfrom"],
             }
             for item in capabilities
         ],
@@ -231,7 +232,7 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
     ).fetchall()
     capabilities = connection.execute(
         """
-        SELECT name, line, file_id
+        SELECT name, line, file_id, clonepermissionsfrom
         FROM capabilities
         WHERE component_id = ?
         ORDER BY name
@@ -302,7 +303,14 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
         },
         "key_file_roles": dict(sorted(role_counts.items())),
         "files": [dict(item) for item in files],
-        "capabilities": [{"name": item["name"], "line": item["line"]} for item in capabilities],
+        "capabilities": [
+            {
+                "name": item["name"],
+                "line": item["line"],
+                "clonepermissionsfrom": item["clonepermissionsfrom"],
+            }
+            for item in capabilities
+        ],
         "language_strings": [{"string_key": item["string_key"], "line": item["line"]} for item in strings],
         "tests": [dict(item) for item in tests],
         "sample_symbols": [dict(item) for item in symbols],

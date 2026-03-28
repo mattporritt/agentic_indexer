@@ -6,6 +6,7 @@ import pytest
 
 from moodle_indexer.components import infer_component
 from moodle_indexer.file_roles import classify_file_role
+from moodle_indexer.subplugins import SubpluginMount
 
 
 @pytest.mark.parametrize(
@@ -47,6 +48,24 @@ def test_infer_component_for_common_moodle_paths(
     assert component.name == expected_name
     assert component.component_type == expected_type
     assert component.root_path == expected_root
+
+
+def test_infer_component_uses_subplugin_mounts_for_child_plugin_paths() -> None:
+    component = infer_component(
+        "mod/forum/report/summary/db/access.php",
+        subplugin_mounts=[
+            SubpluginMount(
+                subtype="forumreport",
+                parent_component="mod_forum",
+                parent_root_path="mod/forum",
+                mount_path="mod/forum/report",
+            )
+        ],
+    )
+
+    assert component.name == "forumreport_summary"
+    assert component.component_type == "forumreport"
+    assert component.root_path == "mod/forum/report/summary"
 
 
 @pytest.mark.parametrize(

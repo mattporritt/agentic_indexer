@@ -83,7 +83,8 @@ SCHEMA_STATEMENTS = [
         captype TEXT,
         contextlevel TEXT,
         archetypes_json TEXT NOT NULL,
-        riskbitmask TEXT
+        riskbitmask TEXT,
+        clonepermissionsfrom TEXT
     );
     """,
     """
@@ -307,8 +308,18 @@ def insert_capability(connection: sqlite3.Connection, file_id: int, component_id
 
     connection.execute(
         """
-        INSERT INTO capabilities (file_id, component_id, name, line, captype, contextlevel, archetypes_json, riskbitmask)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO capabilities (
+            file_id,
+            component_id,
+            name,
+            line,
+            captype,
+            contextlevel,
+            archetypes_json,
+            riskbitmask,
+            clonepermissionsfrom
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             file_id,
@@ -319,6 +330,7 @@ def insert_capability(connection: sqlite3.Connection, file_id: int, component_id
             capability.get("contextlevel"),
             json.dumps(capability.get("archetypes", {}), sort_keys=True),
             capability.get("riskbitmask"),
+            capability.get("clonepermissionsfrom"),
         ),
     )
 

@@ -35,11 +35,13 @@ This tool builds a compact local index so those questions become cheap and machi
 
 - full rebuild indexing into SQLite
 - explicit Moodle component inference for common plugin families and core subsystems
+- subplugin-aware component inference via `db/subplugins.json`
 - deterministic file-role classification
 - parser-first PHP extraction with resilient fallback logic
 - symbol indexing for classes, interfaces, traits, functions, and methods
 - structural relationship indexing for `extends`, `implements`, and method-to-class ownership
 - capability extraction from `db/access.php`
+- capability attribution to the owning component of the defining file
 - language string extraction from `lang/en/*.php`
 - detection of obvious `require_capability`, `has_capability`, and `get_string` usage
 - PHPUnit and Behat discovery
@@ -341,6 +343,8 @@ Phase 1 handles common Moodle conventions more carefully than a generic path pre
 - `contentbank/contenttype/*`
 
 For non-plugin paths, the indexer falls back to sensible core subsystem mapping such as `core_admin`, `core_course`, and `core_question`.
+
+When a plugin declares subplugins in `db/subplugins.json`, files under those declared roots are attributed to the child component rather than the parent plugin. For example, `mod/forum/report/summary/...` is indexed as `forumreport_summary`, so `component-summary --component mod_forum` does not mix in `forumreport_summary` capability definitions.
 
 ## Testing
 

@@ -93,15 +93,26 @@ def test_php_extraction_captures_structural_relationships() -> None:
 def test_capability_and_language_string_extractors_capture_metadata() -> None:
     capability_source = _read_fixture("mod/forum/db/access.php")
     capabilities = extract_capabilities(capability_source, "mod/forum/db/access.php", "mod_forum")
-    assert len(capabilities) == 1
-    assert capabilities[0].name == "mod/forum:viewdiscussion"
-    assert capabilities[0].captype == "read"
-    assert capabilities[0].contextlevel == "CONTEXT_MODULE"
-    assert capabilities[0].archetypes == {
+    capability_map = {item.name: item for item in capabilities}
+    assert set(capability_map) == {
+        "mod/forum:addinstance",
+        "mod/forum:viewdiscussion",
+        "mod/forum:replypost",
+        "mod/forum:startdiscussion",
+        "mod/forum:deleteownpost",
+        "mod/forum:exportdiscussion",
+        "mod/forum:grade",
+        "mod/forum:canmailnow",
+    }
+    assert "archetypes" not in capability_map
+    assert capability_map["mod/forum:viewdiscussion"].captype == "read"
+    assert capability_map["mod/forum:viewdiscussion"].contextlevel == "CONTEXT_MODULE"
+    assert capability_map["mod/forum:viewdiscussion"].archetypes == {
         "editingteacher": "CAP_ALLOW",
         "student": "CAP_ALLOW",
     }
-    assert capabilities[0].riskbitmask == "RISK_SPAM"
+    assert capability_map["mod/forum:viewdiscussion"].riskbitmask == "RISK_SPAM"
+    assert capability_map["mod/forum:addinstance"].clonepermissionsfrom == "moodle/course:manageactivities"
 
     string_source = _read_fixture("mod/forum/lang/en/mod_forum.php")
     strings = extract_language_strings(string_source, "mod/forum/lang/en/mod_forum.php", "mod_forum")
@@ -117,7 +128,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
     assert result["repository_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
     assert result["application_root"] == str(CLASSIC_FIXTURE_ROOT.resolve())
     assert result["layout_type"] == "classic"
-    assert result["components"] >= 5
+    assert result["components"] >= 6
     assert result["relationships"] >= 6
     assert result["discovered_files"] >= result["processed_files"] == result["files"]
     assert result["persisted_files"] == result["processed_files"]
@@ -156,7 +167,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             row["name"]
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
         }
-        assert {"mod_forum", "tool_demo", "theme_boost", "enrol_manual", "tool_phpunit"} <= stored_components
+        assert {"mod_forum", "forumreport_summary", "tool_demo", "theme_boost", "enrol_manual", "tool_phpunit"} <= stored_components
 
         symbol_result = find_symbol(connection, "discussion_exporter")
         assert symbol_result["matches"][0]["file"] == "mod/forum/classes/external/discussion_exporter.php"
@@ -168,7 +179,11 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert access_context["moodle_path"] == "mod/forum/db/access.php"
         assert access_context["path_scope"] == "application"
         assert access_context["absolute_path"] == str((CLASSIC_FIXTURE_ROOT / "mod/forum/db/access.php").resolve())
-        assert access_context["capabilities"][0]["archetypes"]["student"] == "CAP_ALLOW"
+        access_capability_names = [item["name"] for item in access_context["capabilities"]]
+        assert "mod/forum:addinstance" in access_capability_names
+        assert "forumreport/summary:view" not in access_capability_names
+        addinstance = next(item for item in access_context["capabilities"] if item["name"] == "mod/forum:addinstance")
+        assert addinstance["clonepermissionsfrom"] == "moodle/course:manageactivities"
 
         component_result = component_summary(connection, "mod_forum")
         assert component_result["stats"]["relationship_count"] >= 6
@@ -177,6 +192,36 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             and file_row["moodle_path"] == "mod/forum/lib.php"
             for file_row in component_result["files"]
         )
+        mod_forum_capabilities = {item["name"] for item in component_result["capabilities"]}
+        assert {
+            "mod/forum:addinstance",
+            "mod/forum:viewdiscussion",
+            "mod/forum:replypost",
+            "mod/forum:startdiscussion",
+            "mod/forum:deleteownpost",
+            "mod/forum:exportdiscussion",
+            "mod/forum:grade",
+            "mod/forum:canmailnow",
+        } <= mod_forum_capabilities
+        assert "forumreport/summary:view" not in mod_forum_capabilities
+
+        child_summary = component_summary(connection, "forumreport_summary")
+        child_capabilities = {item["name"] for item in child_summary["capabilities"]}
+        assert child_capabilities == {
+            "forumreport/summary:view",
+            "forumreport/summary:viewall",
+        }
+        assert any(
+            file_row["repository_relative_path"] == "mod/forum/report/summary/db/access.php"
+            for file_row in child_summary["files"]
+        )
+
+        child_context = file_context(connection, "mod/forum/report/summary/db/access.php")
+        assert child_context["component"] == "forumreport_summary"
+        assert {item["name"] for item in child_context["capabilities"]} == {
+            "forumreport/summary:view",
+            "forumreport/summary:viewall",
+        }
 
         related_result = suggest_related(connection, CLASSIC_FIXTURE_ROOT, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
@@ -277,10 +322,10 @@ def test_index_summary_reports_failed_files_without_aborting(tmp_path: Path, mon
     db_path = tmp_path / "failure.sqlite"
     original = indexer_module._process_file_for_indexing
 
-    def flaky_process(repository_root: Path, application_root: Path, file_path: Path) -> dict:
+    def flaky_process(repository_root: Path, application_root: Path, file_path: Path, subplugin_mounts) -> dict:
         if file_path.name == "renderer.php":
             raise RuntimeError("synthetic extraction failure")
-        return original(repository_root, application_root, file_path)
+        return original(repository_root, application_root, file_path, subplugin_mounts)
 
     monkeypatch.setattr(indexer_module, "_process_file_for_indexing", flaky_process)
 

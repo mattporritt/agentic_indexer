@@ -42,6 +42,7 @@ from moodle_indexer.store import (
     insert_symbol,
     insert_test,
 )
+from moodle_indexer.subplugins import load_subplugin_mounts
 
 
 LOGGER = logging.getLogger(__name__)
@@ -62,12 +63,15 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
     scan_seconds = time.perf_counter() - scan_started_at
     files = scan_result.files
     discovered_files = len(files)
+    subplugin_mounts = load_subplugin_mounts(application_root)
     LOGGER.info(
         "Discovered %d candidate files in %.2fs (%d ignored during scan)",
         discovered_files,
         scan_seconds,
         scan_result.ignored_files,
     )
+    if subplugin_mounts:
+        LOGGER.info("Loaded %d subplugin mount(s) from db/subplugins.json", len(subplugin_mounts))
 
     connection = initialize_database(config.database_path)
     repository_id = insert_repository(
@@ -110,7 +114,13 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
     persistence_progress = ProgressBar(total=discovered_files, label="Persisting records")
     extraction_started_at = time.perf_counter()
     try:
-        for result in _iter_file_payloads(repository_root, application_root, files, worker_stats["active_workers"]):
+        for result in _iter_file_payloads(
+            repository_root,
+            application_root,
+            files,
+            subplugin_mounts,
+            worker_stats["active_workers"],
+        ):
             extraction_progress.advance()
             if result["status"] == "failed":
                 failed_files += 1
@@ -240,6 +250,7 @@ def _iter_file_payloads(
     repository_root: Path,
     application_root: Path,
     files: list[Path],
+    subplugin_mounts,
     workers: int,
 ):
     """Yield extraction results in input order.
@@ -253,7 +264,12 @@ def _iter_file_payloads(
             try:
                 yield {
                     "status": "ok",
-                    "payload": _process_file_for_indexing(repository_root, application_root, file_path),
+                    "payload": _process_file_for_indexing(
+                        repository_root,
+                        application_root,
+                        file_path,
+                        subplugin_mounts,
+                    ),
                 }
             except Exception as exc:  # pragma: no cover - exercised via monkeypatch tests.
                 yield {
@@ -268,7 +284,13 @@ def _iter_file_payloads(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_process_file_for_indexing, repository_root, application_root, file_path): (index, file_path)
+            executor.submit(
+                _process_file_for_indexing,
+                repository_root,
+                application_root,
+                file_path,
+                subplugin_mounts,
+            ): (index, file_path)
             for index, file_path in enumerate(files)
         }
         for future in as_completed(futures):
@@ -290,11 +312,11 @@ def _iter_file_payloads(
                 next_index += 1
 
 
-def _process_file_for_indexing(repository_root: Path, application_root: Path, file_path: Path) -> dict:
+def _process_file_for_indexing(repository_root: Path, application_root: Path, file_path: Path, subplugin_mounts) -> dict:
     """Extract all indexable artifacts for one file."""
 
     indexed_paths = build_indexed_paths(repository_root, application_root, file_path)
-    component = infer_component(indexed_paths.moodle_path)
+    component = infer_component(indexed_paths.moodle_path, subplugin_mounts=subplugin_mounts)
     file_role = classify_file_role(indexed_paths.moodle_path)
     source = file_path.read_text(encoding="utf-8", errors="ignore")
 

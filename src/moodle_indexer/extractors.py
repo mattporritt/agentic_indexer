@@ -7,6 +7,7 @@ definitions and checks, language strings and usages, and test artifacts.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from moodle_indexer.file_roles import classify_file_role
@@ -21,15 +22,22 @@ from moodle_indexer.models import (
 )
 from moodle_indexer.php_parser import ParsedSymbol, parse_php_symbols
 
-
-CAPABILITY_START_RE = re.compile(r"'([^']+/[^']+:[^']+)'\s*=>\s*\[")
-CAPABILITY_FIELD_RE = re.compile(r"'(captype|contextlevel|riskbitmask)'\s*=>\s*([^,\n]+)")
-ARCHETYPE_RE = re.compile(r"'archetypes'\s*=>\s*\[(.*?)\]", re.DOTALL)
-ARCHETYPE_VALUE_RE = re.compile(r"'([^']+)'\s*=>\s*([A-Z_]+|'[^']+')")
 CAPABILITY_CALL_RE = re.compile(r"""\b(has_capability|require_capability)\s*\(\s*['"]([^'"]+)['"]""")
 STRING_DEF_RE = re.compile(r"\$string\['([^']+)'\]\s*=\s*'((?:\\'|[^'])*)';")
 GET_STRING_RE = re.compile(r"\bget_string\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)")
 FEATURE_SCENARIO_RE = re.compile(r"^\s*(Feature|Scenario|Scenario Outline):\s*(.+)\s*$", re.MULTILINE)
+CAPABILITIES_ASSIGNMENT_RE = re.compile(r"\$capabilities\s*=")
+
+
+@dataclass(slots=True)
+class PhpArrayEntry:
+    """One key/value pair extracted from a PHP array literal."""
+
+    key: str
+    raw_value: str
+    key_index: int
+    value_start: int
+    value_end: int
 
 
 def extract_php_artifacts(
@@ -108,48 +116,271 @@ def extract_capabilities(source: str, relative_path: str, component_name: str) -
         return []
 
     capabilities: list[CapabilityRecord] = []
-    for match in CAPABILITY_START_RE.finditer(source):
-        name = match.group(1)
-        block_start = match.end() - 1
-        block_end = _find_matching_square_bracket(source, block_start)
-        block = source[block_start + 1:block_end]
-        line = source.count("\n", 0, match.start()) + 1
-        field_map = {field: value.strip().strip("',") for field, value in CAPABILITY_FIELD_RE.findall(block)}
-        archetypes: dict[str, str] = {}
-        archetypes_match = ARCHETYPE_RE.search(block)
-        if archetypes_match:
-            archetypes = {
-                role: permission.strip("'")
-                for role, permission in ARCHETYPE_VALUE_RE.findall(archetypes_match.group(1))
-            }
+    for entry in _parse_capabilities_entries(source):
+        metadata = _parse_capability_metadata(source, entry)
         capabilities.append(
             CapabilityRecord(
-                name=name,
+                name=entry.key,
                 component_name=component_name,
                 file_path=relative_path,
-                line=line,
-                captype=field_map.get("captype"),
-                contextlevel=field_map.get("contextlevel"),
-                archetypes=archetypes,
-                riskbitmask=field_map.get("riskbitmask"),
+                line=source.count("\n", 0, entry.key_index) + 1,
+                captype=metadata.get("captype"),
+                contextlevel=metadata.get("contextlevel"),
+                archetypes=metadata.get("archetypes", {}),
+                riskbitmask=metadata.get("riskbitmask"),
+                clonepermissionsfrom=metadata.get("clonepermissionsfrom"),
             )
         )
     return capabilities
 
 
-def _find_matching_square_bracket(source: str, opening_bracket_index: int) -> int:
-    """Return the index of the matching closing square bracket."""
+def _parse_capabilities_entries(source: str) -> list[PhpArrayEntry]:
+    """Return top-level capability entries from the ``$capabilities`` array."""
 
+    match = CAPABILITIES_ASSIGNMENT_RE.search(source)
+    if match is None:
+        return []
+
+    array_start = _locate_array_start(source, match.end())
+    if array_start is None:
+        return []
+    array_end = _find_matching_delimiter(source, array_start)
+    return _parse_php_array_entries(source, array_start, array_end)
+
+
+def _parse_capability_metadata(source: str, entry: PhpArrayEntry) -> dict:
+    """Return selected metadata fields from one top-level capability block."""
+
+    value_start = _locate_array_start(source, entry.value_start, limit=entry.value_end)
+    if value_start is None:
+        return {}
+    value_end = _find_matching_delimiter(source, value_start)
+    child_entries = _parse_php_array_entries(source, value_start, value_end)
+    metadata: dict[str, object] = {}
+
+    for child in child_entries:
+        normalized_key = child.key.lower()
+        if normalized_key in {"captype", "contextlevel", "riskbitmask", "clonepermissionsfrom"}:
+            metadata[normalized_key] = _normalize_php_scalar(child.raw_value)
+        elif normalized_key == "archetypes":
+            archetype_start = _locate_array_start(source, child.value_start, limit=child.value_end)
+            if archetype_start is None:
+                continue
+            archetype_end = _find_matching_delimiter(source, archetype_start)
+            archetype_entries = _parse_php_array_entries(source, archetype_start, archetype_end)
+            metadata["archetypes"] = {
+                item.key: _normalize_php_scalar(item.raw_value)
+                for item in archetype_entries
+            }
+
+    return metadata
+
+
+def _parse_php_array_entries(source: str, array_start: int, array_end: int) -> list[PhpArrayEntry]:
+    """Return top-level key/value pairs from one PHP array literal."""
+
+    entries: list[PhpArrayEntry] = []
+    index = array_start + 1
+    closing_delimiter = "]" if source[array_start] == "[" else ")"
+
+    while index < array_end:
+        index = _skip_php_noise(source, index, array_end)
+        if index >= array_end or source[index] == closing_delimiter:
+            break
+
+        parsed_key = _parse_php_key(source, index, array_end)
+        if parsed_key is None:
+            break
+        key, key_index, index = parsed_key
+        index = _skip_php_noise(source, index, array_end)
+        if source[index:index + 2] != "=>":
+            break
+        index += 2
+        index = _skip_php_noise(source, index, array_end)
+        value_start = index
+        value_end = _consume_php_expression(source, index, array_end, closing_delimiter)
+        entries.append(
+            PhpArrayEntry(
+                key=key,
+                raw_value=source[value_start:value_end].strip(),
+                key_index=key_index,
+                value_start=value_start,
+                value_end=value_end,
+            )
+        )
+        index = value_end
+        if index < array_end and source[index] == ",":
+            index += 1
+
+    return entries
+
+
+def _locate_array_start(source: str, index: int, limit: int | None = None) -> int | None:
+    """Return the opening delimiter for a PHP array value."""
+
+    limit = len(source) if limit is None else limit
+    index = _skip_php_noise(source, index, limit)
+    if index >= limit:
+        return None
+    if source[index] == "[":
+        return index
+    if source.startswith("array", index):
+        next_index = _skip_php_noise(source, index + len("array"), limit)
+        if next_index < limit and source[next_index] == "(":
+            return next_index
+    return None
+
+
+def _find_matching_delimiter(source: str, opening_index: int) -> int:
+    """Return the matching closing delimiter for ``[``, ``(``, or ``{``."""
+
+    opening_char = source[opening_index]
+    closing_char = { "[": "]", "(": ")", "{": "}" }[opening_char]
     depth = 0
-    for index in range(opening_bracket_index, len(source)):
+    index = opening_index
+
+    while index < len(source):
+        if source[index] in {"'", '"'}:
+            index = _skip_php_string(source, index)
+            continue
+        if source.startswith("//", index) or source[index] == "#":
+            index = _skip_php_line_comment(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = _skip_php_block_comment(source, index)
+            continue
+
         char = source[index]
-        if char == "[":
+        if char == opening_char:
             depth += 1
-        elif char == "]":
+        elif char == closing_char:
             depth -= 1
             if depth == 0:
                 return index
-    return len(source)
+        index += 1
+
+    return len(source) - 1
+
+
+def _parse_php_key(source: str, index: int, limit: int) -> tuple[str, int, int] | None:
+    """Parse one PHP array key."""
+
+    if source[index] in {"'", '"'}:
+        value, next_index = _read_php_string(source, index)
+        return value, index, next_index
+
+    key_start = index
+    while index < limit and not source.startswith("=>", index):
+        if source[index] in ",)]":
+            return None
+        index += 1
+    return source[key_start:index].strip(), key_start, index
+
+
+def _consume_php_expression(source: str, index: int, limit: int, top_level_close: str) -> int:
+    """Consume one PHP expression until the next top-level entry boundary."""
+
+    stack: list[str] = []
+    while index < limit:
+        if source[index] in {"'", '"'}:
+            index = _skip_php_string(source, index)
+            continue
+        if source.startswith("//", index) or source[index] == "#":
+            index = _skip_php_line_comment(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = _skip_php_block_comment(source, index)
+            continue
+
+        char = source[index]
+        if char in "[({":
+            stack.append({ "[": "]", "(": ")", "{": "}" }[char])
+            index += 1
+            continue
+        if stack and char == stack[-1]:
+            stack.pop()
+            index += 1
+            continue
+        if not stack and char in {",", top_level_close}:
+            return index
+        index += 1
+    return limit
+
+
+def _normalize_php_scalar(raw_value: str) -> str:
+    """Normalize a lightweight PHP scalar or expression into a stable string."""
+
+    value = raw_value.strip().rstrip(",")
+    if value[:1] in {"'", '"'} and value[-1:] == value[:1]:
+        return _decode_php_string(value[1:-1], value[0])
+    return value
+
+
+def _skip_php_noise(source: str, index: int, limit: int) -> int:
+    """Skip whitespace and comments within a bounded region."""
+
+    while index < limit:
+        if source[index].isspace():
+            index += 1
+            continue
+        if source.startswith("//", index) or source[index] == "#":
+            index = _skip_php_line_comment(source, index)
+            continue
+        if source.startswith("/*", index):
+            index = _skip_php_block_comment(source, index)
+            continue
+        break
+    return index
+
+
+def _skip_php_string(source: str, index: int) -> int:
+    """Return the first index after a quoted PHP string literal."""
+
+    _, next_index = _read_php_string(source, index)
+    return next_index
+
+
+def _read_php_string(source: str, index: int) -> tuple[str, int]:
+    """Read a quoted PHP string literal and return its decoded value."""
+
+    quote = source[index]
+    value_parts: list[str] = []
+    index += 1
+    while index < len(source):
+        char = source[index]
+        if char == "\\" and index + 1 < len(source):
+            value_parts.append(source[index:index + 2])
+            index += 2
+            continue
+        if char == quote:
+            return _decode_php_string("".join(value_parts), quote), index + 1
+        value_parts.append(char)
+        index += 1
+    return _decode_php_string("".join(value_parts), quote), index
+
+
+def _decode_php_string(value: str, quote: str) -> str:
+    """Decode a minimal subset of PHP string escapes used in fixtures/Moodle config."""
+
+    value = value.replace(f"\\{quote}", quote)
+    return value.replace("\\\\", "\\")
+
+
+def _skip_php_line_comment(source: str, index: int) -> int:
+    """Skip a ``//`` or ``#`` line comment."""
+
+    while index < len(source) and source[index] != "\n":
+        index += 1
+    return index
+
+
+def _skip_php_block_comment(source: str, index: int) -> int:
+    """Skip a ``/* ... */`` block comment."""
+
+    end_index = source.find("*/", index + 2)
+    if end_index == -1:
+        return len(source)
+    return end_index + 2
 
 
 def extract_capability_usages(source: str, relative_path: str, component_name: str) -> list[CapabilityUsageRecord]:
