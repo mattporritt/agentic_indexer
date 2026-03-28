@@ -187,12 +187,14 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         """,
         (file_id,),
     ).fetchall()
+    linked_tests = _linked_service_tests(connection, webservices)
 
     related_suggestions = [
         {"path": item.path, "reason": item.reason}
         for item in suggest_related_files(moodle_path)
     ]
     related_suggestions.extend(_service_related_suggestions(webservices))
+    related_suggestions.extend(_service_test_suggestions(connection, webservices))
     related_suggestions = _deduplicate_suggestions(related_suggestions)
 
     return {
@@ -220,7 +222,17 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         "language_strings": [dict(item) for item in strings],
         "capability_checks": [dict(item) for item in capability_checks],
         "string_usages": [dict(item) for item in string_usages],
-        "tests": [dict(item) for item in tests],
+        "tests": [
+            {
+                "name": item["name"],
+                "test_type": item["test_type"],
+                "line": item["line"],
+                "file": moodle_path,
+                "reason": None,
+            }
+            for item in tests
+        ]
+        + linked_tests,
         "webservices": [dict(item) for item in webservices],
         "relationships": [dict(item) for item in relationships],
         "related_suggestions": related_suggestions,
@@ -388,6 +400,7 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
         (row["id"],),
     ).fetchall()
     suggestions.extend(_indexed_service_suggestions(connection, webservices))
+    suggestions.extend(_indexed_service_test_suggestions(connection, webservices))
     suggestions = _deduplicate_indexed_suggestions(suggestions)
     return {
         "file": moodle_path,
@@ -514,6 +527,28 @@ def _service_related_suggestions(webservices: list[sqlite3.Row]) -> list[dict[st
     return suggestions
 
 
+def _service_test_suggestions(
+    connection: sqlite3.Connection,
+    webservices: list[sqlite3.Row],
+) -> list[dict[str, str]]:
+    """Return file-context related suggestions for service-linked tests."""
+
+    suggestions: list[dict[str, str]] = []
+    for candidate in _service_test_candidates(webservices):
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (candidate["path"], candidate["path"]),
+        ).fetchone()
+        if exists:
+            suggestions.append(
+                {
+                    "path": candidate["path"],
+                    "reason": candidate["reason"],
+                }
+            )
+    return suggestions
+
+
 def _indexed_service_suggestions(
     connection: sqlite3.Connection,
     webservices: list[sqlite3.Row],
@@ -557,6 +592,106 @@ def _indexed_service_suggestions(
     return suggestions
 
 
+def _indexed_service_test_suggestions(
+    connection: sqlite3.Connection,
+    webservices: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return suggest-related entries for service-linked tests."""
+
+    suggestions: list[dict[str, object]] = []
+    for candidate in _service_test_candidates(webservices):
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (candidate["path"], candidate["path"]),
+        ).fetchone()
+        if not exists:
+            continue
+        suggestions.append(
+            {
+                "path": candidate["path"],
+                "reason": candidate["reason"],
+                "indexed": True,
+            }
+        )
+    return suggestions
+
+
+def _linked_service_tests(
+    connection: sqlite3.Connection,
+    webservices: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return likely related test files for a services definition file."""
+
+    linked: list[dict[str, object]] = []
+    for candidate in _service_test_candidates(webservices):
+        file_row = connection.execute(
+            """
+            SELECT moodle_path, repository_relative_path, file_role
+            FROM files
+            WHERE (moodle_path = ? OR repository_relative_path = ?)
+              AND file_role = 'phpunit_test'
+            LIMIT 1
+            """,
+            (candidate["path"], candidate["path"]),
+        ).fetchone()
+        if file_row is None:
+            continue
+        linked.append(
+            {
+                "name": Path(file_row["moodle_path"]).name,
+                "test_type": file_row["file_role"],
+                "line": None,
+                "file": file_row["moodle_path"],
+                "reason": candidate["reason"],
+            }
+        )
+    return _deduplicate_tests(linked)
+
+
+def _service_test_candidates(webservices: list[sqlite3.Row]) -> list[dict[str, str]]:
+    """Return deterministic test-file candidates for resolved service targets."""
+
+    candidates: list[dict[str, str]] = []
+    for item in webservices:
+        target_file = item["resolved_target_file"]
+        if not target_file:
+            continue
+
+        if target_file.endswith("/externallib.php"):
+            component_root = target_file.removesuffix("/externallib.php")
+            candidates.append(
+                {
+                    "path": f"{component_root}/tests/externallib_test.php",
+                    "reason": "suggested because externallib.php changes are often covered by externallib_test.php",
+                }
+            )
+            candidates.append(
+                {
+                    "path": f"{component_root}/tests/externallib_advanced_testcase.php",
+                    "reason": (
+                        "suggested because externallib_advanced_testcase.php appears to provide "
+                        "shared web service test coverage for externallib-based services"
+                    ),
+                }
+            )
+            continue
+
+        if "/classes/external/" in target_file:
+            component_root, class_suffix = target_file.split("/classes/external/", 1)
+            class_name = class_suffix.removesuffix(".php")
+            candidates.append(
+                {
+                    "path": f"{component_root}/tests/external/{class_name}_test.php",
+                    "reason": (
+                        f"suggested because service class {item['classname']} is typically covered "
+                        "by this PHPUnit test file"
+                    ),
+                }
+            )
+
+    return candidates
+
+
 def _deduplicate_suggestions(suggestions: list[dict[str, str]]) -> list[dict[str, str]]:
     """Deduplicate non-index-aware suggestions by path and reason."""
 
@@ -584,3 +719,16 @@ def _deduplicate_indexed_suggestions(suggestions: list[dict[str, object]]) -> li
         if item["reason"] not in str(existing["reason"]):
             existing["reason"] = f"{existing['reason']} | {item['reason']}"
     return [merged[path] for path in sorted(merged)]
+
+
+def _deduplicate_tests(tests: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Deduplicate linked test entries by file path."""
+
+    seen: set[str] = set()
+    ordered: list[dict[str, object]] = []
+    for item in tests:
+        if item["file"] in seen:
+            continue
+        seen.add(str(item["file"]))
+        ordered.append(item)
+    return ordered

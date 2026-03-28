@@ -127,12 +127,16 @@ def test_webservice_extractor_resolves_classpath_and_classname_targets() -> None
 
     service_map = {item.service_name: item for item in webservices}
     assert set(service_map) == {
+        "mod_assign_remove_submission",
         "mod_assign_start_submission",
         "mod_assign_submit_grading_form",
     }
     assert service_map["mod_assign_submit_grading_form"].classpath == "mod/assign/externallib.php"
     assert service_map["mod_assign_submit_grading_form"].resolved_target_file == "mod/assign/externallib.php"
     assert service_map["mod_assign_submit_grading_form"].resolution_type == "classpath"
+    assert service_map["mod_assign_remove_submission"].classname == "mod_assign\\external\\remove_submission"
+    assert service_map["mod_assign_remove_submission"].resolved_target_file == "mod/assign/classes/external/remove_submission.php"
+    assert service_map["mod_assign_remove_submission"].resolution_type == "classname"
     assert service_map["mod_assign_start_submission"].classname == "mod_assign\\external\\start_submission"
     assert service_map["mod_assign_start_submission"].resolved_target_file == "mod/assign/classes/external/start_submission.php"
     assert service_map["mod_assign_start_submission"].resolution_type == "classname"
@@ -251,6 +255,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
 
         assign_summary = component_summary(connection, "mod_assign")
         assert {item["service_name"] for item in assign_summary["webservices"]} == {
+            "mod_assign_remove_submission",
             "mod_assign_start_submission",
             "mod_assign_submit_grading_form",
         }
@@ -263,6 +268,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
 
         services_context = file_context(connection, "mod/assign/db/services.php")
         assert {item["service_name"] for item in services_context["webservices"]} == {
+            "mod_assign_remove_submission",
             "mod_assign_start_submission",
             "mod_assign_submit_grading_form",
         }
@@ -270,11 +276,28 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             item["resolved_target_file"] for item in services_context["webservices"]
         } == {
             "mod/assign/externallib.php",
+            "mod/assign/classes/external/remove_submission.php",
             "mod/assign/classes/external/start_submission.php",
         }
+        linked_test_files = {item["file"] for item in services_context["tests"]}
+        assert linked_test_files == {
+            "mod/assign/tests/external/remove_submission_test.php",
+            "mod/assign/tests/external/start_submission_test.php",
+            "mod/assign/tests/externallib_test.php",
+            "mod/assign/tests/externallib_advanced_testcase.php",
+        }
+        linked_test_reasons = {item["file"]: item["reason"] for item in services_context["tests"]}
+        assert "service class mod_assign\\external\\start_submission" in linked_test_reasons[
+            "mod/assign/tests/external/start_submission_test.php"
+        ]
+        assert "externallib.php changes are often covered" in linked_test_reasons[
+            "mod/assign/tests/externallib_test.php"
+        ]
         service_related_paths = {item["path"] for item in services_context["related_suggestions"]}
         assert "mod/assign/externallib.php" in service_related_paths
         assert "mod/assign/classes/external/start_submission.php" in service_related_paths
+        assert "mod/assign/tests/external/start_submission_test.php" in service_related_paths
+        assert "mod/assign/tests/externallib_test.php" in service_related_paths
 
         assign_related = suggest_related(connection, "mod/assign/db/services.php")
         assign_suggestions = {item["path"]: item for item in assign_related["suggestions"]}
@@ -283,6 +306,19 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/classes/external/start_submission.php" in assign_suggestions
         assert "mod_assign\\external\\start_submission" in assign_suggestions[
             "mod/assign/classes/external/start_submission.php"
+        ]["reason"]
+        assert "mod/assign/tests/external/remove_submission_test.php" in assign_suggestions
+        assert "mod_assign\\external\\remove_submission" in assign_suggestions[
+            "mod/assign/tests/external/remove_submission_test.php"
+        ]["reason"]
+        assert "mod/assign/tests/external/start_submission_test.php" in assign_suggestions
+        assert "mod/assign/tests/externallib_test.php" in assign_suggestions
+        assert "externallib.php changes are often covered" in assign_suggestions[
+            "mod/assign/tests/externallib_test.php"
+        ]["reason"]
+        assert "mod/assign/tests/externallib_advanced_testcase.php" in assign_suggestions
+        assert "shared web service test coverage" in assign_suggestions[
+            "mod/assign/tests/externallib_advanced_testcase.php"
         ]["reason"]
 
         related_result = suggest_related(connection, "admin/tool/demo/settings.php")
