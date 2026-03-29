@@ -70,6 +70,22 @@ def component_root_from_name(component_name: str) -> str | None:
     return None
 
 
+def resolve_classname_to_file_path(classname: str) -> str | None:
+    """Resolve a Moodle class name to its expected autoloaded PHP file path."""
+
+    normalized = classname.lstrip("\\")
+    namespace_parts = normalized.split("\\")
+    if not namespace_parts:
+        return None
+    component_root = component_root_from_name(namespace_parts[0])
+    if component_root is None or len(namespace_parts) < 2:
+        return None
+    relative_parts = [part for part in namespace_parts[1:] if part]
+    if not relative_parts:
+        return None
+    return f"{component_root}/classes/{'/'.join(relative_parts)}.php"
+
+
 def infer_component(relative_path: str, subplugin_mounts: Sequence[SubpluginMount] | None = None) -> InferredComponent:
     """Infer the Moodle component from a repository-relative path.
 

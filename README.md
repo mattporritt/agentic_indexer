@@ -40,6 +40,7 @@ This tool builds a compact local index so those questions become cheap and machi
 - parser-first PHP extraction with resilient fallback logic
 - symbol indexing for classes, interfaces, traits, functions, and methods
 - structural relationship indexing for `extends`, `implements`, and method-to-class ownership
+- output/rendering-aware suggestions for `classes/output/` and `templates/` when production PHP references Moodle output classes
 - capability extraction from `db/access.php`
 - web service extraction from `db/services.php`
 - capability attribution to the owning component of the defining file

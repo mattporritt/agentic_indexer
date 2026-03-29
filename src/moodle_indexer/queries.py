@@ -10,6 +10,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from moodle_indexer.components import resolve_classname_to_file_path
 from moodle_indexer.errors import ValidationError
 from moodle_indexer.paths import normalize_relative_lookup_path
 from moodle_indexer.suggestions import suggest_related_files
@@ -188,6 +189,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         (file_id,),
     ).fetchall()
     linked_tests = _linked_service_tests(connection, webservices)
+    rendering_references = _linked_rendering_artifacts(connection, relationships)
 
     related_suggestions = [
         {"path": item.path, "reason": item.reason}
@@ -195,6 +197,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     ]
     related_suggestions.extend(_service_related_suggestions(webservices))
     related_suggestions.extend(_service_test_suggestions(connection, webservices))
+    related_suggestions.extend(_rendering_related_suggestions(rendering_references))
     related_suggestions = _deduplicate_suggestions(related_suggestions)
 
     return {
@@ -234,6 +237,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         ]
         + linked_tests,
         "webservices": [dict(item) for item in webservices],
+        "rendering_references": rendering_references,
         "relationships": [dict(item) for item in relationships],
         "related_suggestions": related_suggestions,
         "repository_root": repository["repository_root"],
@@ -401,6 +405,16 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
     ).fetchall()
     suggestions.extend(_indexed_service_suggestions(connection, webservices))
     suggestions.extend(_indexed_service_test_suggestions(connection, webservices))
+    rendering_relationships = connection.execute(
+        """
+        SELECT target_name, relationship_type, line
+        FROM relationships
+        WHERE file_id = ? AND relationship_type = 'references_class'
+        ORDER BY line, target_name
+        """,
+        (row["id"],),
+    ).fetchall()
+    suggestions.extend(_indexed_rendering_suggestions(connection, rendering_relationships))
     suggestions = _deduplicate_indexed_suggestions(suggestions)
     return {
         "file": moodle_path,
@@ -527,6 +541,67 @@ def _service_related_suggestions(webservices: list[sqlite3.Row]) -> list[dict[st
     return suggestions
 
 
+def _linked_rendering_artifacts(
+    connection: sqlite3.Connection,
+    relationships: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return resolved output-class and template artifacts for one file."""
+
+    artifacts: list[dict[str, object]] = []
+    seen_classes: set[str] = set()
+    for item in relationships:
+        if item["relationship_type"] != "references_class":
+            continue
+        class_name = str(item["target_name"]).lstrip("\\")
+        if class_name in seen_classes:
+            continue
+        seen_classes.add(class_name)
+        output_file = resolve_classname_to_file_path(class_name)
+        if output_file is None:
+            continue
+        file_exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (output_file, output_file),
+        ).fetchone()
+        template_files = _existing_template_candidates(connection, output_file)
+        artifacts.append(
+            {
+                "class_name": class_name,
+                "resolved_target_file": output_file,
+                "resolved": bool(file_exists),
+                "template_files": template_files,
+            }
+        )
+    return artifacts
+
+
+def _rendering_related_suggestions(rendering_references: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Return file-context related suggestions for resolved rendering artifacts."""
+
+    suggestions: list[dict[str, str]] = []
+    for item in rendering_references:
+        suggestions.append(
+            {
+                "path": str(item["resolved_target_file"]),
+                "reason": (
+                    f"suggested because this file references class \\{item['class_name']}, "
+                    "which resolves to this output file"
+                ),
+            }
+        )
+        for template_path in item["template_files"]:
+            suggestions.append(
+                {
+                    "path": template_path,
+                    "reason": (
+                        f"suggested because output class \\{item['class_name']} likely renders "
+                        "through this Mustache template"
+                    ),
+                }
+            )
+    return suggestions
+
+
 def _service_test_suggestions(
     connection: sqlite3.Connection,
     webservices: list[sqlite3.Row],
@@ -613,6 +688,41 @@ def _indexed_service_test_suggestions(
                 "indexed": True,
             }
         )
+    return suggestions
+
+
+def _indexed_rendering_suggestions(
+    connection: sqlite3.Connection,
+    relationships: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return suggest-related entries for output-class and template companions."""
+
+    artifacts = _linked_rendering_artifacts(connection, relationships)
+    suggestions: list[dict[str, object]] = []
+    for item in artifacts:
+        target_path = str(item["resolved_target_file"])
+        if item["resolved"]:
+            suggestions.append(
+                {
+                    "path": target_path,
+                    "reason": (
+                        f"suggested because this file references class \\{item['class_name']}, "
+                        "which resolves to this output file"
+                    ),
+                    "indexed": True,
+                }
+            )
+        for template_path in item["template_files"]:
+            suggestions.append(
+                {
+                    "path": template_path,
+                    "reason": (
+                        f"suggested because output class \\{item['class_name']} likely renders "
+                        "through this Mustache template"
+                    ),
+                    "indexed": True,
+                }
+            )
     return suggestions
 
 
@@ -732,3 +842,17 @@ def _deduplicate_tests(tests: list[dict[str, object]]) -> list[dict[str, object]
         seen.add(str(item["file"]))
         ordered.append(item)
     return ordered
+
+
+def _existing_template_candidates(connection: sqlite3.Connection, output_file: str) -> list[str]:
+    """Return indexed Mustache templates that plausibly pair with one output class."""
+
+    if "/classes/output/" not in output_file:
+        return []
+    component_root, class_suffix = output_file.split("/classes/output/", 1)
+    template_path = f"{component_root}/templates/{class_suffix.removesuffix('.php')}.mustache"
+    row = connection.execute(
+        "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+        (template_path, template_path),
+    ).fetchone()
+    return [template_path] if row else []

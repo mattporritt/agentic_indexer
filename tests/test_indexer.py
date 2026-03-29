@@ -321,6 +321,31 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             "mod/assign/tests/externallib_advanced_testcase.php"
         ]["reason"]
 
+        locallib_context = file_context(connection, "mod/assign/locallib.php")
+        assert {
+            item["class_name"] for item in locallib_context["rendering_references"]
+        } == {
+            "mod_assign\\output\\grading_app",
+        }
+        rendering_reference = locallib_context["rendering_references"][0]
+        assert rendering_reference["resolved_target_file"] == "mod/assign/classes/output/grading_app.php"
+        assert rendering_reference["template_files"] == ["mod/assign/templates/grading_app.mustache"]
+
+        locallib_related_paths = {item["path"] for item in locallib_context["related_suggestions"]}
+        assert "mod/assign/classes/output/grading_app.php" in locallib_related_paths
+        assert "mod/assign/templates/grading_app.mustache" in locallib_related_paths
+
+        locallib_related = suggest_related(connection, "mod/assign/locallib.php")
+        locallib_suggestions = {item["path"]: item for item in locallib_related["suggestions"]}
+        assert "mod/assign/classes/output/grading_app.php" in locallib_suggestions
+        assert "\\mod_assign\\output\\grading_app" in locallib_suggestions[
+            "mod/assign/classes/output/grading_app.php"
+        ]["reason"]
+        assert "mod/assign/templates/grading_app.mustache" in locallib_suggestions
+        assert "Mustache template" in locallib_suggestions[
+            "mod/assign/templates/grading_app.mustache"
+        ]["reason"]
+
         related_result = suggest_related(connection, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
         assert suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["indexed"] is True

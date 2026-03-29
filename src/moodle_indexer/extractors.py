@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from moodle_indexer.components import component_root_from_name
+from moodle_indexer.components import resolve_classname_to_file_path
 from moodle_indexer.file_roles import classify_file_role
 from moodle_indexer.models import (
     CapabilityRecord,
@@ -30,6 +30,7 @@ GET_STRING_RE = re.compile(r"\bget_string\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)"
 FEATURE_SCENARIO_RE = re.compile(r"^\s*(Feature|Scenario|Scenario Outline):\s*(.+)\s*$", re.MULTILINE)
 CAPABILITIES_ASSIGNMENT_RE = re.compile(r"\$capabilities\s*=")
 FUNCTIONS_ASSIGNMENT_RE = re.compile(r"\$functions\s*=")
+OUTPUT_CLASS_REFERENCE_RE = re.compile(r"(?<![A-Za-z0-9_])\\?([A-Za-z][A-Za-z0-9_]*_[A-Za-z0-9_]+\\output\\[A-Za-z0-9_\\]+)")
 
 
 @dataclass(slots=True)
@@ -108,6 +109,18 @@ def extract_php_artifacts(
                     line=method.line,
                 )
             )
+
+    for match in OUTPUT_CLASS_REFERENCE_RE.finditer(source):
+        class_name = match.group(1).lstrip("\\")
+        relationships.append(
+            RelationshipRecord(
+                source_fqname=relative_path,
+                target_name=class_name,
+                relationship_type="references_class",
+                file_path=relative_path,
+                line=source.count("\n", 0, match.start()) + 1,
+            )
+        )
 
     return symbols, relationships
 
@@ -573,25 +586,10 @@ def _resolve_service_target(
     if classpath:
         return Path(classpath).as_posix().lstrip("/"), "classpath", "resolved"
     if classname:
-        resolved = _resolve_classname_to_file_path(classname)
+        resolved = resolve_classname_to_file_path(classname)
         if resolved is not None:
             return resolved, "classname", "resolved"
     return None, "unresolved", "unresolved"
-
-
-def _resolve_classname_to_file_path(classname: str) -> str | None:
-    """Resolve a Moodle class name to its expected autoloaded PHP file path."""
-
-    namespace_parts = classname.split("\\")
-    if not namespace_parts:
-        return None
-    component_root = component_root_from_name(namespace_parts[0])
-    if component_root is None or len(namespace_parts) < 2:
-        return None
-    relative_parts = [part for part in namespace_parts[1:] if part]
-    if not relative_parts:
-        return None
-    return f"{component_root}/classes/{'/'.join(relative_parts)}.php"
 
 
 def _symbol_record_from_parsed(parsed: ParsedSymbol, relative_path: str, component_name: str) -> SymbolRecord:
