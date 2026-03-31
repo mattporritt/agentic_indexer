@@ -39,6 +39,7 @@ def component_root_from_name(component_name: str) -> str | None:
     prefix_mappings = {
         "tool_": "admin/tool",
         "report_": "admin/report",
+        "aiprovider_": "ai/provider",
         "format_": "course/format",
         "qtype_": "question/type",
         "qbehaviour_": "question/behaviour",
@@ -86,6 +87,21 @@ def resolve_classname_to_file_path(classname: str) -> str | None:
     return f"{component_root}/classes/{'/'.join(relative_parts)}.php"
 
 
+def resolve_framework_class_to_file_path(classname: str) -> str | None:
+    """Resolve well-known legacy Moodle framework classes to core files.
+
+    Moodle still uses a few important non-namespaced framework classes. Phase 1
+    only needs a small explicit mapping so related-file suggestions can surface
+    the core implementation files developers commonly need beside plugin code.
+    """
+
+    normalized = classname.lstrip("\\").lower()
+    framework_mappings = {
+        "moodleform": "lib/formslib.php",
+    }
+    return framework_mappings.get(normalized)
+
+
 def infer_component(relative_path: str, subplugin_mounts: Sequence[SubpluginMount] | None = None) -> InferredComponent:
     """Infer the Moodle component from a repository-relative path.
 
@@ -131,6 +147,8 @@ def infer_component(relative_path: str, subplugin_mounts: Sequence[SubpluginMoun
         return _plugin_component(f"contenttype_{parts[2]}", "contenttype", parts[:3])
     if len(parts) >= 3 and parts[0] == "message" and parts[1] == "output":
         return _plugin_component(f"message_{parts[2]}", "message", parts[:3])
+    if len(parts) >= 3 and parts[0] == "ai" and parts[1] == "provider":
+        return _plugin_component(f"aiprovider_{parts[2]}", "aiprovider", parts[:3])
 
     top_level_families = {
         "mod",

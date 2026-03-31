@@ -10,7 +10,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from moodle_indexer.components import resolve_classname_to_file_path
+from moodle_indexer.components import resolve_classname_to_file_path, resolve_framework_class_to_file_path
 from moodle_indexer.errors import ValidationError
 from moodle_indexer.paths import normalize_relative_lookup_path
 from moodle_indexer.suggestions import suggest_related_files
@@ -189,7 +189,8 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         (file_id,),
     ).fetchall()
     linked_tests = _linked_service_tests(connection, webservices)
-    rendering_references = _linked_rendering_artifacts(connection, relationships)
+    class_references = _linked_class_artifacts(connection, relationships)
+    rendering_references = [item for item in class_references if item["artifact_kind"] == "output_class"]
 
     related_suggestions = [
         {"path": item.path, "reason": item.reason}
@@ -197,7 +198,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     ]
     related_suggestions.extend(_service_related_suggestions(webservices))
     related_suggestions.extend(_service_test_suggestions(connection, webservices))
-    related_suggestions.extend(_rendering_related_suggestions(rendering_references))
+    related_suggestions.extend(_class_related_suggestions(class_references))
     related_suggestions = _deduplicate_suggestions(related_suggestions)
 
     return {
@@ -237,6 +238,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         ]
         + linked_tests,
         "webservices": [dict(item) for item in webservices],
+        "class_references": class_references,
         "rendering_references": rendering_references,
         "relationships": [dict(item) for item in relationships],
         "related_suggestions": related_suggestions,
@@ -409,12 +411,12 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
         """
         SELECT target_name, relationship_type, line
         FROM relationships
-        WHERE file_id = ? AND relationship_type = 'references_class'
+        WHERE file_id = ? AND relationship_type IN ('references_class', 'extends')
         ORDER BY line, target_name
         """,
         (row["id"],),
     ).fetchall()
-    suggestions.extend(_indexed_rendering_suggestions(connection, rendering_relationships))
+    suggestions.extend(_indexed_class_suggestions(connection, rendering_relationships))
     suggestions = _deduplicate_indexed_suggestions(suggestions)
     return {
         "file": moodle_path,
@@ -541,52 +543,63 @@ def _service_related_suggestions(webservices: list[sqlite3.Row]) -> list[dict[st
     return suggestions
 
 
-def _linked_rendering_artifacts(
+def _linked_class_artifacts(
     connection: sqlite3.Connection,
     relationships: list[sqlite3.Row],
 ) -> list[dict[str, object]]:
-    """Return resolved output-class and template artifacts for one file."""
+    """Return resolved class/file artifacts for one file.
+
+    This helper keeps Phase 1 resolution deterministic:
+    - Moodle autoloaded namespaced classes resolve via frankenstyle component
+      namespaces.
+    - a short explicit map handles important legacy framework classes such as
+      ``moodleform``.
+    - output classes additionally surface likely paired Mustache templates.
+    """
 
     artifacts: list[dict[str, object]] = []
-    seen_classes: set[str] = set()
+    seen_relationships: set[tuple[str, str]] = set()
     for item in relationships:
-        if item["relationship_type"] != "references_class":
+        if item["relationship_type"] not in {"references_class", "extends"}:
             continue
         class_name = str(item["target_name"]).lstrip("\\")
-        if class_name in seen_classes:
+        relationship_key = (item["relationship_type"], class_name)
+        if relationship_key in seen_relationships:
             continue
-        seen_classes.add(class_name)
-        output_file = resolve_classname_to_file_path(class_name)
-        if output_file is None:
+        seen_relationships.add(relationship_key)
+        target_file = resolve_classname_to_file_path(class_name)
+        if target_file is None:
+            target_file = resolve_framework_class_to_file_path(class_name)
+        if target_file is None:
             continue
         file_exists = connection.execute(
             "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
-            (output_file, output_file),
+            (target_file, target_file),
         ).fetchone()
-        template_files = _existing_template_candidates(connection, output_file)
+        template_files = _existing_template_candidates(connection, target_file)
+        artifact_kind = _class_artifact_kind(target_file)
         artifacts.append(
             {
                 "class_name": class_name,
-                "resolved_target_file": output_file,
+                "relationship_type": item["relationship_type"],
+                "resolved_target_file": target_file,
                 "resolved": bool(file_exists),
+                "artifact_kind": artifact_kind,
                 "template_files": template_files,
             }
         )
     return artifacts
 
 
-def _rendering_related_suggestions(rendering_references: list[dict[str, object]]) -> list[dict[str, str]]:
-    """Return file-context related suggestions for resolved rendering artifacts."""
+def _class_related_suggestions(class_references: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Return file-context related suggestions for resolved class artifacts."""
 
     suggestions: list[dict[str, str]] = []
-    for item in rendering_references:
+    for item in class_references:
         suggestions.append(
             {
                 "path": str(item["resolved_target_file"]),
-                "reason": (
-                    f"suggested because this file references class \\{item['class_name']}, "
-                    "which resolves to this output file"
-                ),
+                "reason": _class_artifact_reason(item),
             }
         )
         for template_path in item["template_files"]:
@@ -691,13 +704,13 @@ def _indexed_service_test_suggestions(
     return suggestions
 
 
-def _indexed_rendering_suggestions(
+def _indexed_class_suggestions(
     connection: sqlite3.Connection,
     relationships: list[sqlite3.Row],
 ) -> list[dict[str, object]]:
-    """Return suggest-related entries for output-class and template companions."""
+    """Return suggest-related entries for resolved class/file companions."""
 
-    artifacts = _linked_rendering_artifacts(connection, relationships)
+    artifacts = _linked_class_artifacts(connection, relationships)
     suggestions: list[dict[str, object]] = []
     for item in artifacts:
         target_path = str(item["resolved_target_file"])
@@ -705,10 +718,7 @@ def _indexed_rendering_suggestions(
             suggestions.append(
                 {
                     "path": target_path,
-                    "reason": (
-                        f"suggested because this file references class \\{item['class_name']}, "
-                        "which resolves to this output file"
-                    ),
+                    "reason": _class_artifact_reason(item),
                     "indexed": True,
                 }
             )
@@ -856,3 +866,38 @@ def _existing_template_candidates(connection: sqlite3.Connection, output_file: s
         (template_path, template_path),
     ).fetchone()
     return [template_path] if row else []
+
+
+def _class_artifact_kind(target_file: str) -> str:
+    """Return a coarse artifact kind for a resolved class target file."""
+
+    if target_file == "lib/formslib.php":
+        return "framework_base"
+    if "/classes/output/" in target_file:
+        return "output_class"
+    if "/classes/form/" in target_file:
+        return "form_class"
+    return "class_file"
+
+
+def _class_artifact_reason(item: dict[str, object]) -> str:
+    """Return a human-readable explanation for a resolved class artifact."""
+
+    class_name = str(item["class_name"])
+    relationship_type = str(item["relationship_type"])
+    artifact_kind = str(item["artifact_kind"])
+
+    if relationship_type == "extends" and artifact_kind == "framework_base":
+        return (
+            f"suggested because this class extends {class_name}, whose core base "
+            "implementation lives in this file"
+        )
+    if relationship_type == "extends":
+        return f"suggested because this class extends {class_name}, which is implemented in this file"
+    if artifact_kind == "output_class":
+        return f"suggested because this file references class \\{class_name}, which resolves to this output file"
+    if artifact_kind == "form_class":
+        return f"suggested because this file references class \\{class_name}, which resolves to this form class file"
+    if artifact_kind == "framework_base":
+        return f"suggested because this file references core framework class \\{class_name}, which is defined here"
+    return f"suggested because this file references class \\{class_name}, which resolves to this file"

@@ -41,12 +41,14 @@ This tool builds a compact local index so those questions become cheap and machi
 - symbol indexing for classes, interfaces, traits, functions, and methods
 - structural relationship indexing for `extends`, `implements`, and method-to-class ownership
 - output/rendering-aware suggestions for `classes/output/` and `templates/` when production PHP references Moodle output classes
+- framework-aware suggestions for `settings.php`, `lib/adminlib.php`, Moodle form classes, and `lib/formslib.php`
 - capability extraction from `db/access.php`
 - web service extraction from `db/services.php`
 - capability attribution to the owning component of the defining file
 - language string extraction from `lang/en/*.php`
 - detection of obvious `require_capability`, `has_capability`, and `get_string` usage
 - `db/services.php` extraction with support for both deprecated `classpath` implementations and modern `classname`-based external classes
+- service-aware suggestions that link `db/services.php` to implementation files and likely PHPUnit coverage
 - PHPUnit and Behat discovery
 - related-file suggestions with explanation strings
 - JSON CLI commands for indexing and querying
@@ -89,6 +91,26 @@ The SQLite schema stays intentionally small and extensible:
 - `language_strings`
 - `language_string_usages`
 - `tests`
+
+## Moodle-Aware Suggestions
+
+Phase 1 intentionally mixes a few different sources of truth:
+
+- explicitly extracted relationships:
+  - PHP `extends` / `implements`
+  - web service definitions from `db/services.php`
+  - capability definitions from `db/access.php`
+- deterministic Moodle heuristics:
+  - `settings.php` suggests `lib/adminlib.php`
+  - `classes/output/*.php` suggests paired Mustache templates when present
+  - `db/services.php` suggests resolved `classpath` and `classname` implementation files
+  - resolved service implementations suggest likely PHPUnit files such as `tests/external/*_test.php` or `tests/externallib_test.php`
+  - PHP class references and instantiations can resolve companion files for Moodle output classes and plugin form classes
+  - form classes extending `moodleform` suggest the core base implementation in `lib/formslib.php`
+
+The suggestion engine is still heuristic in places. It is designed to be
+explainable and useful for local navigation, not to claim perfect semantic
+coverage of Moodle's runtime behavior.
 
 ## Setup
 

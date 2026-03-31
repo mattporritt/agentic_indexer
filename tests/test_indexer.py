@@ -190,10 +190,12 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
         }
         assert {
+            "aiprovider_openai",
             "mod_forum",
             "forumreport_summary",
             "mod_assign",
             "tool_demo",
+            "tool_mfa",
             "theme_boost",
             "enrol_manual",
             "tool_phpunit",
@@ -349,6 +351,51 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         related_result = suggest_related(connection, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
         assert suggestions_by_path["admin/tool/demo/lang/en/tool_demo.php"]["indexed"] is True
+
+        mfa_context = file_context(connection, "admin/tool/mfa/settings.php")
+        mfa_related = {item["path"]: item for item in mfa_context["related_suggestions"]}
+        assert "lib/adminlib.php" in mfa_related
+        assert "admin settings APIs" in mfa_related["lib/adminlib.php"]["reason"]
+
+        mfa_suggestions = {item["path"]: item for item in suggest_related(connection, "admin/tool/mfa/settings.php")["suggestions"]}
+        assert "lib/adminlib.php" in mfa_suggestions
+        assert mfa_suggestions["lib/adminlib.php"]["indexed"] is True
+        assert "admin settings APIs" in mfa_suggestions["lib/adminlib.php"]["reason"]
+
+        provider_context = file_context(connection, "ai/provider/openai/classes/provider.php")
+        provider_class_references = {
+            item["class_name"]: item for item in provider_context["class_references"]
+        }
+        assert "aiprovider_openai\\form\\action_generate_image_form" in provider_class_references
+        assert provider_class_references["aiprovider_openai\\form\\action_generate_image_form"][
+            "resolved_target_file"
+        ] == "ai/provider/openai/classes/form/action_generate_image_form.php"
+        provider_related = {item["path"]: item for item in provider_context["related_suggestions"]}
+        assert "ai/provider/openai/classes/form/action_generate_image_form.php" in provider_related
+        assert "form\\action_generate_image_form" in provider_related[
+            "ai/provider/openai/classes/form/action_generate_image_form.php"
+        ]["reason"]
+
+        provider_suggestions = {
+            item["path"]: item for item in suggest_related(connection, "ai/provider/openai/classes/provider.php")["suggestions"]
+        }
+        assert "ai/provider/openai/classes/form/action_generate_image_form.php" in provider_suggestions
+        assert "form\\action_generate_image_form" in provider_suggestions[
+            "ai/provider/openai/classes/form/action_generate_image_form.php"
+        ]["reason"]
+
+        action_form_context = file_context(connection, "ai/provider/openai/classes/form/action_form.php")
+        action_form_related = {item["path"]: item for item in action_form_context["related_suggestions"]}
+        assert "lib/formslib.php" in action_form_related
+        assert "extends moodleform" in action_form_related["lib/formslib.php"]["reason"]
+
+        action_form_suggestions = {
+            item["path"]: item
+            for item in suggest_related(connection, "ai/provider/openai/classes/form/action_form.php")["suggestions"]
+        }
+        assert "lib/formslib.php" in action_form_suggestions
+        assert action_form_suggestions["lib/formslib.php"]["indexed"] is True
+        assert "extends moodleform" in action_form_suggestions["lib/formslib.php"]["reason"]
     finally:
         connection.close()
 

@@ -31,6 +31,8 @@ FEATURE_SCENARIO_RE = re.compile(r"^\s*(Feature|Scenario|Scenario Outline):\s*(.
 CAPABILITIES_ASSIGNMENT_RE = re.compile(r"\$capabilities\s*=")
 FUNCTIONS_ASSIGNMENT_RE = re.compile(r"\$functions\s*=")
 OUTPUT_CLASS_REFERENCE_RE = re.compile(r"(?<![A-Za-z0-9_])\\?([A-Za-z][A-Za-z0-9_]*_[A-Za-z0-9_]+\\output\\[A-Za-z0-9_\\]+)")
+NEW_CLASS_REFERENCE_RE = re.compile(r"\bnew\s+([\\A-Za-z_][\\A-Za-z0-9_\\]*)")
+NAMESPACE_RE = re.compile(r"namespace\s+([^;]+);")
 
 
 @dataclass(slots=True)
@@ -52,6 +54,7 @@ def extract_php_artifacts(
     """Extract PHP symbols and basic relationships from a PHP source file."""
 
     parsed_symbols = parse_php_symbols(source)
+    namespace = _extract_namespace(source)
     symbols: list[SymbolRecord] = []
     relationships: list[RelationshipRecord] = []
 
@@ -116,6 +119,19 @@ def extract_php_artifacts(
             RelationshipRecord(
                 source_fqname=relative_path,
                 target_name=class_name,
+                relationship_type="references_class",
+                file_path=relative_path,
+                line=source.count("\n", 0, match.start()) + 1,
+            )
+        )
+    for match in NEW_CLASS_REFERENCE_RE.finditer(source):
+        normalized_reference = _normalize_class_reference(match.group(1), namespace)
+        if normalized_reference is None or normalized_reference.endswith("\\output"):
+            continue
+        relationships.append(
+            RelationshipRecord(
+                source_fqname=relative_path,
+                target_name=normalized_reference,
                 relationship_type="references_class",
                 file_path=relative_path,
                 line=source.count("\n", 0, match.start()) + 1,
@@ -397,6 +413,28 @@ def _skip_php_block_comment(source: str, index: int) -> int:
     if end_index == -1:
         return len(source)
     return end_index + 2
+
+
+def _extract_namespace(source: str) -> str | None:
+    """Return the declared namespace for a PHP source file when present."""
+
+    match = NAMESPACE_RE.search(source)
+    return match.group(1).strip() if match else None
+
+
+def _normalize_class_reference(reference: str, namespace: str | None) -> str | None:
+    """Normalize a class reference into a resolvable Moodle class name."""
+
+    if not reference:
+        return None
+    normalized = reference.lstrip("\\")
+    if "\\" not in normalized:
+        return normalized
+    if reference.startswith("\\"):
+        return normalized
+    if namespace:
+        return f"{namespace}\\{normalized}"
+    return normalized
 
 
 def extract_capability_usages(source: str, relative_path: str, component_name: str) -> list[CapabilityUsageRecord]:

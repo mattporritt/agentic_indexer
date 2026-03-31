@@ -34,6 +34,7 @@ from moodle_indexer.subplugins import SubpluginMount
         ("theme/boost/lib.php", "theme_boost", "theme", "theme/boost"),
         ("payment/gateway/paypal/classes/gateway.php", "paygw_paypal", "paygw", "payment/gateway/paypal"),
         ("contentbank/contenttype/h5p/lib.php", "contenttype_h5p", "contenttype", "contentbank/contenttype/h5p"),
+        ("ai/provider/openai/classes/provider.php", "aiprovider_openai", "aiprovider", "ai/provider/openai"),
         ("question/engine/lib.php", "core_question", "core", "question"),
         ("admin/cli/cron.php", "core_admin", "core", "admin"),
     ],

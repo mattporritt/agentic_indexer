@@ -48,6 +48,10 @@ def suggest_related_files(relative_path: str) -> list[RelatedSuggestion]:
             "Settings-related work commonly involves the component settings definition file.",
         )
         add(
+            "lib/adminlib.php",
+            "suggested because settings.php uses Moodle admin settings APIs defined in lib/adminlib.php",
+        )
+        add(
             f"{component_root}/version.php",
             "Settings changes are often shipped alongside version bumps during Moodle development.",
         )
