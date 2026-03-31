@@ -10,11 +10,18 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from moodle_indexer.components import resolve_classname_to_file_path
+from moodle_indexer.components import (
+    infer_js_module_name,
+    resolve_amd_build_path,
+    resolve_classname_to_file_path,
+    resolve_js_module_to_source_path,
+)
 from moodle_indexer.file_roles import classify_file_role
 from moodle_indexer.models import (
     CapabilityRecord,
     CapabilityUsageRecord,
+    JsImportRecord,
+    JsModuleRecord,
     LanguageStringRecord,
     LanguageStringUsageRecord,
     RelationshipRecord,
@@ -33,6 +40,26 @@ FUNCTIONS_ASSIGNMENT_RE = re.compile(r"\$functions\s*=")
 OUTPUT_CLASS_REFERENCE_RE = re.compile(r"(?<![A-Za-z0-9_])\\?([A-Za-z][A-Za-z0-9_]*_[A-Za-z0-9_]+\\output\\[A-Za-z0-9_\\]+)")
 NEW_CLASS_REFERENCE_RE = re.compile(r"\bnew\s+([\\A-Za-z_][\\A-Za-z0-9_\\]*)")
 NAMESPACE_RE = re.compile(r"namespace\s+([^;]+);")
+IMPORT_FROM_RE = re.compile(
+    r"""^\s*import\s+(?P<clause>.+?)\s+from\s+['"](?P<module>[^'"]+)['"]\s*;?\s*$""",
+    re.MULTILINE,
+)
+IMPORT_SIDE_EFFECT_RE = re.compile(r"""^\s*import\s+['"](?P<module>[^'"]+)['"]\s*;?\s*$""", re.MULTILINE)
+DEFINE_RE = re.compile(
+    r"""define\s*\(\s*\[(?P<deps>.*?)\]\s*,\s*function\s*\((?P<params>[^)]*)\)""",
+    re.DOTALL,
+)
+QUOTED_STRING_RE = re.compile(r"""['"]([^'"]+)['"]""")
+EXPORT_DEFAULT_CLASS_RE = re.compile(
+    r"""export\s+default\s+class(?:\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*))?(?:\s+extends\s+(?P<superclass>[A-Za-z_][A-Za-z0-9_]*))?""",
+)
+EXPORT_DEFAULT_ANONYMOUS_CLASS_RE = re.compile(
+    r"""export\s+default\s+class\s+extends\s+(?P<superclass>[A-Za-z_][A-Za-z0-9_]*)"""
+)
+EXPORT_NAMED_CLASS_RE = re.compile(
+    r"""export\s+class\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s+extends\s+(?P<superclass>[A-Za-z_][A-Za-z0-9_]*))?"""
+)
+EXPORT_DEFAULT_RE = re.compile(r"""export\s+default\s+(?!class)(?P<name>[A-Za-z_][A-Za-z0-9_]*)""")
 
 
 @dataclass(slots=True)
@@ -139,6 +166,83 @@ def extract_php_artifacts(
         )
 
     return symbols, relationships
+
+
+def extract_js_module_artifacts(
+    source: str,
+    relative_path: str,
+    component_name: str,
+) -> tuple[JsModuleRecord | None, list[JsImportRecord], list[RelationshipRecord]]:
+    """Extract Moodle AMD source metadata from a JavaScript source file.
+
+    Phase 1 intentionally keeps this parser small and Moodle-specific:
+    - modern ES module imports
+    - legacy ``define([...], function(...))`` dependencies
+    - default export / exported class detection
+    - class inheritance linked back to imported module bindings where possible
+    - deterministic ``amd/src`` to ``amd/build`` pairing
+    """
+
+    if classify_file_role(relative_path) != "amd_source":
+        return None, [], []
+
+    module_name = infer_js_module_name(relative_path, component_name)
+    if module_name is None:
+        return None, [], []
+
+    imports, binding_modules = _extract_js_imports(source, relative_path, component_name)
+    export_kind, export_name, superclass_name = _extract_js_export_metadata(source)
+    superclass_module = binding_modules.get(superclass_name) if superclass_name else None
+    resolved_superclass_file = (
+        resolve_js_module_to_source_path(superclass_module) if superclass_module else None
+    )
+    build_file = resolve_amd_build_path(relative_path)
+
+    relationships: list[RelationshipRecord] = []
+    for item in imports:
+        relationships.append(
+            RelationshipRecord(
+                source_fqname=module_name,
+                target_name=item.module_name,
+                relationship_type="js_imports",
+                file_path=relative_path,
+                line=item.line,
+            )
+        )
+    if superclass_name:
+        relationships.append(
+            RelationshipRecord(
+                source_fqname=module_name,
+                target_name=superclass_module or superclass_name,
+                relationship_type="js_extends",
+                file_path=relative_path,
+                line=_line_number_for_match(source, EXPORT_DEFAULT_CLASS_RE.search(source) or EXPORT_NAMED_CLASS_RE.search(source)),
+            )
+        )
+    if build_file:
+        relationships.append(
+            RelationshipRecord(
+                source_fqname=module_name,
+                target_name=build_file,
+                relationship_type="builds_to",
+                file_path=relative_path,
+                line=1,
+            )
+        )
+
+    js_module = JsModuleRecord(
+        module_name=module_name,
+        component_name=component_name,
+        file_path=relative_path,
+        export_kind=export_kind,
+        export_name=export_name,
+        superclass_name=superclass_name,
+        superclass_module=superclass_module,
+        resolved_superclass_file=resolved_superclass_file,
+        build_file=build_file,
+        build_status="resolved" if build_file else "unresolved",
+    )
+    return js_module, imports, relationships
 
 
 def extract_capabilities(source: str, relative_path: str, component_name: str) -> list[CapabilityRecord]:
@@ -582,6 +686,186 @@ def extract_tests(source: str, relative_path: str, component_name: str) -> list[
                     )
                 )
     return tests
+
+
+def _extract_js_imports(
+    source: str,
+    relative_path: str,
+    component_name: str,
+) -> tuple[list[JsImportRecord], dict[str, str]]:
+    """Return JS import/dependency records plus local-binding module lookup."""
+
+    imports: list[JsImportRecord] = []
+    binding_modules: dict[str, str] = {}
+
+    for match in IMPORT_FROM_RE.finditer(source):
+        module_name = match.group("module")
+        line = source.count("\n", 0, match.start()) + 1
+        resolved_target_file = resolve_js_module_to_source_path(module_name)
+        resolution_status = "resolved" if resolved_target_file else "unresolved"
+        clause = match.group("clause").strip()
+        parsed_imports = _parse_import_clause(
+            clause,
+            module_name,
+            line,
+            relative_path,
+            component_name,
+            resolved_target_file,
+            resolution_status,
+        )
+        imports.extend(parsed_imports)
+        for item in parsed_imports:
+            if item.local_name:
+                binding_modules[item.local_name] = module_name
+
+    for match in IMPORT_SIDE_EFFECT_RE.finditer(source):
+        module_name = match.group("module")
+        if any(item.module_name == module_name and item.line == source.count("\n", 0, match.start()) + 1 for item in imports):
+            continue
+        line = source.count("\n", 0, match.start()) + 1
+        resolved_target_file = resolve_js_module_to_source_path(module_name)
+        imports.append(
+            JsImportRecord(
+                module_name=module_name,
+                file_path=relative_path,
+                component_name=component_name,
+                line=line,
+                import_kind="side_effect",
+                resolved_target_file=resolved_target_file,
+                resolution_status="resolved" if resolved_target_file else "unresolved",
+            )
+        )
+
+    for match in DEFINE_RE.finditer(source):
+        dependencies = [item.group(1) for item in QUOTED_STRING_RE.finditer(match.group("deps"))]
+        factory_params = [item.strip() for item in match.group("params").split(",") if item.strip()]
+        for index, module_name in enumerate(dependencies):
+            line = source.count("\n", 0, match.start()) + 1
+            resolved_target_file = resolve_js_module_to_source_path(module_name)
+            local_name = factory_params[index] if index < len(factory_params) else None
+            import_record = JsImportRecord(
+                module_name=module_name,
+                file_path=relative_path,
+                component_name=component_name,
+                line=line,
+                import_kind="amd_dependency",
+                local_name=local_name,
+                resolved_target_file=resolved_target_file,
+                resolution_status="resolved" if resolved_target_file else "unresolved",
+            )
+            imports.append(import_record)
+            if local_name:
+                binding_modules[local_name] = module_name
+
+    return imports, binding_modules
+
+
+def _parse_import_clause(
+    clause: str,
+    module_name: str,
+    line: int,
+    relative_path: str,
+    component_name: str,
+    resolved_target_file: str | None,
+    resolution_status: str,
+) -> list[JsImportRecord]:
+    """Parse one ES module import clause into concrete import records."""
+
+    imports: list[JsImportRecord] = []
+
+    def add(import_kind: str, imported_name: str | None, local_name: str | None) -> None:
+        imports.append(
+            JsImportRecord(
+                module_name=module_name,
+                file_path=relative_path,
+                component_name=component_name,
+                line=line,
+                import_kind=import_kind,
+                imported_name=imported_name,
+                local_name=local_name,
+                resolved_target_file=resolved_target_file,
+                resolution_status=resolution_status,
+            )
+        )
+
+    clause = clause.strip()
+    if clause.startswith("{") and clause.endswith("}"):
+        for item in _parse_named_imports(clause):
+            add("named", item["imported_name"], item["local_name"])
+        return imports
+
+    if clause.startswith("* as "):
+        add("namespace", None, clause.removeprefix("* as ").strip())
+        return imports
+
+    if "," in clause:
+        default_part, rest = clause.split(",", 1)
+        add("default", "default", default_part.strip())
+        rest = rest.strip()
+        if rest.startswith("{") and rest.endswith("}"):
+            for item in _parse_named_imports(rest):
+                add("named", item["imported_name"], item["local_name"])
+        elif rest.startswith("* as "):
+            add("namespace", None, rest.removeprefix("* as ").strip())
+        return imports
+
+    add("default", "default", clause)
+    return imports
+
+
+def _parse_named_imports(clause: str) -> list[dict[str, str]]:
+    """Parse the names inside an ES module ``{ ... }`` import clause."""
+
+    names = []
+    for raw_item in clause.strip()[1:-1].split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        if " as " in item:
+            imported_name, local_name = [part.strip() for part in item.split(" as ", 1)]
+        else:
+            imported_name = item
+            local_name = item
+        names.append({"imported_name": imported_name, "local_name": local_name})
+    return names
+
+
+def _extract_js_export_metadata(source: str) -> tuple[str | None, str | None, str | None]:
+    """Extract a compact export/superclass summary from one JS source file."""
+
+    anonymous_default_class_match = EXPORT_DEFAULT_ANONYMOUS_CLASS_RE.search(source)
+    if anonymous_default_class_match:
+        return "default_class", None, anonymous_default_class_match.group("superclass")
+
+    default_class_match = EXPORT_DEFAULT_CLASS_RE.search(source)
+    if default_class_match:
+        return "default_class", default_class_match.group("name"), default_class_match.group("superclass")
+
+    named_class_match = EXPORT_NAMED_CLASS_RE.search(source)
+    if named_class_match:
+        return "named_class", named_class_match.group("name"), named_class_match.group("superclass")
+
+    default_match = EXPORT_DEFAULT_RE.search(source)
+    if default_match:
+        return "default_reference", default_match.group("name"), None
+
+    define_match = DEFINE_RE.search(source)
+    if define_match:
+        if re.search(r"\breturn\s+\{", source):
+            return "amd_return_object", None, None
+        if re.search(r"\breturn\s+function\b", source):
+            return "amd_return_function", None, None
+        return "amd_define", None, None
+
+    return None, None, None
+
+
+def _line_number_for_match(source: str, match: re.Match[str] | None) -> int:
+    """Return a 1-based line number for a regex match, defaulting to line 1."""
+
+    if match is None:
+        return 1
+    return source.count("\n", 0, match.start()) + 1
 
 
 def _parse_functions_entries(source: str) -> list[PhpArrayEntry]:

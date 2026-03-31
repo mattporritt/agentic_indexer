@@ -7,6 +7,7 @@ from pathlib import Path
 from moodle_indexer.config import build_index_config, detect_application_root
 from moodle_indexer.extractors import (
     extract_capabilities,
+    extract_js_module_artifacts,
     extract_language_strings,
     extract_php_artifacts,
     extract_webservices,
@@ -142,6 +143,51 @@ def test_webservice_extractor_resolves_classpath_and_classname_targets() -> None
     assert service_map["mod_assign_start_submission"].resolution_type == "classname"
 
 
+def test_js_module_extractor_handles_modern_and_legacy_moodle_patterns() -> None:
+    modern_source = _read_fixture("ai/amd/src/aiprovider_action_management_table.js")
+    modern_module, modern_imports, modern_relationships = extract_js_module_artifacts(
+        modern_source,
+        "ai/amd/src/aiprovider_action_management_table.js",
+        "core_ai",
+    )
+
+    assert modern_module is not None
+    assert modern_module.module_name == "core_ai/aiprovider_action_management_table"
+    assert modern_module.export_kind == "default_class"
+    assert modern_module.superclass_name == "PluginManagementTable"
+    assert modern_module.superclass_module == "core_admin/plugin_management_table"
+    assert modern_module.resolved_superclass_file == "admin/amd/src/plugin_management_table.js"
+    assert modern_module.build_file == "ai/amd/build/aiprovider_action_management_table.min.js"
+    modern_import_map = {(item.module_name, item.local_name, item.import_kind) for item in modern_imports}
+    assert ("core_admin/plugin_management_table", "PluginManagementTable", "default") in modern_import_map
+    assert ("core/ajax", "fetchMany", "named") in modern_import_map
+    assert ("core_ai/local_actions", "buildActionPayload", "named") in modern_import_map
+    assert ("js_extends", "core_admin/plugin_management_table") in {
+        (item.relationship_type, item.target_name) for item in modern_relationships
+    }
+    assert ("builds_to", "ai/amd/build/aiprovider_action_management_table.min.js") in {
+        (item.relationship_type, item.target_name) for item in modern_relationships
+    }
+
+    legacy_source = _read_fixture("mod/forum/amd/src/forum.js")
+    legacy_module, legacy_imports, legacy_relationships = extract_js_module_artifacts(
+        legacy_source,
+        "mod/forum/amd/src/forum.js",
+        "mod_forum",
+    )
+
+    assert legacy_module is not None
+    assert legacy_module.module_name == "mod_forum/forum"
+    assert legacy_module.export_kind == "amd_return_object"
+    legacy_import_map = {(item.module_name, item.local_name, item.resolved_target_file) for item in legacy_imports}
+    assert ("jquery", "$", None) in legacy_import_map
+    assert ("core/ajax", "Ajax", "lib/amd/src/ajax.js") in legacy_import_map
+    assert ("mod_forum/repository", "Repository", "mod/forum/amd/src/repository.js") in legacy_import_map
+    assert ("builds_to", "mod/forum/amd/build/forum.min.js") in {
+        (item.relationship_type, item.target_name) for item in legacy_relationships
+    }
+
+
 def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
     db_path = tmp_path / "classic.sqlite"
     result = build_index(build_index_config(str(CLASSIC_FIXTURE_ROOT), str(db_path), workers=2))
@@ -190,6 +236,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()
         }
         assert {
+            "core_ai",
             "aiprovider_openai",
             "mod_forum",
             "forumreport_summary",
@@ -396,6 +443,56 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "lib/formslib.php" in action_form_suggestions
         assert action_form_suggestions["lib/formslib.php"]["indexed"] is True
         assert "extends moodleform" in action_form_suggestions["lib/formslib.php"]["reason"]
+
+        js_context = file_context(connection, "ai/amd/src/aiprovider_action_management_table.js")
+        assert js_context["js_module"]["module_name"] == "core_ai/aiprovider_action_management_table"
+        assert js_context["js_module"]["export_kind"] == "default_class"
+        assert js_context["js_module"]["superclass_module"] == "core_admin/plugin_management_table"
+        assert js_context["js_module"]["resolved_superclass_file"] == "admin/amd/src/plugin_management_table.js"
+        assert js_context["js_module"]["build_file"] == "ai/amd/build/aiprovider_action_management_table.min.js"
+        js_imports = {(item["module_name"], item["resolved_target_file"]) for item in js_context["js_imports"]}
+        assert ("core_admin/plugin_management_table", "admin/amd/src/plugin_management_table.js") in js_imports
+        assert ("core/ajax", "lib/amd/src/ajax.js") in js_imports
+        assert ("core_ai/local_actions", "ai/amd/src/local_actions.js") in js_imports
+        js_related_paths = {item["path"] for item in js_context["related_suggestions"]}
+        assert "admin/amd/src/plugin_management_table.js" in js_related_paths
+        assert "lib/amd/src/ajax.js" in js_related_paths
+        assert "ai/amd/src/local_actions.js" in js_related_paths
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_related_paths
+
+        js_related = suggest_related(connection, "ai/amd/src/aiprovider_action_management_table.js")
+        js_suggestions = {item["path"]: item for item in js_related["suggestions"]}
+        assert "admin/amd/src/plugin_management_table.js" in js_suggestions
+        assert "imports core_admin/plugin_management_table" in js_suggestions[
+            "admin/amd/src/plugin_management_table.js"
+        ]["reason"]
+        assert "lib/amd/src/ajax.js" in js_suggestions
+        assert "imports core/ajax" in js_suggestions["lib/amd/src/ajax.js"]["reason"]
+        assert "ai/amd/src/local_actions.js" in js_suggestions
+        assert "imports core_ai/local_actions" in js_suggestions["ai/amd/src/local_actions.js"]["reason"]
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_suggestions
+        assert "built artifact" in js_suggestions["ai/amd/build/aiprovider_action_management_table.min.js"]["reason"]
+
+        legacy_js_context = file_context(connection, "mod/forum/amd/src/forum.js")
+        assert legacy_js_context["js_module"]["module_name"] == "mod_forum/forum"
+        assert legacy_js_context["js_module"]["export_kind"] == "amd_return_object"
+        legacy_imports = {(item["module_name"], item["resolved_target_file"]) for item in legacy_js_context["js_imports"]}
+        assert ("jquery", None) in legacy_imports
+        assert ("core/ajax", "lib/amd/src/ajax.js") in legacy_imports
+        assert ("mod_forum/repository", "mod/forum/amd/src/repository.js") in legacy_imports
+        legacy_related_paths = {item["path"] for item in legacy_js_context["related_suggestions"]}
+        assert "lib/amd/src/ajax.js" in legacy_related_paths
+        assert "mod/forum/amd/src/repository.js" in legacy_related_paths
+        assert "mod/forum/amd/build/forum.min.js" in legacy_related_paths
+
+        legacy_related = suggest_related(connection, "mod/forum/amd/src/forum.js")
+        legacy_suggestions = {item["path"]: item for item in legacy_related["suggestions"]}
+        assert "lib/amd/src/ajax.js" in legacy_suggestions
+        assert "imports core/ajax" in legacy_suggestions["lib/amd/src/ajax.js"]["reason"]
+        assert "mod/forum/amd/src/repository.js" in legacy_suggestions
+        assert "imports mod_forum/repository" in legacy_suggestions["mod/forum/amd/src/repository.js"]["reason"]
+        assert "mod/forum/amd/build/forum.min.js" in legacy_suggestions
+        assert "built artifact" in legacy_suggestions["mod/forum/amd/build/forum.min.js"]["reason"]
     finally:
         connection.close()
 

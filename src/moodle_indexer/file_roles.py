@@ -49,6 +49,8 @@ def classify_file_role(relative_path: str) -> str:
         return "template_file"
     if "/amd/src/" in path and path.endswith(".js"):
         return "amd_source"
+    if "/amd/build/" in path and path.endswith(".min.js"):
+        return "amd_build"
     if path.endswith("_test.php") or "/tests/" in path and path.endswith(".php"):
         return "phpunit_test"
     return "unknown"

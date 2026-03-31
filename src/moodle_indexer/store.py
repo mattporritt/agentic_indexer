@@ -132,6 +132,34 @@ SCHEMA_STATEMENTS = [
     );
     """,
     """
+    CREATE TABLE js_modules (
+        id INTEGER PRIMARY KEY,
+        file_id INTEGER NOT NULL UNIQUE REFERENCES files(id) ON DELETE CASCADE,
+        component_id INTEGER NOT NULL REFERENCES components(id) ON DELETE CASCADE,
+        module_name TEXT NOT NULL,
+        export_kind TEXT,
+        export_name TEXT,
+        superclass_name TEXT,
+        superclass_module TEXT,
+        resolved_superclass_file TEXT,
+        build_file TEXT,
+        build_status TEXT NOT NULL
+    );
+    """,
+    """
+    CREATE TABLE js_imports (
+        id INTEGER PRIMARY KEY,
+        js_module_id INTEGER NOT NULL REFERENCES js_modules(id) ON DELETE CASCADE,
+        module_name TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        import_kind TEXT NOT NULL,
+        imported_name TEXT,
+        local_name TEXT,
+        resolved_target_file TEXT,
+        resolution_status TEXT NOT NULL
+    );
+    """,
+    """
     CREATE TABLE tests (
         id INTEGER PRIMARY KEY,
         file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -168,6 +196,15 @@ SCHEMA_STATEMENTS = [
     """,
     """
     CREATE INDEX idx_webservices_component_id ON webservices(component_id);
+    """,
+    """
+    CREATE INDEX idx_js_modules_component_id ON js_modules(component_id);
+    """,
+    """
+    CREATE INDEX idx_js_modules_module_name ON js_modules(module_name);
+    """,
+    """
+    CREATE INDEX idx_js_imports_module_name ON js_imports(module_name);
     """,
     """
     CREATE INDEX idx_tests_component_id ON tests(component_id);
@@ -443,5 +480,75 @@ def insert_webservice(
             webservice.get("resolved_target_file"),
             webservice["resolution_type"],
             webservice["resolution_status"],
+        ),
+    )
+
+
+def insert_js_module(
+    connection: sqlite3.Connection,
+    file_id: int,
+    component_id: int,
+    js_module: dict[str, Any],
+) -> int:
+    """Insert one indexed JS module row and return its id."""
+
+    cursor = connection.execute(
+        """
+        INSERT INTO js_modules (
+            file_id,
+            component_id,
+            module_name,
+            export_kind,
+            export_name,
+            superclass_name,
+            superclass_module,
+            resolved_superclass_file,
+            build_file,
+            build_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            file_id,
+            component_id,
+            js_module["module_name"],
+            js_module.get("export_kind"),
+            js_module.get("export_name"),
+            js_module.get("superclass_name"),
+            js_module.get("superclass_module"),
+            js_module.get("resolved_superclass_file"),
+            js_module.get("build_file"),
+            js_module["build_status"],
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def insert_js_import(connection: sqlite3.Connection, js_module_id: int, js_import: dict[str, Any]) -> None:
+    """Insert one JS import/dependency row."""
+
+    connection.execute(
+        """
+        INSERT INTO js_imports (
+            js_module_id,
+            module_name,
+            line,
+            import_kind,
+            imported_name,
+            local_name,
+            resolved_target_file,
+            resolution_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            js_module_id,
+            js_import["module_name"],
+            js_import["line"],
+            js_import["import_kind"],
+            js_import.get("imported_name"),
+            js_import.get("local_name"),
+            js_import.get("resolved_target_file"),
+            js_import["resolution_status"],
         ),
     )

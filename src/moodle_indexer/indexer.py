@@ -19,6 +19,7 @@ from moodle_indexer.config import IndexConfig
 from moodle_indexer.extractors import (
     extract_capabilities,
     extract_capability_usages,
+    extract_js_module_artifacts,
     extract_language_string_usages,
     extract_language_strings,
     extract_php_artifacts,
@@ -36,6 +37,8 @@ from moodle_indexer.store import (
     insert_capability_usage,
     insert_component,
     insert_file,
+    insert_js_import,
+    insert_js_module,
     insert_language_string,
     insert_language_string_usage,
     insert_relationship,
@@ -93,6 +96,8 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
         "capabilities": 0,
         "language_strings": 0,
         "webservices": 0,
+        "js_modules": 0,
+        "js_imports": 0,
         "tests": 0,
     }
     worker_stats = _resolve_worker_usage(config.workers, discovered_files)
@@ -189,6 +194,13 @@ def build_index(config: IndexConfig) -> dict[str, int | str]:
             for webservice in file_payload["webservices"]:
                 insert_webservice(connection, file_id, component_id, asdict(webservice))
             counts["webservices"] += len(file_payload["webservices"])
+
+            if file_payload["js_module"] is not None:
+                js_module_id = insert_js_module(connection, file_id, component_id, asdict(file_payload["js_module"]))
+                counts["js_modules"] += 1
+                for js_import in file_payload["js_imports"]:
+                    insert_js_import(connection, js_module_id, asdict(js_import))
+                counts["js_imports"] += len(file_payload["js_imports"])
 
             for test_record in file_payload["tests"]:
                 insert_test(connection, file_id, component_id, asdict(test_record))
@@ -334,6 +346,8 @@ def _process_file_for_indexing(repository_root: Path, application_root: Path, fi
     language_string_usages = []
     tests = []
     webservices = []
+    js_module = None
+    js_imports = []
 
     if is_php_file(file_path):
         symbols, relationships = extract_php_artifacts(source, indexed_paths.moodle_path, component.name)
@@ -342,6 +356,13 @@ def _process_file_for_indexing(repository_root: Path, application_root: Path, fi
         language_string_usages = extract_language_string_usages(source, indexed_paths.moodle_path)
         webservices = extract_webservices(source, indexed_paths.moodle_path, component.name)
         tests = extract_tests(source, indexed_paths.moodle_path, component.name)
+    elif file_path.suffix.lower() == ".js":
+        js_module, js_imports, js_relationships = extract_js_module_artifacts(
+            source,
+            indexed_paths.moodle_path,
+            component.name,
+        )
+        relationships.extend(js_relationships)
 
     language_strings = extract_language_strings(source, indexed_paths.moodle_path, component.name)
     if file_role in {"behat_feature", "behat_context"} and not is_php_file(file_path):
@@ -360,6 +381,8 @@ def _process_file_for_indexing(repository_root: Path, application_root: Path, fi
         "path_scope": indexed_paths.path_scope,
         "repository_relative_path": indexed_paths.repository_relative_path,
         "relationships": relationships,
+        "js_imports": js_imports,
+        "js_module": js_module,
         "symbols": symbols,
         "tests": tests,
         "webservices": webservices,

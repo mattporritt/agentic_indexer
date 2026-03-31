@@ -38,6 +38,7 @@ This tool builds a compact local index so those questions become cheap and machi
 - subplugin-aware component inference via `db/subplugins.json`
 - deterministic file-role classification
 - parser-first PHP extraction with resilient fallback logic
+- Moodle-aware AMD JavaScript extraction for `amd/src/` source files
 - symbol indexing for classes, interfaces, traits, functions, and methods
 - structural relationship indexing for `extends`, `implements`, and method-to-class ownership
 - output/rendering-aware suggestions for `classes/output/` and `templates/` when production PHP references Moodle output classes
@@ -48,6 +49,8 @@ This tool builds a compact local index so those questions become cheap and machi
 - language string extraction from `lang/en/*.php`
 - detection of obvious `require_capability`, `has_capability`, and `get_string` usage
 - `db/services.php` extraction with support for both deprecated `classpath` implementations and modern `classname`-based external classes
+- JavaScript import/dependency extraction for both modern ES module syntax and older Moodle `define([...])` AMD modules
+- source/build awareness for `amd/src/*.js` and `amd/build/*.min.js`
 - service-aware suggestions that link `db/services.php` to implementation files and likely PHPUnit coverage
 - PHPUnit and Behat discovery
 - related-file suggestions with explanation strings
@@ -74,7 +77,7 @@ The package lives under `src/moodle_indexer/` and keeps responsibilities separat
 - `components.py`: Moodle component inference rules
 - `file_roles.py`: path-based file-role classification
 - `php_parser.py`: parser-first PHP symbol extraction with fallback logic
-- `extractors.py`: Moodle-specific extraction for relationships, capabilities, strings, and tests
+- `extractors.py`: Moodle-specific extraction for PHP, JS modules, relationships, capabilities, strings, and tests
 - `store.py`: SQLite schema and persistence helpers
 - `queries.py`: query services used by the CLI
 - `suggestions.py`: deterministic related-file heuristics
@@ -91,6 +94,8 @@ The SQLite schema stays intentionally small and extensible:
 - `language_strings`
 - `language_string_usages`
 - `tests`
+- `js_modules`
+- `js_imports`
 
 ## Moodle-Aware Suggestions
 
@@ -100,6 +105,7 @@ Phase 1 intentionally mixes a few different sources of truth:
   - PHP `extends` / `implements`
   - web service definitions from `db/services.php`
   - capability definitions from `db/access.php`
+  - Moodle AMD source module imports, exports, inheritance, and source/build pairings
 - deterministic Moodle heuristics:
   - `settings.php` suggests `lib/adminlib.php`
   - `classes/output/*.php` suggests paired Mustache templates when present
@@ -107,6 +113,17 @@ Phase 1 intentionally mixes a few different sources of truth:
   - resolved service implementations suggest likely PHPUnit files such as `tests/external/*_test.php` or `tests/externallib_test.php`
   - PHP class references and instantiations can resolve companion files for Moodle output classes and plugin form classes
   - form classes extending `moodleform` suggest the core base implementation in `lib/formslib.php`
+  - `amd/src/*.js` files surface resolved imported module source files and related `amd/build/*.min.js` artifacts
+
+Current JavaScript support is intentionally Moodle-specific rather than a
+generic JS graph. Phase 1 supports:
+
+- modern ES module imports such as `import Foo from 'core_admin/foo'`
+- named imports such as `import {call as fetchMany} from 'core/ajax'`
+- older Moodle AMD dependencies declared with `define([...], function(...) {})`
+- default export / exported class detection where practical
+- superclass detection for exported classes that extend imported modules
+- deterministic source/build linking between `amd/src/*.js` and `amd/build/*.min.js`
 
 The suggestion engine is still heuristic in places. It is designed to be
 explainable and useful for local navigation, not to claim perfect semantic

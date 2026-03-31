@@ -131,6 +131,37 @@ class WebServiceRecord:
 
 
 @dataclass(slots=True)
+class JsModuleRecord:
+    """Represents one Moodle AMD source module."""
+
+    module_name: str
+    component_name: str
+    file_path: str
+    export_kind: str | None = None
+    export_name: str | None = None
+    superclass_name: str | None = None
+    superclass_module: str | None = None
+    resolved_superclass_file: str | None = None
+    build_file: str | None = None
+    build_status: str = "unresolved"
+
+
+@dataclass(slots=True)
+class JsImportRecord:
+    """Represents one import or AMD dependency for a Moodle JS source file."""
+
+    module_name: str
+    file_path: str
+    component_name: str
+    line: int
+    import_kind: str
+    imported_name: str | None = None
+    local_name: str | None = None
+    resolved_target_file: str | None = None
+    resolution_status: str = "unresolved"
+
+
+@dataclass(slots=True)
 class TestRecord:
     """Represents a discovered test artifact."""
 

@@ -188,6 +188,41 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         """,
         (file_id,),
     ).fetchall()
+    js_module = connection.execute(
+        """
+        SELECT
+            id,
+            module_name,
+            export_kind,
+            export_name,
+            superclass_name,
+            superclass_module,
+            resolved_superclass_file,
+            build_file,
+            build_status
+        FROM js_modules
+        WHERE file_id = ?
+        """,
+        (file_id,),
+    ).fetchone()
+    js_imports = []
+    if js_module is not None:
+        js_imports = connection.execute(
+            """
+            SELECT
+                module_name,
+                line,
+                import_kind,
+                imported_name,
+                local_name,
+                resolved_target_file,
+                resolution_status
+            FROM js_imports
+            WHERE js_module_id = ?
+            ORDER BY line, module_name, local_name
+            """,
+            (js_module["id"],),
+        ).fetchall()
     linked_tests = _linked_service_tests(connection, webservices)
     class_references = _linked_class_artifacts(connection, relationships)
     rendering_references = [item for item in class_references if item["artifact_kind"] == "output_class"]
@@ -199,6 +234,7 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     related_suggestions.extend(_service_related_suggestions(webservices))
     related_suggestions.extend(_service_test_suggestions(connection, webservices))
     related_suggestions.extend(_class_related_suggestions(class_references))
+    related_suggestions.extend(_js_related_suggestions(connection, js_module, js_imports))
     related_suggestions = _deduplicate_suggestions(related_suggestions)
 
     return {
@@ -238,6 +274,8 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         ]
         + linked_tests,
         "webservices": [dict(item) for item in webservices],
+        "js_module": _serialize_js_module(js_module, connection),
+        "js_imports": [dict(item) for item in js_imports],
         "class_references": class_references,
         "rendering_references": rendering_references,
         "relationships": [dict(item) for item in relationships],
@@ -417,6 +455,35 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
         (row["id"],),
     ).fetchall()
     suggestions.extend(_indexed_class_suggestions(connection, rendering_relationships))
+    js_module = connection.execute(
+        """
+        SELECT
+            id,
+            module_name,
+            export_kind,
+            export_name,
+            superclass_name,
+            superclass_module,
+            resolved_superclass_file,
+            build_file,
+            build_status
+        FROM js_modules
+        WHERE file_id = ?
+        """,
+        (row["id"],),
+    ).fetchone()
+    js_imports = []
+    if js_module is not None:
+        js_imports = connection.execute(
+            """
+            SELECT module_name, line, import_kind, imported_name, local_name, resolved_target_file, resolution_status
+            FROM js_imports
+            WHERE js_module_id = ?
+            ORDER BY line, module_name, local_name
+            """,
+            (js_module["id"],),
+        ).fetchall()
+    suggestions.extend(_indexed_js_suggestions(connection, js_module, js_imports))
     suggestions = _deduplicate_indexed_suggestions(suggestions)
     return {
         "file": moodle_path,
@@ -901,3 +968,125 @@ def _class_artifact_reason(item: dict[str, object]) -> str:
     if artifact_kind == "framework_base":
         return f"suggested because this file references core framework class \\{class_name}, which is defined here"
     return f"suggested because this file references class \\{class_name}, which resolves to this file"
+
+
+def _serialize_js_module(js_module: sqlite3.Row | None, connection: sqlite3.Connection) -> dict[str, object] | None:
+    """Return a JSON-friendly JS module payload for ``file-context``."""
+
+    if js_module is None:
+        return None
+    build_indexed = False
+    if js_module["build_file"]:
+        build_indexed = bool(
+            connection.execute(
+                "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+                (js_module["build_file"], js_module["build_file"]),
+            ).fetchone()
+        )
+    return {
+        "module_name": js_module["module_name"],
+        "export_kind": js_module["export_kind"],
+        "export_name": js_module["export_name"],
+        "superclass_name": js_module["superclass_name"],
+        "superclass_module": js_module["superclass_module"],
+        "resolved_superclass_file": js_module["resolved_superclass_file"],
+        "build_file": js_module["build_file"],
+        "build_indexed": build_indexed,
+        "build_status": js_module["build_status"],
+    }
+
+
+def _js_related_suggestions(
+    connection: sqlite3.Connection,
+    js_module: sqlite3.Row | None,
+    js_imports: list[sqlite3.Row],
+) -> list[dict[str, str]]:
+    """Return ``file-context`` related suggestions for indexed JS module metadata."""
+
+    suggestions: list[dict[str, str]] = []
+    for item in js_imports:
+        if item["resolved_target_file"]:
+            suggestions.append(
+                {
+                    "path": item["resolved_target_file"],
+                    "reason": f"suggested because this source file imports {item['module_name']}",
+                }
+            )
+    if js_module is not None and js_module["resolved_superclass_file"]:
+        suggestions.append(
+            {
+                "path": js_module["resolved_superclass_file"],
+                "reason": (
+                    f"suggested because this source file extends {js_module['superclass_name']} "
+                    f"from {js_module['superclass_module']}"
+                ),
+            }
+        )
+    if js_module is not None and js_module["build_file"]:
+        build_file = js_module["build_file"]
+        build_exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (build_file, build_file),
+        ).fetchone()
+        if build_exists:
+            suggestions.append(
+                {
+                    "path": build_file,
+                    "reason": "suggested because this is the built artifact generated from the AMD source module",
+                }
+            )
+    return suggestions
+
+
+def _indexed_js_suggestions(
+    connection: sqlite3.Connection,
+    js_module: sqlite3.Row | None,
+    js_imports: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return ``suggest-related`` entries for indexed JS module metadata."""
+
+    suggestions: list[dict[str, object]] = []
+    for item in js_imports:
+        if not item["resolved_target_file"]:
+            continue
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (item["resolved_target_file"], item["resolved_target_file"]),
+        ).fetchone()
+        suggestions.append(
+            {
+                "path": item["resolved_target_file"],
+                "reason": f"suggested because this source file imports {item['module_name']}",
+                "indexed": bool(exists),
+            }
+        )
+    if js_module is not None and js_module["resolved_superclass_file"]:
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (js_module["resolved_superclass_file"], js_module["resolved_superclass_file"]),
+        ).fetchone()
+        suggestions.append(
+            {
+                "path": js_module["resolved_superclass_file"],
+                "reason": (
+                    f"suggested because this source file extends {js_module['superclass_name']} "
+                    f"from {js_module['superclass_module']}"
+                ),
+                "indexed": bool(exists),
+            }
+        )
+    if js_module is not None and js_module["build_file"]:
+        build_file = js_module["build_file"]
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (build_file, build_file),
+        ).fetchone()
+        if exists:
+            suggestions.append(
+                {
+                    "path": build_file,
+                    "reason": "suggested because this is the built artifact generated from the AMD source module",
+                    "indexed": True,
+                }
+            )
+    return suggestions

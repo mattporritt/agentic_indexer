@@ -14,6 +14,28 @@ from typing import Sequence
 from moodle_indexer.subplugins import SubpluginMount
 
 
+CORE_COMPONENT_ROOTS = {
+    "core": "lib",
+    "core_admin": "admin",
+    "core_course": "course",
+    "core_user": "user",
+    "core_group": "group",
+    "core_calendar": "calendar",
+    "core_files": "files",
+    "core_tag": "tag",
+    "core_backup": "backup",
+    "core_badges": "badges",
+    "core_grade": "grade",
+    "core_message": "message",
+    "core_question": "question",
+    "core_availability": "availability",
+    "core_contentbank": "contentbank",
+    "core_payment": "payment",
+    "core_media": "media",
+    "core_ai": "ai",
+}
+
+
 @dataclass(slots=True)
 class InferredComponent:
     """The inferred Moodle component for a repository path."""
@@ -35,6 +57,9 @@ def _plugin_component(
 
 def component_root_from_name(component_name: str) -> str | None:
     """Return the Moodle root path for a known frankenstyle component name."""
+
+    if component_name in CORE_COMPONENT_ROOTS:
+        return CORE_COMPONENT_ROOTS[component_name]
 
     prefix_mappings = {
         "tool_": "admin/tool",
@@ -69,6 +94,38 @@ def component_root_from_name(component_name: str) -> str | None:
             suffix = component_name.removeprefix(prefix)
             return f"{root}/{suffix}"
     return None
+
+
+def infer_js_module_name(relative_path: str, component_name: str) -> str | None:
+    """Infer the Moodle AMD module name for a source file under ``amd/src``."""
+
+    if "/amd/src/" not in relative_path or not relative_path.endswith(".js"):
+        return None
+    module_suffix = relative_path.split("/amd/src/", 1)[1].removesuffix(".js")
+    if not module_suffix:
+        return None
+    return f"{component_name}/{module_suffix}"
+
+
+def resolve_js_module_to_source_path(module_name: str) -> str | None:
+    """Resolve a Moodle AMD module name to its canonical ``amd/src`` file."""
+
+    normalized = module_name.strip().strip("'\"")
+    if "/" not in normalized:
+        return None
+    component_name, module_suffix = normalized.split("/", 1)
+    component_root = component_root_from_name(component_name)
+    if component_root is None or not module_suffix:
+        return None
+    return f"{component_root}/amd/src/{module_suffix}.js"
+
+
+def resolve_amd_build_path(source_path: str) -> str | None:
+    """Resolve an ``amd/src`` source path to its built ``amd/build`` artifact."""
+
+    if "/amd/src/" not in source_path or not source_path.endswith(".js"):
+        return None
+    return source_path.replace("/amd/src/", "/amd/build/").removesuffix(".js") + ".min.js"
 
 
 def resolve_classname_to_file_path(classname: str) -> str | None:
@@ -170,6 +227,7 @@ def infer_component(relative_path: str, subplugin_mounts: Sequence[SubpluginMoun
     core_prefixes = {
         "lib": "core",
         "admin": "core_admin",
+        "ai": "core_ai",
         "course": "core_course",
         "user": "core_user",
         "group": "core_group",
