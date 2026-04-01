@@ -321,7 +321,12 @@ For supported PHP functions, classes, and methods it returns:
 - docblock summary and selected tags
 - method modifiers such as visibility, `static`, `final`, and `abstract`
 - basic inheritance hints such as `override` or `interface_implementation`
-- a small number of practical usage examples
+- a small number of practical, high-confidence usage examples
+
+Phase 1.5 usage examples intentionally prefer precision over recall. The indexer
+will surface direct static calls, simple `new ClassName(...)` to `$var->method()`
+patterns, and a few other high-confidence linkages, and it may return zero
+examples when it cannot do so without becoming misleading.
 
 Ambiguity is explicit. If a short query such as `execute` matches multiple
 methods, the command returns multiple distinguishable matches instead of

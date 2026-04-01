@@ -254,4 +254,56 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     method_match = method_payload["data"]["matches"][0]
     assert method_match["class_name"] == "assign"
     assert method_match["inheritance_role"] == "interface_implementation"
-    assert any(item["usage_kind"] == "instance_method_call" for item in method_match["usage_examples"])
+    assert {item["file"] for item in method_match["usage_examples"]} == {
+        "mod/assign/externallib.php",
+        "mod/assign/renderer.php",
+    }
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "\\assign::view",
+        ]
+    )
+    assert exit_code == 0
+    legacy_slash_payload = json.loads(capsys.readouterr().out)
+    assert legacy_slash_payload["data"]["total_matches"] == 1
+    assert legacy_slash_payload["data"]["matches"][0]["class_name"] == "assign"
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    execute_payload = json.loads(capsys.readouterr().out)
+    assert execute_payload["data"]["matches"][0]["usage_examples"] == [
+        {
+            "file": "mod/assign/db/services.php",
+            "line": 13,
+            "usage_kind": "service_definition",
+            "confidence": "high",
+            "snippet": "mod_assign_start_submission",
+        }
+    ]
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "\\mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    namespaced_slash_payload = json.loads(capsys.readouterr().out)
+    assert namespaced_slash_payload["data"]["total_matches"] == 1
+    assert namespaced_slash_payload["data"]["matches"][0]["class_name"] == "mod_assign\\external\\start_submission"

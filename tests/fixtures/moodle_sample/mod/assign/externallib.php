@@ -15,3 +15,14 @@ function submit_grading_form(int $userid): array {
 
     return ['status' => 'ok'];
 }
+
+/**
+ * Remove an assignment instance through the legacy model.
+ *
+ * @param object $context Runtime context.
+ * @return bool
+ */
+function remove_assignment_instance(object $context): bool {
+    $assignment = new assign($context, null, null);
+    return $assignment->delete_instance();
+}

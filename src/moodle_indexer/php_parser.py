@@ -34,27 +34,14 @@ DECLARATION_RE = re.compile(
     """,
     re.VERBOSE | re.DOTALL,
 )
-FUNCTION_RE = re.compile(
+CALLABLE_START_RE = re.compile(
     r"""
     (?P<docblock>/\*\*.*?\*/\s*)?
     (?P<modifiers>(?:(?:public|protected|private|static|abstract|final)\s+)*)?
     function\s+
     (?P<reference>&\s*)?
     (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*
-    \((?P<params>.*?)\)
-    \s*(?::\s*(?P<return_type>[^{;\n]+))?
-    """,
-    re.VERBOSE | re.DOTALL,
-)
-METHOD_RE = re.compile(
-    r"""
-    (?P<docblock>/\*\*.*?\*/\s*)?
-    (?P<modifiers>(?:(?:public|protected|private|static|abstract|final)\s+)*)?
-    function\s+
-    (?P<reference>&\s*)?
-    (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*
-    \((?P<params>.*?)\)
-    \s*(?::\s*(?P<return_type>[^{;\n]+))?
+    \(
     """,
     re.VERBOSE | re.DOTALL,
 )
@@ -215,8 +202,8 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
         body = source[match.end():class_end] if class_end > match.end() else ""
         methods = [
             _parsed_method_from_match(source, match.end(), method_match)
-            for method_match in METHOD_RE.finditer(body)
-            if method_match.group("name") != "__construct" or "__construct" in body
+            for method_match in _iter_callable_declarations(body)
+            if method_match["name"] != "__construct" or "__construct" in body
         ]
         extends = match.group("extends")
         implements = [
@@ -243,11 +230,11 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
         )
         class_ranges.append((match.start(), class_end))
 
-    for match in FUNCTION_RE.finditer(source):
-        name = match.group("name")
-        if _offset_within_ranges(match.start(), class_ranges):
+    for match in _iter_callable_declarations(source):
+        name = str(match["name"])
+        if _offset_within_ranges(int(match["start"]), class_ranges):
             continue
-        line = source.count("\n", 0, match.start()) + 1
+        line = source.count("\n", 0, int(match["start"])) + 1
         key = ("function", name, namespace)
         if key in seen_names:
             continue
@@ -259,15 +246,15 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
                 fqname=_qualify_name(namespace, name),
                 line=line,
                 namespace=namespace,
-                signature=_build_function_signature(name, match.group("params"), match.group("return_type"), match.group("modifiers")),
-                parameters=_parse_parameters(match.group("params")),
-                return_type=_clean_type(match.group("return_type")),
-                docblock_summary=_docblock_summary(match.group("docblock")),
-                docblock_tags=_docblock_tags(match.group("docblock")),
-                visibility=_default_visibility(match.group("modifiers")),
-                is_static="static" in _modifier_tokens(match.group("modifiers")),
-                is_final="final" in _modifier_tokens(match.group("modifiers")),
-                is_abstract="abstract" in _modifier_tokens(match.group("modifiers")),
+                signature=_build_function_signature(name, _string_value(match["params"]), _string_value(match["return_type"]), _string_value(match["modifiers"])),
+                parameters=_parse_parameters(_string_value(match["params"])),
+                return_type=_clean_type(_string_value(match["return_type"])),
+                docblock_summary=_docblock_summary(_string_value(match["docblock"])),
+                docblock_tags=_docblock_tags(_string_value(match["docblock"])),
+                visibility=_default_visibility(_string_value(match["modifiers"])),
+                is_static="static" in _modifier_tokens(_string_value(match["modifiers"])),
+                is_final="final" in _modifier_tokens(_string_value(match["modifiers"])),
+                is_abstract="abstract" in _modifier_tokens(_string_value(match["modifiers"])),
             )
         )
 
@@ -277,16 +264,7 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
 def _find_matching_brace(source: str, opening_brace_index: int) -> int:
     """Return the index of the matching closing brace for a declaration."""
 
-    depth = 0
-    for index in range(opening_brace_index, len(source)):
-        char = source[index]
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return index
-    return len(source)
+    return _find_matching_delimiter(source, opening_brace_index, "{", "}")
 
 
 def _merge_symbol_metadata(parsed_symbols: list[ParsedSymbol], regex_symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
@@ -352,24 +330,88 @@ def _merge_symbol_metadata(parsed_symbols: list[ParsedSymbol], regex_symbols: li
     return merged
 
 
-def _parsed_method_from_match(source: str, body_offset: int, method_match: re.Match[str]) -> ParsedMethod:
+def _parsed_method_from_match(source: str, body_offset: int, method_match: dict[str, str | int | None]) -> ParsedMethod:
     """Build a detailed parsed-method record from a regex declaration match."""
 
-    modifiers = _modifier_tokens(method_match.group("modifiers"))
-    name = method_match.group("name")
+    modifiers = _modifier_tokens(_string_value(method_match["modifiers"]))
+    name = str(method_match["name"])
     return ParsedMethod(
         name=name,
-        line=source.count("\n", 0, body_offset + method_match.start()) + 1,
-        signature=_build_function_signature(name, method_match.group("params"), method_match.group("return_type"), method_match.group("modifiers")),
-        parameters=_parse_parameters(method_match.group("params")),
-        return_type=_clean_type(method_match.group("return_type")),
-        docblock_summary=_docblock_summary(method_match.group("docblock")),
-        docblock_tags=_docblock_tags(method_match.group("docblock")),
-        visibility=_default_visibility(method_match.group("modifiers")),
+        line=source.count("\n", 0, body_offset + int(method_match["start"])) + 1,
+        signature=_build_function_signature(name, _string_value(method_match["params"]), _string_value(method_match["return_type"]), _string_value(method_match["modifiers"])),
+        parameters=_parse_parameters(_string_value(method_match["params"])),
+        return_type=_clean_type(_string_value(method_match["return_type"])),
+        docblock_summary=_docblock_summary(_string_value(method_match["docblock"])),
+        docblock_tags=_docblock_tags(_string_value(method_match["docblock"])),
+        visibility=_default_visibility(_string_value(method_match["modifiers"])),
         is_static="static" in modifiers,
         is_final="final" in modifiers,
         is_abstract="abstract" in modifiers,
     )
+
+
+def _iter_callable_declarations(source: str) -> list[dict[str, str | int | None]]:
+    """Return callable declarations with balanced parameter extraction."""
+
+    declarations: list[dict[str, str | int | None]] = []
+    for match in CALLABLE_START_RE.finditer(source):
+        params_start = match.end() - 1
+        params_end = _find_matching_delimiter(source, params_start, "(", ")")
+        if params_end <= params_start:
+            continue
+        cursor = params_end + 1
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+        return_type = None
+        if cursor < len(source) and source[cursor] == ":":
+            cursor += 1
+            return_start = cursor
+            while cursor < len(source) and source[cursor] not in "{;\n":
+                cursor += 1
+            return_type = source[return_start:cursor].strip() or None
+        declarations.append(
+            {
+                "start": match.start(),
+                "name": match.group("name"),
+                "docblock": match.group("docblock"),
+                "modifiers": match.group("modifiers"),
+                "params": source[params_start + 1 : params_end],
+                "return_type": return_type,
+            }
+        )
+    return declarations
+
+
+def _find_matching_delimiter(source: str, opening_index: int, opening: str, closing: str) -> int:
+    """Return the matching closing delimiter index for a balanced pair."""
+
+    depth = 0
+    quote: str | None = None
+    for index in range(opening_index, len(source)):
+        char = source[index]
+        previous = source[index - 1] if index > 0 else ""
+        if quote:
+            if char == quote and previous != "\\":
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(source)
+
+
+def _string_value(value: str | int | None) -> str | None:
+    """Return a string-like helper value or ``None``."""
+
+    if value is None or isinstance(value, int):
+        return None
+    return value
 
 
 def _offset_within_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:

@@ -22,6 +22,16 @@ class assign extends assign_base implements viewable {
     }
 
     /**
+     * Delete this assignment instance.
+     *
+     * @param array $options Optional deletion flags.
+     * @return bool True when the instance can be deleted.
+     */
+    public function delete_instance(array $options = array('force' => true)): bool {
+        return !empty($options);
+    }
+
+    /**
      * Render a final status string.
      *
      * @return string Final status label.

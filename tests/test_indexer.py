@@ -311,7 +311,31 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert assign_view_match["inheritance_role"] == "interface_implementation"
         assert assign_view_match["overrides"] == "mod_assign\\local\\assign_base::view"
         assert assign_view_match["implements_method"] == ["mod_assign\\local\\viewable::view"]
-        assert any(example["usage_kind"] == "instance_method_call" for example in assign_view_match["usage_examples"])
+        assert {example["file"] for example in assign_view_match["usage_examples"]} == {
+            "mod/assign/externallib.php",
+            "mod/assign/renderer.php",
+        }
+        assert all("->view(" in example["snippet"] for example in assign_view_match["usage_examples"])
+
+        assign_view_with_leading_slash = find_definition(connection, "\\assign::view")
+        assert assign_view_with_leading_slash["total_matches"] == 1
+        assert assign_view_with_leading_slash["matches"][0]["fqname"] == assign_view_match["fqname"]
+
+        delete_instance_definition = find_definition(connection, "assign::delete_instance")
+        assert delete_instance_definition["total_matches"] == 1
+        delete_instance_match = delete_instance_definition["matches"][0]
+        assert delete_instance_match["signature"] == (
+            "public function delete_instance(array $options = array('force' => true)): bool"
+        )
+        assert delete_instance_match["parameters"] == [
+            {"name": "options", "type": "array", "default": "array('force' => true)"},
+        ]
+        assert len(delete_instance_match["usage_examples"]) == 1
+        delete_usage = delete_instance_match["usage_examples"][0]
+        assert delete_usage["file"] == "mod/assign/externallib.php"
+        assert delete_usage["usage_kind"] == "instance_method_call"
+        assert delete_usage["confidence"] == "high"
+        assert delete_usage["snippet"] == "return $assignment->delete_instance();"
 
         start_submission_definition = find_definition(connection, "mod_assign\\external\\start_submission::execute")
         assert start_submission_definition["total_matches"] == 1
@@ -326,6 +350,22 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         ]
         assert start_submission_match["return_type"] == "array"
         assert start_submission_match["docblock_summary"] == "Start a submission attempt."
+        assert start_submission_match["usage_examples"] == [
+            {
+                "file": "mod/assign/db/services.php",
+                "line": 13,
+                "usage_kind": "service_definition",
+                "confidence": "high",
+                "snippet": "mod_assign_start_submission",
+            }
+        ]
+
+        start_submission_with_leading_slash = find_definition(
+            connection,
+            "\\mod_assign\\external\\start_submission::execute",
+        )
+        assert start_submission_with_leading_slash["total_matches"] == 1
+        assert start_submission_with_leading_slash["matches"][0]["fqname"] == start_submission_match["fqname"]
 
         ambiguous_execute = find_definition(connection, "execute", symbol_type="method")
         assert ambiguous_execute["total_matches"] >= 2

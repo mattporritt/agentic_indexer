@@ -579,6 +579,9 @@ def _find_method_definitions(
     """Return ranked method matches for ``Class::method``-style queries."""
 
     class_part, method_name = symbol_query.split("::", 1)
+    normalized_query = _normalize_php_symbol_name(symbol_query)
+    normalized_class = _normalize_php_symbol_name(class_part)
+    normalized_method = _normalize_php_symbol_name(method_name)
     rows = connection.execute(
         """
         SELECT
@@ -591,10 +594,10 @@ def _find_method_definitions(
         JOIN files f ON f.id = s.file_id
         JOIN components c ON c.id = s.component_id
         WHERE s.symbol_type = 'method'
-          AND (s.name = ? OR s.fqname = ?)
+          AND s.name = ?
         ORDER BY s.fqname, s.line
         """,
-        (method_name, symbol_query),
+        (method_name,),
     ).fetchall()
 
     ranked: list[tuple[tuple[int, str, int], sqlite3.Row]] = []
@@ -602,21 +605,31 @@ def _find_method_definitions(
         if symbol_type not in {"any", "method"}:
             continue
         container_name = row["container_name"] or ""
-        container_short = container_name.split("\\")[-1] if container_name else None
-        if row["fqname"] == symbol_query:
+        normalized_container = _normalize_php_symbol_name(container_name)
+        container_short = normalized_container.split("\\")[-1] if normalized_container else None
+        normalized_fqname = _normalize_php_symbol_name(row["fqname"])
+        if normalized_fqname == normalized_query:
             rank = 0
-        elif container_name == class_part:
+        elif normalized_container == normalized_class:
             rank = 1
-        elif container_name.endswith(f"\\{class_part}"):
+        elif normalized_container.endswith(f"\\{normalized_class}"):
             rank = 2
-        elif container_short == class_part:
+        elif container_short == normalized_class:
             rank = 3
         else:
             continue
-        ranked.append(((rank, row["fqname"], row["line"]), row))
+        ranked.append(((rank, normalized_fqname, row["line"]), row))
 
     ranked.sort(key=lambda item: item[0])
     return [row for _, row in ranked[:limit]]
+
+
+def _normalize_php_symbol_name(name: str | None) -> str:
+    """Return a normalized PHP symbol name for legacy and namespaced matching."""
+
+    if not name:
+        return ""
+    return str(name).strip().lstrip("\\")
 
 
 def _serialize_definition_match(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
@@ -738,7 +751,7 @@ def _find_method_in_container(connection: sqlite3.Connection, container_name: st
 
 
 def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit: int) -> list[dict[str, object]]:
-    """Return a bounded set of pragmatic usage examples for a symbol."""
+    """Return a bounded set of higher-confidence usage examples for a symbol."""
 
     file_rows = connection.execute(
         """
@@ -748,6 +761,18 @@ def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit
         ORDER BY moodle_path
         """
     ).fetchall()
+
+    if row["symbol_type"] == "function":
+        return _find_function_usage_examples(row, file_rows, limit)
+    if row["symbol_type"] == "method":
+        return _find_method_usage_examples(connection, row, file_rows, limit)
+    if row["symbol_type"] == "class":
+        return _find_class_usage_examples(row, file_rows, limit)
+    return []
+
+
+def _find_function_usage_examples(row: sqlite3.Row, file_rows: list[sqlite3.Row], limit: int) -> list[dict[str, object]]:
+    """Return bounded function-call examples using exact call matching."""
 
     examples: list[dict[str, object]] = []
     for file_row in file_rows:
@@ -761,14 +786,14 @@ def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit
         for line_number, line in enumerate(source.splitlines(), start=1):
             if file_row["id"] == row["file_id"] and line_number == row["line"]:
                 continue
-            usage_kind = _usage_kind_for_line(row, line)
-            if usage_kind is None:
+            if not _function_call_matches(str(row["name"]), line):
                 continue
             examples.append(
                 {
                     "file": file_row["moodle_path"],
                     "line": line_number,
-                    "usage_kind": usage_kind,
+                    "usage_kind": "function_call",
+                    "confidence": "high",
                     "snippet": line.strip(),
                 }
             )
@@ -777,28 +802,247 @@ def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit
     return examples
 
 
-def _usage_kind_for_line(row: sqlite3.Row, line: str) -> str | None:
-    """Return a best-effort usage kind for a single source line."""
+def _find_class_usage_examples(row: sqlite3.Row, file_rows: list[sqlite3.Row], limit: int) -> list[dict[str, object]]:
+    """Return bounded class-reference examples."""
 
-    name = re.escape(str(row["name"]))
-    if row["symbol_type"] == "function":
-        pattern = re.compile(rf"(?<!function\s)\b{name}\s*\(")
-        return "function_call" if pattern.search(line) else None
-    if row["symbol_type"] == "method":
-        if re.search(rf"::\s*{name}\s*\(", line):
-            return "static_method_call"
-        if re.search(rf"->\s*{name}\s*\(", line):
-            return "instance_method_call"
-        return None
-    if row["symbol_type"] == "class":
-        class_name = re.escape(str(row["name"]))
-        if re.search(rf"\bnew\s+{class_name}\s*\(", line):
-            return "class_instantiation"
-        if re.search(rf"\bextends\s+{class_name}\b", line):
-            return "extends_reference"
-        if re.search(rf"\bimplements\b.*\b{class_name}\b", line):
-            return "implements_reference"
+    examples: list[dict[str, object]] = []
+    for file_row in file_rows:
+        if len(examples) >= limit:
+            break
+        absolute_path = Path(file_row["absolute_path"])
+        try:
+            source = absolute_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            if file_row["id"] == row["file_id"] and line_number == row["line"]:
+                continue
+            usage_kind = _class_usage_kind_for_line(row, line)
+            if usage_kind is None:
+                continue
+            examples.append(
+                {
+                    "file": file_row["moodle_path"],
+                    "line": line_number,
+                    "usage_kind": usage_kind,
+                    "confidence": "high",
+                    "snippet": line.strip(),
+                }
+            )
+            if len(examples) >= limit:
+                break
+    return examples
+
+
+def _find_method_usage_examples(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    file_rows: list[sqlite3.Row],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded method usage examples using class-aware matching."""
+
+    examples: list[dict[str, object]] = []
+    seen: set[tuple[str, int, str]] = set()
+
+    if row["is_static"]:
+        for item in _find_service_definition_examples(connection, row):
+            key = (str(item["file"]), int(item["line"]), str(item["usage_kind"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            examples.append(item)
+            if len(examples) >= limit:
+                return examples
+
+    for file_row in file_rows:
+        if len(examples) >= limit:
+            break
+        absolute_path = Path(file_row["absolute_path"])
+        try:
+            source = absolute_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for item in _scan_method_usage_examples_in_source(row, file_row, source):
+            if file_row["id"] == row["file_id"] and item["line"] == row["line"]:
+                continue
+            key = (str(item["file"]), int(item["line"]), str(item["usage_kind"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            examples.append(item)
+            if len(examples) >= limit:
+                break
+    return examples
+
+
+def _function_call_matches(function_name: str, line: str) -> bool:
+    """Return whether a line contains a likely function call."""
+
+    pattern = re.compile(rf"(?<!function\s)\b{re.escape(function_name)}\s*\(")
+    return pattern.search(line) is not None
+
+
+def _class_usage_kind_for_line(row: sqlite3.Row, line: str) -> str | None:
+    """Return a best-effort class usage kind for a single source line."""
+
+    class_name = re.escape(str(row["name"]))
+    if re.search(rf"\bnew\s+{class_name}\s*\(", line):
+        return "class_instantiation"
+    if re.search(rf"\bextends\s+{class_name}\b", line):
+        return "extends_reference"
+    if re.search(rf"\bimplements\b.*\b{class_name}\b", line):
+        return "implements_reference"
     return None
+
+
+def _find_service_definition_examples(connection: sqlite3.Connection, row: sqlite3.Row) -> list[dict[str, object]]:
+    """Return high-confidence service-definition linkages for external execute methods."""
+
+    if row["name"] != "execute" or not row["container_name"]:
+        return []
+    service_rows = connection.execute(
+        """
+        SELECT ws.service_name, ws.line, f.moodle_path
+        FROM webservices ws
+        JOIN files f ON f.id = ws.file_id
+        WHERE ws.classname = ?
+        ORDER BY f.moodle_path, ws.line, ws.service_name
+        """,
+        (str(row["container_name"]).lstrip("\\"),),
+    ).fetchall()
+    return [
+        {
+            "file": item["moodle_path"],
+            "line": item["line"],
+            "usage_kind": "service_definition",
+            "confidence": "high",
+            "snippet": item["service_name"],
+        }
+        for item in service_rows
+    ]
+
+
+def _scan_method_usage_examples_in_source(row: sqlite3.Row, file_row: sqlite3.Row, source: str) -> list[dict[str, object]]:
+    """Return high-confidence method usage examples found in one PHP source file."""
+
+    method_name = str(row["name"])
+    class_candidates = _candidate_class_names(row["container_name"])
+    examples: list[dict[str, object]] = []
+    lines = source.splitlines()
+    variable_types: dict[str, str] = {}
+
+    for line_number, line in enumerate(lines, start=1):
+        if re.search(r"^\s*(?:public|protected|private|final|abstract|static\s+)*function\b|^\s*function\b", line):
+            variable_types = _typed_parameters_for_line(line)
+
+        if row["is_static"]:
+            if _static_call_matches(line, class_candidates, method_name):
+                examples.append(
+                    {
+                        "file": file_row["moodle_path"],
+                        "line": line_number,
+                        "usage_kind": "static_method_call",
+                        "confidence": "high",
+                        "snippet": line.strip(),
+                    }
+                )
+            continue
+
+        direct_call = _direct_new_call_matches(line, class_candidates, method_name)
+        if direct_call:
+            examples.append(
+                {
+                    "file": file_row["moodle_path"],
+                    "line": line_number,
+                    "usage_kind": "instance_method_call",
+                    "confidence": "high",
+                    "snippet": line.strip(),
+                }
+            )
+            continue
+
+        assignment = _new_assignment_type(line, class_candidates)
+        if assignment is not None:
+            variable_types[assignment[0]] = assignment[1]
+
+        variable_name = _instance_call_variable(line, method_name)
+        if variable_name and variable_types.get(variable_name) in class_candidates:
+            examples.append(
+                {
+                    "file": file_row["moodle_path"],
+                    "line": line_number,
+                    "usage_kind": "instance_method_call",
+                    "confidence": "high",
+                    "snippet": line.strip(),
+                }
+            )
+
+    return examples
+
+
+def _candidate_class_names(container_name: str | None) -> set[str]:
+    """Return exact class-name variants for a container."""
+
+    if not container_name:
+        return set()
+    normalized = str(container_name).lstrip("\\")
+    short_name = normalized.split("\\")[-1]
+    return {normalized, f"\\{normalized}", short_name}
+
+
+def _static_call_matches(line: str, class_candidates: set[str], method_name: str) -> bool:
+    """Return whether a line contains a high-confidence static method call."""
+
+    match = re.search(rf"(?P<class>[\\A-Za-z_][\\A-Za-z0-9_]*)\s*::\s*{re.escape(method_name)}\s*\(", line)
+    if match is None:
+        return False
+    class_name = match.group("class")
+    return class_name in class_candidates or class_name.lstrip("\\") in class_candidates
+
+
+def _direct_new_call_matches(line: str, class_candidates: set[str], method_name: str) -> bool:
+    """Return whether a line directly instantiates a class and calls the target method."""
+
+    match = re.search(rf"new\s+(?P<class>[\\A-Za-z_][\\A-Za-z0-9_]*)\s*\(.*\)\s*->\s*{re.escape(method_name)}\s*\(", line)
+    if match is None:
+        return False
+    class_name = match.group("class")
+    return class_name in class_candidates or class_name.lstrip("\\") in class_candidates
+
+
+def _new_assignment_type(line: str, class_candidates: set[str]) -> tuple[str, str] | None:
+    """Return a variable/class pair for a direct ``$var = new ClassName(...)`` assignment."""
+
+    assignment_match = re.search(r"(?P<var>\$[A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+(?P<class>[\\A-Za-z_][\\A-Za-z0-9_]*)\s*\(", line)
+    if assignment_match is None:
+        return None
+    class_name = assignment_match.group("class")
+    if class_name in class_candidates or class_name.lstrip("\\") in class_candidates:
+        return assignment_match.group("var"), class_name if class_name in class_candidates else class_name.lstrip("\\")
+    return None
+
+
+def _instance_call_variable(line: str, method_name: str) -> str | None:
+    """Return the variable name for a direct ``$var->method()`` call."""
+
+    match = re.search(rf"(?P<var>\$[A-Za-z_][A-Za-z0-9_]*)\s*->\s*{re.escape(method_name)}\s*\(", line)
+    return match.group("var") if match is not None else None
+
+
+def _typed_parameters_for_line(line: str) -> dict[str, str]:
+    """Return simple typed-parameter hints from a one-line function declaration."""
+
+    if "(" not in line or ")" not in line:
+        return {}
+    raw_params = line.split("(", 1)[1].rsplit(")", 1)[0]
+    typed_parameters: dict[str, str] = {}
+    for part in raw_params.split(","):
+        match = re.search(r"(?P<type>[\\A-Za-z_][\\A-Za-z0-9_]*|\?[\\A-Za-z_][\\A-Za-z0-9_]*)\s+(?P<var>\$[A-Za-z_][A-Za-z0-9_]*)", part.strip())
+        if match is None:
+            continue
+        typed_parameters[match.group("var")] = match.group("type").lstrip("?")
+    return typed_parameters
 
 
 def _resolve_file_row(
