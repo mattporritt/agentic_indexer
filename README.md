@@ -125,6 +125,24 @@ generic JS graph. Phase 1 supports:
 - superclass detection for exported classes that extend imported modules
 - deterministic source/build linking between `amd/src/*.js` and `amd/build/*.min.js`
 
+JavaScript module resolution follows a fixed precedence order:
+
+1. exact hit in the indexed `js_modules` registry
+2. explicit external runtime dependency classification for modules such as `jquery`
+3. indexed component-root lookup plus deterministic Moodle path mapping
+4. static component-root fallback rules
+5. explicit unresolved result
+
+The current resolver understands:
+
+- `core/<module>` -> `lib/amd/src/<module>.js`
+- `core_<subsystem>/<module>` -> `<core subsystem root>/amd/src/<module>.js`
+- frankenstyle plugin modules such as `mod_assign/foo` or `tool_analytics/bar` -> `<component root>/amd/src/<module>.js`
+
+For agentic work, the canonical editable implementation is always the source
+file in `amd/src/`. Matching `amd/build/*.min.js` files are treated as related
+artifacts, not as the primary implementation target.
+
 The suggestion engine is still heuristic in places. It is designed to be
 explainable and useful for local navigation, not to claim perfect semantic
 coverage of Moodle's runtime behavior.

@@ -14,6 +14,7 @@ from moodle_indexer.extractors import (
 )
 from moodle_indexer import indexer as indexer_module
 from moodle_indexer.indexer import build_index
+from moodle_indexer.js_modules import resolve_js_module
 from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
 from moodle_indexer.queries import component_summary, file_context, find_symbol, suggest_related
 from moodle_indexer.store import open_database
@@ -248,6 +249,38 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             "tool_phpunit",
         } <= stored_components
 
+        js_registry_entries = {
+            (row["module_name"], row["moodle_path"], row["build_file"])
+            for row in connection.execute(
+                """
+                SELECT jm.module_name, f.moodle_path, jm.build_file
+                FROM js_modules jm
+                JOIN files f ON f.id = jm.file_id
+                ORDER BY jm.module_name
+                """
+            ).fetchall()
+        }
+        assert ("core/ajax", "lib/amd/src/ajax.js", "lib/amd/build/ajax.min.js") in js_registry_entries
+        assert (
+            "core_admin/plugin_management_table",
+            "admin/amd/src/plugin_management_table.js",
+            "admin/amd/build/plugin_management_table.min.js",
+        ) in js_registry_entries
+        assert (
+            "core_ai/aiprovider_action_management_table",
+            "ai/amd/src/aiprovider_action_management_table.js",
+            "ai/amd/build/aiprovider_action_management_table.min.js",
+        ) in js_registry_entries
+        assert ("mod_forum/repository", "mod/forum/amd/src/repository.js", "mod/forum/amd/build/repository.min.js") in js_registry_entries
+
+        assert resolve_js_module(connection, "core/ajax").resolution_strategy == "indexed_registry"
+        assert resolve_js_module(connection, "core_admin/plugin_management_table").source_file == "admin/amd/src/plugin_management_table.js"
+        assert resolve_js_module(connection, "mod_forum/repository").source_file == "mod/forum/amd/src/repository.js"
+        jquery_resolution = resolve_js_module(connection, "jquery")
+        assert jquery_resolution.resolution_status == "external"
+        assert jquery_resolution.resolution_strategy == "external_runtime"
+        assert jquery_resolution.is_external is True
+
         symbol_result = find_symbol(connection, "discussion_exporter")
         assert symbol_result["matches"][0]["file"] == "mod/forum/classes/external/discussion_exporter.php"
         assert symbol_result["matches"][0]["repository_relative_path"] == "mod/forum/classes/external/discussion_exporter.php"
@@ -454,6 +487,11 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert ("core_admin/plugin_management_table", "admin/amd/src/plugin_management_table.js") in js_imports
         assert ("core/ajax", "lib/amd/src/ajax.js") in js_imports
         assert ("core_ai/local_actions", "ai/amd/src/local_actions.js") in js_imports
+        js_import_map = {item["module_name"]: item for item in js_context["js_imports"]}
+        assert js_import_map["core/ajax"]["imported_name"] == "call"
+        assert js_import_map["core/ajax"]["local_name"] == "fetchMany"
+        assert js_import_map["core/ajax"]["resolution_strategy"] == "indexed_registry"
+        assert js_import_map["core_admin/plugin_management_table"]["resolution_strategy"] == "indexed_registry"
         js_related_paths = {item["path"] for item in js_context["related_suggestions"]}
         assert "admin/amd/src/plugin_management_table.js" in js_related_paths
         assert "lib/amd/src/ajax.js" in js_related_paths
@@ -476,10 +514,15 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         legacy_js_context = file_context(connection, "mod/forum/amd/src/forum.js")
         assert legacy_js_context["js_module"]["module_name"] == "mod_forum/forum"
         assert legacy_js_context["js_module"]["export_kind"] == "amd_return_object"
-        legacy_imports = {(item["module_name"], item["resolved_target_file"]) for item in legacy_js_context["js_imports"]}
-        assert ("jquery", None) in legacy_imports
-        assert ("core/ajax", "lib/amd/src/ajax.js") in legacy_imports
-        assert ("mod_forum/repository", "mod/forum/amd/src/repository.js") in legacy_imports
+        legacy_imports = {item["module_name"]: item for item in legacy_js_context["js_imports"]}
+        assert legacy_imports["jquery"]["resolved_target_file"] is None
+        assert legacy_imports["jquery"]["resolution_status"] == "external"
+        assert legacy_imports["jquery"]["resolution_strategy"] == "external_runtime"
+        assert legacy_imports["jquery"]["is_external"] is True
+        assert legacy_imports["core/ajax"]["resolved_target_file"] == "lib/amd/src/ajax.js"
+        assert legacy_imports["core/ajax"]["resolution_strategy"] == "indexed_registry"
+        assert legacy_imports["mod_forum/repository"]["resolved_target_file"] == "mod/forum/amd/src/repository.js"
+        assert legacy_imports["mod_forum/repository"]["resolution_strategy"] == "indexed_registry"
         legacy_related_paths = {item["path"] for item in legacy_js_context["related_suggestions"]}
         assert "lib/amd/src/ajax.js" in legacy_related_paths
         assert "mod/forum/amd/src/repository.js" in legacy_related_paths

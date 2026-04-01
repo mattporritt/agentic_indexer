@@ -14,9 +14,9 @@ from moodle_indexer.components import (
     infer_js_module_name,
     resolve_amd_build_path,
     resolve_classname_to_file_path,
-    resolve_js_module_to_source_path,
 )
 from moodle_indexer.file_roles import classify_file_role
+from moodle_indexer.js_modules import resolve_js_module_via_fallback
 from moodle_indexer.models import (
     CapabilityRecord,
     CapabilityUsageRecord,
@@ -194,7 +194,7 @@ def extract_js_module_artifacts(
     export_kind, export_name, superclass_name = _extract_js_export_metadata(source)
     superclass_module = binding_modules.get(superclass_name) if superclass_name else None
     resolved_superclass_file = (
-        resolve_js_module_to_source_path(superclass_module) if superclass_module else None
+        resolve_js_module_via_fallback(superclass_module, None).source_file if superclass_module else None
     )
     build_file = resolve_amd_build_path(relative_path)
 
@@ -701,8 +701,9 @@ def _extract_js_imports(
     for match in IMPORT_FROM_RE.finditer(source):
         module_name = match.group("module")
         line = source.count("\n", 0, match.start()) + 1
-        resolved_target_file = resolve_js_module_to_source_path(module_name)
-        resolution_status = "resolved" if resolved_target_file else "unresolved"
+        resolution = resolve_js_module_via_fallback(module_name)
+        resolved_target_file = resolution.source_file
+        resolution_status = resolution.resolution_status
         clause = match.group("clause").strip()
         parsed_imports = _parse_import_clause(
             clause,
@@ -723,7 +724,7 @@ def _extract_js_imports(
         if any(item.module_name == module_name and item.line == source.count("\n", 0, match.start()) + 1 for item in imports):
             continue
         line = source.count("\n", 0, match.start()) + 1
-        resolved_target_file = resolve_js_module_to_source_path(module_name)
+        resolution = resolve_js_module_via_fallback(module_name)
         imports.append(
             JsImportRecord(
                 module_name=module_name,
@@ -731,8 +732,8 @@ def _extract_js_imports(
                 component_name=component_name,
                 line=line,
                 import_kind="side_effect",
-                resolved_target_file=resolved_target_file,
-                resolution_status="resolved" if resolved_target_file else "unresolved",
+                resolved_target_file=resolution.source_file,
+                resolution_status=resolution.resolution_status,
             )
         )
 
@@ -741,7 +742,7 @@ def _extract_js_imports(
         factory_params = [item.strip() for item in match.group("params").split(",") if item.strip()]
         for index, module_name in enumerate(dependencies):
             line = source.count("\n", 0, match.start()) + 1
-            resolved_target_file = resolve_js_module_to_source_path(module_name)
+            resolution = resolve_js_module_via_fallback(module_name)
             local_name = factory_params[index] if index < len(factory_params) else None
             import_record = JsImportRecord(
                 module_name=module_name,
@@ -750,8 +751,8 @@ def _extract_js_imports(
                 line=line,
                 import_kind="amd_dependency",
                 local_name=local_name,
-                resolved_target_file=resolved_target_file,
-                resolution_status="resolved" if resolved_target_file else "unresolved",
+                resolved_target_file=resolution.source_file,
+                resolution_status=resolution.resolution_status,
             )
             imports.append(import_record)
             if local_name:
