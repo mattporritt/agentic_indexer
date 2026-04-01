@@ -54,6 +54,7 @@ This tool builds a compact local index so those questions become cheap and machi
 - service-aware suggestions that link `db/services.php` to implementation files and likely PHPUnit coverage
 - PHPUnit and Behat discovery
 - related-file suggestions with explanation strings
+- IDE-like definition lookup with signatures, modifiers, docblocks, inheritance hints, and bounded usage examples
 - JSON CLI commands for indexing and querying
 
 ## What Phase 1 Does Not Include
@@ -251,6 +252,26 @@ moodle-indexer suggest-related \
   --file admin/tool/demo/settings.php
 ```
 
+Find a definition:
+
+```bash
+moodle-indexer find-definition \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol get_string
+```
+
+Method lookups support both short and fully qualified forms:
+
+```bash
+moodle-indexer find-definition \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol assign::view
+
+moodle-indexer find-definition \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+```
+
 The package can still be run directly for debugging:
 
 ```bash
@@ -291,6 +312,20 @@ python -m moodle_indexer --help
   }
 }
 ```
+
+`find-definition` is designed to feel more like an IDE “go to definition” view.
+For supported PHP functions, classes, and methods it returns:
+
+- file, line, component, namespace, and owning class
+- signature, parameters, defaults, and return type where available
+- docblock summary and selected tags
+- method modifiers such as visibility, `static`, `final`, and `abstract`
+- basic inheritance hints such as `override` or `interface_implementation`
+- a small number of practical usage examples
+
+Ambiguity is explicit. If a short query such as `execute` matches multiple
+methods, the command returns multiple distinguishable matches instead of
+pretending there is only one.
 
 `file-context` surfaces the indexed data already known for a file without becoming a dump of the whole database:
 

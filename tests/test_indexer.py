@@ -16,7 +16,7 @@ from moodle_indexer import indexer as indexer_module
 from moodle_indexer.indexer import build_index
 from moodle_indexer.js_modules import resolve_js_module
 from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
-from moodle_indexer.queries import component_summary, file_context, find_symbol, suggest_related
+from moodle_indexer.queries import component_summary, file_context, find_definition, find_symbol, suggest_related
 from moodle_indexer.store import open_database
 
 
@@ -280,6 +280,62 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert jquery_resolution.resolution_status == "external"
         assert jquery_resolution.resolution_strategy == "external_runtime"
         assert jquery_resolution.is_external is True
+
+        get_string_definition = find_definition(connection, "get_string")
+        assert get_string_definition["total_matches"] == 1
+        get_string_match = get_string_definition["matches"][0]
+        assert get_string_match["symbol_type"] == "function"
+        assert get_string_match["file"] == "lib/moodlelib.php"
+        assert get_string_match["component"] == "core"
+        assert get_string_match["signature"] == "function get_string(string $identifier, ?string $component = null): string"
+        assert get_string_match["parameters"] == [
+            {"name": "identifier", "type": "string", "default": None},
+            {"name": "component", "type": "?string", "default": "null"},
+        ]
+        assert get_string_match["return_type"] == "string"
+        assert get_string_match["docblock_summary"] == "Returns a localised string."
+        assert any(example["usage_kind"] == "function_call" for example in get_string_match["usage_examples"])
+
+        assign_view_definition = find_definition(connection, "assign::view")
+        assert assign_view_definition["total_matches"] == 1
+        assign_view_match = assign_view_definition["matches"][0]
+        assert assign_view_match["symbol_type"] == "method"
+        assert assign_view_match["class_name"] == "assign"
+        assert assign_view_match["file"] == "mod/assign/locallib.php"
+        assert assign_view_match["visibility"] == "public"
+        assert assign_view_match["is_static"] is False
+        assert assign_view_match["is_final"] is False
+        assert assign_view_match["is_abstract"] is False
+        assert assign_view_match["return_type"] == "string"
+        assert assign_view_match["docblock_summary"] == "Render the current assignment view."
+        assert assign_view_match["inheritance_role"] == "interface_implementation"
+        assert assign_view_match["overrides"] == "mod_assign\\local\\assign_base::view"
+        assert assign_view_match["implements_method"] == ["mod_assign\\local\\viewable::view"]
+        assert any(example["usage_kind"] == "instance_method_call" for example in assign_view_match["usage_examples"])
+
+        start_submission_definition = find_definition(connection, "mod_assign\\external\\start_submission::execute")
+        assert start_submission_definition["total_matches"] == 1
+        start_submission_match = start_submission_definition["matches"][0]
+        assert start_submission_match["class_name"] == "mod_assign\\external\\start_submission"
+        assert start_submission_match["visibility"] == "public"
+        assert start_submission_match["is_static"] is True
+        assert start_submission_match["signature"] == "public static function execute(int $assignmentid, bool $draft = false): array"
+        assert start_submission_match["parameters"] == [
+            {"name": "assignmentid", "type": "int", "default": None},
+            {"name": "draft", "type": "bool", "default": "false"},
+        ]
+        assert start_submission_match["return_type"] == "array"
+        assert start_submission_match["docblock_summary"] == "Start a submission attempt."
+
+        ambiguous_execute = find_definition(connection, "execute", symbol_type="method")
+        assert ambiguous_execute["total_matches"] >= 2
+        assert {
+            match["class_name"]
+            for match in ambiguous_execute["matches"]
+        } >= {
+            "mod_assign\\external\\remove_submission",
+            "mod_assign\\external\\start_submission",
+        }
 
         symbol_result = find_symbol(connection, "discussion_exporter")
         assert symbol_result["matches"][0]["file"] == "mod/forum/classes/external/discussion_exporter.php"
@@ -633,7 +689,7 @@ def test_index_summary_reports_failed_files_without_aborting(tmp_path: Path, mon
     original = indexer_module._process_file_for_indexing
 
     def flaky_process(repository_root: Path, application_root: Path, file_path: Path, subplugin_mounts) -> dict:
-        if file_path.name == "renderer.php":
+        if file_path.as_posix().endswith("mod/forum/renderer.php"):
             raise RuntimeError("synthetic extraction failure")
         return original(repository_root, application_root, file_path, subplugin_mounts)
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 LOGGER = logging.getLogger(__name__)
@@ -24,24 +24,39 @@ except ModuleNotFoundError:  # pragma: no cover - exercised indirectly in tests
 NAMESPACE_RE = re.compile(r"namespace\s+([^;]+);")
 DECLARATION_RE = re.compile(
     r"""
+    (?P<docblock>/\*\*.*?\*/\s*)?
+    (?P<modifiers>(?:(?:abstract|final)\s+)*)?
     (?P<kind>class|interface|trait)\s+
     (?P<name>[A-Za-z_][A-Za-z0-9_]*)              # symbol name
     (?:\s+extends\s+(?P<extends>[\\A-Za-z_][\\A-Za-z0-9_]*))?
     (?:\s+implements\s+(?P<implements>[\\A-Za-z0-9_,\s]+))?
     \s*\{
     """,
-    re.VERBOSE,
+    re.VERBOSE | re.DOTALL,
 )
-FUNCTION_RE = re.compile(r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+FUNCTION_RE = re.compile(
+    r"""
+    (?P<docblock>/\*\*.*?\*/\s*)?
+    (?P<modifiers>(?:(?:public|protected|private|static|abstract|final)\s+)*)?
+    function\s+
+    (?P<reference>&\s*)?
+    (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*
+    \((?P<params>.*?)\)
+    \s*(?::\s*(?P<return_type>[^{;\n]+))?
+    """,
+    re.VERBOSE | re.DOTALL,
+)
 METHOD_RE = re.compile(
     r"""
-    (?:
-        public|protected|private|static|abstract|final|\s
-    )*
+    (?P<docblock>/\*\*.*?\*/\s*)?
+    (?P<modifiers>(?:(?:public|protected|private|static|abstract|final)\s+)*)?
     function\s+
-    (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(
+    (?P<reference>&\s*)?
+    (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*
+    \((?P<params>.*?)\)
+    \s*(?::\s*(?P<return_type>[^{;\n]+))?
     """,
-    re.VERBOSE,
+    re.VERBOSE | re.DOTALL,
 )
 
 
@@ -51,6 +66,15 @@ class ParsedMethod:
 
     name: str
     line: int
+    signature: str | None = None
+    parameters: list[dict[str, str | None]] = field(default_factory=list)
+    return_type: str | None = None
+    docblock_summary: str | None = None
+    docblock_tags: dict[str, list[str]] = field(default_factory=dict)
+    visibility: str | None = None
+    is_static: bool = False
+    is_final: bool = False
+    is_abstract: bool = False
 
 
 @dataclass(slots=True)
@@ -65,11 +89,21 @@ class ParsedSymbol:
     extends: str | None = None
     implements: list[str] = field(default_factory=list)
     methods: list[ParsedMethod] = field(default_factory=list)
+    signature: str | None = None
+    parameters: list[dict[str, str | None]] = field(default_factory=list)
+    return_type: str | None = None
+    docblock_summary: str | None = None
+    docblock_tags: dict[str, list[str]] = field(default_factory=dict)
+    visibility: str | None = None
+    is_static: bool = False
+    is_final: bool = False
+    is_abstract: bool = False
 
 
 def parse_php_symbols(source: str) -> list[ParsedSymbol]:
     """Parse PHP symbols with ``phply`` and fall back to regex if needed."""
 
+    regex_symbols = _extract_with_regex_fallback(source)
     if phplex is not None and phpparse is not None:
         try:
             lexer = phplex.lexer.clone()
@@ -77,10 +111,10 @@ def parse_php_symbols(source: str) -> list[ParsedSymbol]:
             ast = parser.parse(source, lexer=lexer, debug=False)
             parsed = _extract_from_ast(ast or [], source)
             if parsed:
-                return parsed
+                return _merge_symbol_metadata(parsed, regex_symbols)
         except Exception:
             LOGGER.debug("Falling back to regex PHP extraction", exc_info=True)
-    return _extract_with_regex_fallback(source)
+    return regex_symbols
 
 
 def _extract_from_ast(ast_nodes: list[Any], source: str) -> list[ParsedSymbol]:
@@ -180,10 +214,7 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
         class_end = _find_matching_brace(source, match.end() - 1)
         body = source[match.end():class_end] if class_end > match.end() else ""
         methods = [
-            ParsedMethod(
-                name=method_match.group("name"),
-                line=source.count("\n", 0, match.end() + method_match.start()) + 1,
-            )
+            _parsed_method_from_match(source, match.end(), method_match)
             for method_match in METHOD_RE.finditer(body)
             if method_match.group("name") != "__construct" or "__construct" in body
         ]
@@ -203,12 +234,17 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
                 extends=extends,
                 implements=implements,
                 methods=methods,
+                signature=_build_type_signature(symbol_type, name, extends, implements, match.group("modifiers")),
+                docblock_summary=_docblock_summary(match.group("docblock")),
+                docblock_tags=_docblock_tags(match.group("docblock")),
+                is_final="final" in _modifier_tokens(match.group("modifiers")),
+                is_abstract=symbol_type == "interface" or "abstract" in _modifier_tokens(match.group("modifiers")),
             )
         )
         class_ranges.append((match.start(), class_end))
 
     for match in FUNCTION_RE.finditer(source):
-        name = match.group(1)
+        name = match.group("name")
         if _offset_within_ranges(match.start(), class_ranges):
             continue
         line = source.count("\n", 0, match.start()) + 1
@@ -223,6 +259,15 @@ def _extract_with_regex_fallback(source: str) -> list[ParsedSymbol]:
                 fqname=_qualify_name(namespace, name),
                 line=line,
                 namespace=namespace,
+                signature=_build_function_signature(name, match.group("params"), match.group("return_type"), match.group("modifiers")),
+                parameters=_parse_parameters(match.group("params")),
+                return_type=_clean_type(match.group("return_type")),
+                docblock_summary=_docblock_summary(match.group("docblock")),
+                docblock_tags=_docblock_tags(match.group("docblock")),
+                visibility=_default_visibility(match.group("modifiers")),
+                is_static="static" in _modifier_tokens(match.group("modifiers")),
+                is_final="final" in _modifier_tokens(match.group("modifiers")),
+                is_abstract="abstract" in _modifier_tokens(match.group("modifiers")),
             )
         )
 
@@ -244,10 +289,258 @@ def _find_matching_brace(source: str, opening_brace_index: int) -> int:
     return len(source)
 
 
+def _merge_symbol_metadata(parsed_symbols: list[ParsedSymbol], regex_symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
+    """Merge parser-derived structure with regex-derived declaration metadata."""
+
+    regex_by_fqname = {item.fqname: item for item in regex_symbols if item.fqname}
+    merged: list[ParsedSymbol] = []
+    seen_fqnames: set[str] = set()
+
+    for item in parsed_symbols:
+        metadata = regex_by_fqname.get(item.fqname)
+        if metadata is None:
+            merged.append(item)
+            seen_fqnames.add(item.fqname)
+            continue
+
+        method_metadata = {method.name: method for method in metadata.methods}
+        merged_methods = [
+            replace(
+                method,
+                signature=method_metadata.get(method.name).signature if method_metadata.get(method.name) else method.signature,
+                parameters=method_metadata.get(method.name).parameters if method_metadata.get(method.name) else method.parameters,
+                return_type=method_metadata.get(method.name).return_type if method_metadata.get(method.name) else method.return_type,
+                docblock_summary=(
+                    method_metadata.get(method.name).docblock_summary
+                    if method_metadata.get(method.name)
+                    else method.docblock_summary
+                ),
+                docblock_tags=method_metadata.get(method.name).docblock_tags if method_metadata.get(method.name) else method.docblock_tags,
+                visibility=method_metadata.get(method.name).visibility if method_metadata.get(method.name) else method.visibility,
+                is_static=(
+                    method_metadata.get(method.name).is_static if method_metadata.get(method.name) else method.is_static
+                ),
+                is_final=method_metadata.get(method.name).is_final if method_metadata.get(method.name) else method.is_final,
+                is_abstract=(
+                    method_metadata.get(method.name).is_abstract if method_metadata.get(method.name) else method.is_abstract
+                ),
+            )
+            for method in item.methods
+        ]
+
+        merged.append(
+            replace(
+                item,
+                signature=metadata.signature or item.signature,
+                parameters=metadata.parameters or item.parameters,
+                return_type=metadata.return_type or item.return_type,
+                docblock_summary=metadata.docblock_summary or item.docblock_summary,
+                docblock_tags=metadata.docblock_tags or item.docblock_tags,
+                visibility=metadata.visibility or item.visibility,
+                is_static=metadata.is_static or item.is_static,
+                is_final=metadata.is_final or item.is_final,
+                is_abstract=metadata.is_abstract or item.is_abstract,
+                methods=merged_methods or metadata.methods,
+            )
+        )
+        seen_fqnames.add(item.fqname)
+
+    for item in regex_symbols:
+        if item.fqname not in seen_fqnames:
+            merged.append(item)
+
+    return merged
+
+
+def _parsed_method_from_match(source: str, body_offset: int, method_match: re.Match[str]) -> ParsedMethod:
+    """Build a detailed parsed-method record from a regex declaration match."""
+
+    modifiers = _modifier_tokens(method_match.group("modifiers"))
+    name = method_match.group("name")
+    return ParsedMethod(
+        name=name,
+        line=source.count("\n", 0, body_offset + method_match.start()) + 1,
+        signature=_build_function_signature(name, method_match.group("params"), method_match.group("return_type"), method_match.group("modifiers")),
+        parameters=_parse_parameters(method_match.group("params")),
+        return_type=_clean_type(method_match.group("return_type")),
+        docblock_summary=_docblock_summary(method_match.group("docblock")),
+        docblock_tags=_docblock_tags(method_match.group("docblock")),
+        visibility=_default_visibility(method_match.group("modifiers")),
+        is_static="static" in modifiers,
+        is_final="final" in modifiers,
+        is_abstract="abstract" in modifiers,
+    )
+
+
 def _offset_within_ranges(offset: int, ranges: list[tuple[int, int]]) -> bool:
     """Return whether an offset lies within any class or trait body range."""
 
     return any(start <= offset <= end for start, end in ranges)
+
+
+def _modifier_tokens(raw_modifiers: str | None) -> set[str]:
+    """Return normalized declaration modifiers from a regex capture."""
+
+    if not raw_modifiers:
+        return set()
+    return {item.strip() for item in raw_modifiers.split() if item.strip()}
+
+
+def _default_visibility(raw_modifiers: str | None) -> str | None:
+    """Return the declared visibility, defaulting PHP methods to public."""
+
+    modifiers = _modifier_tokens(raw_modifiers)
+    for visibility in ("public", "protected", "private"):
+        if visibility in modifiers:
+            return visibility
+    return "public" if raw_modifiers is not None else None
+
+
+def _build_type_signature(
+    symbol_type: str,
+    name: str,
+    extends: str | None,
+    implements: list[str],
+    raw_modifiers: str | None,
+) -> str:
+    """Return a compact declaration signature for a class/interface/trait."""
+
+    prefixes = [item for item in (raw_modifiers or "").split() if item]
+    signature = " ".join([*prefixes, symbol_type, name]).strip()
+    if extends:
+        signature = f"{signature} extends {extends}"
+    if implements:
+        signature = f"{signature} implements {', '.join(implements)}"
+    return signature
+
+
+def _build_function_signature(
+    name: str,
+    raw_params: str | None,
+    raw_return_type: str | None,
+    raw_modifiers: str | None,
+) -> str:
+    """Return a compact signature string for a function or method."""
+
+    prefixes = [item for item in (raw_modifiers or "").split() if item]
+    signature = " ".join([*prefixes, "function", f"{name}({_normalize_parameter_signature(raw_params)})"]).strip()
+    return_type = _clean_type(raw_return_type)
+    if return_type:
+        signature = f"{signature}: {return_type}"
+    return signature
+
+
+def _normalize_parameter_signature(raw_params: str | None) -> str:
+    """Normalize the parameter source into a compact signature fragment."""
+
+    if not raw_params:
+        return ""
+    return ", ".join(part.strip() for part in _split_parameters(raw_params))
+
+
+def _parse_parameters(raw_params: str | None) -> list[dict[str, str | None]]:
+    """Parse a PHP parameter list into structured parameter metadata."""
+
+    if not raw_params:
+        return []
+
+    parameters: list[dict[str, str | None]] = []
+    for raw_parameter in _split_parameters(raw_params):
+        parameter = raw_parameter.strip()
+        if not parameter:
+            continue
+        if "=" in parameter:
+            declaration, default_value = parameter.split("=", 1)
+            default = default_value.strip()
+        else:
+            declaration = parameter
+            default = None
+        declaration = declaration.strip()
+        variable_match = re.search(r"(&?\.\.\.)?\$([A-Za-z_][A-Za-z0-9_]*)", declaration)
+        if variable_match is None:
+            continue
+        prefix = variable_match.group(1) or ""
+        name = variable_match.group(2)
+        type_part = declaration[:variable_match.start()].strip()
+        if prefix:
+            type_part = f"{type_part} {prefix}".strip()
+        parameters.append(
+            {
+                "name": name,
+                "type": type_part or None,
+                "default": default,
+            }
+        )
+    return parameters
+
+
+def _split_parameters(raw_params: str) -> list[str]:
+    """Split a PHP parameter list while respecting nested delimiters and strings."""
+
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote: str | None = None
+
+    for char in raw_params:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            continue
+        if char in {"(", "[", "{"}:
+            depth += 1
+        elif char in {")", "]", "}"} and depth > 0:
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
+def _clean_type(raw_type: str | None) -> str | None:
+    """Return a normalized type string."""
+
+    if raw_type is None:
+        return None
+    cleaned = raw_type.strip()
+    return cleaned or None
+
+
+def _docblock_summary(raw_docblock: str | None) -> str | None:
+    """Return the first descriptive line from a PHP docblock."""
+
+    if not raw_docblock:
+        return None
+    for line in raw_docblock.splitlines():
+        content = line.strip().lstrip("/*").strip()
+        if not content or content.startswith("@"):
+            continue
+        return content
+    return None
+
+
+def _docblock_tags(raw_docblock: str | None) -> dict[str, list[str]]:
+    """Return selected docblock tags from a PHP docblock."""
+
+    tags: dict[str, list[str]] = {}
+    if not raw_docblock:
+        return tags
+    for line in raw_docblock.splitlines():
+        content = line.strip().lstrip("*").strip()
+        if not content.startswith("@"):
+            continue
+        tag_name, _, remainder = content[1:].partition(" ")
+        tags.setdefault(tag_name, []).append(remainder.strip())
+    return tags
 
 
 def _qualify_name(namespace: str | None, name: str | None) -> str:

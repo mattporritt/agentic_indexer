@@ -204,3 +204,54 @@ def test_suggest_related_cli_uses_only_db_path_and_file(tmp_path: Path, capsys) 
     suggestions_by_path = {item["path"]: item for item in payload["data"]["suggestions"]}
     assert "mod/forum/lang/en/mod_forum.php" in suggestions_by_path
     assert suggestions_by_path["mod/forum/lang/en/mod_forum.php"]["indexed"] is True
+
+
+def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "definitions.sqlite"
+    exit_code = main(
+        [
+            "index",
+            "--moodle-path",
+            str(CLASSIC_FIXTURE_ROOT),
+            "--db-path",
+            str(db_path),
+            "--workers",
+            "2",
+        ]
+    )
+    assert exit_code == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "get_string",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["query"] == "get_string"
+    match = payload["data"]["matches"][0]
+    assert match["file"] == "lib/moodlelib.php"
+    assert match["signature"] == "function get_string(string $identifier, ?string $component = null): string"
+    assert match["docblock_summary"] == "Returns a localised string."
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "assign::view",
+        ]
+    )
+    assert exit_code == 0
+    method_payload = json.loads(capsys.readouterr().out)
+    method_match = method_payload["data"]["matches"][0]
+    assert method_match["class_name"] == "assign"
+    assert method_match["inheritance_role"] == "interface_implementation"
+    assert any(item["usage_kind"] == "instance_method_call" for item in method_match["usage_examples"])

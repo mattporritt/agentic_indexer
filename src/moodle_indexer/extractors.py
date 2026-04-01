@@ -119,6 +119,15 @@ def extract_php_artifacts(
                     line=method.line,
                     namespace=parsed.namespace,
                     container_name=parsed.fqname,
+                    signature=method.signature,
+                    parameters=method.parameters,
+                    return_type=method.return_type,
+                    docblock_summary=method.docblock_summary,
+                    docblock_tags=method.docblock_tags,
+                    visibility=method.visibility,
+                    is_static=method.is_static,
+                    is_final=method.is_final,
+                    is_abstract=method.is_abstract,
                 )
             )
             relationships.append(
@@ -926,6 +935,15 @@ def _symbol_record_from_parsed(parsed: ParsedSymbol, relative_path: str, compone
         component_name=component_name,
         line=parsed.line,
         namespace=parsed.namespace,
+        signature=parsed.signature,
+        parameters=parsed.parameters,
+        return_type=parsed.return_type,
+        docblock_summary=parsed.docblock_summary,
+        docblock_tags=parsed.docblock_tags,
+        visibility=parsed.visibility,
+        is_static=parsed.is_static,
+        is_final=parsed.is_final,
+        is_abstract=parsed.is_abstract,
     )
 
 

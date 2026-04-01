@@ -7,6 +7,7 @@ out of the command-line interface layer.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -93,6 +94,36 @@ def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
             }
         )
     return {"query": symbol_name, "matches": matches}
+
+
+def find_definition(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    symbol_type: str = "any",
+    limit: int = 10,
+    include_usages: bool = True,
+) -> dict:
+    """Return IDE-style definition records for functions, methods, and classes."""
+
+    if "::" in symbol_query:
+        matches = _find_method_definitions(connection, symbol_query, symbol_type, limit)
+    else:
+        matches = _find_named_definitions(connection, symbol_query, symbol_type, limit)
+
+    results = []
+    for row in matches[:limit]:
+        payload = _serialize_definition_match(connection, row)
+        if include_usages:
+            payload["usage_examples"] = _find_usage_examples(connection, row, limit=min(5, limit))
+        else:
+            payload["usage_examples"] = []
+        results.append(payload)
+
+    return {
+        "query": symbol_query,
+        "total_matches": len(matches),
+        "matches": results,
+    }
 
 
 def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
@@ -494,6 +525,280 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
         "moodle_path": moodle_path,
         "suggestions": suggestions,
     }
+
+
+def _find_named_definitions(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    symbol_type: str,
+    limit: int,
+) -> list[sqlite3.Row]:
+    """Return exact-name or fqname definition matches for non-method queries."""
+
+    type_clause = ""
+    parameters: list[object] = [symbol_query, symbol_query]
+    if symbol_type != "any":
+        type_clause = "AND s.symbol_type = ?"
+        parameters.append(symbol_type)
+    parameters.extend([symbol_query, symbol_query, symbol_query, limit])
+    return connection.execute(
+        f"""
+        SELECT
+            s.*,
+            f.repository_relative_path,
+            f.moodle_path,
+            f.absolute_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE (s.name = ? OR s.fqname = ?)
+          {type_clause}
+        ORDER BY
+            CASE
+                WHEN s.fqname = ? THEN 0
+                WHEN s.name = ? THEN 1
+                WHEN s.fqname LIKE ? || '\\\\%' ESCAPE '\\' THEN 2
+                ELSE 3
+            END,
+            s.symbol_type,
+            s.fqname,
+            s.line
+        LIMIT ?
+        """,
+        tuple(parameters),
+    ).fetchall()
+
+
+def _find_method_definitions(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    symbol_type: str,
+    limit: int,
+) -> list[sqlite3.Row]:
+    """Return ranked method matches for ``Class::method``-style queries."""
+
+    class_part, method_name = symbol_query.split("::", 1)
+    rows = connection.execute(
+        """
+        SELECT
+            s.*,
+            f.repository_relative_path,
+            f.moodle_path,
+            f.absolute_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE s.symbol_type = 'method'
+          AND (s.name = ? OR s.fqname = ?)
+        ORDER BY s.fqname, s.line
+        """,
+        (method_name, symbol_query),
+    ).fetchall()
+
+    ranked: list[tuple[tuple[int, str, int], sqlite3.Row]] = []
+    for row in rows:
+        if symbol_type not in {"any", "method"}:
+            continue
+        container_name = row["container_name"] or ""
+        container_short = container_name.split("\\")[-1] if container_name else None
+        if row["fqname"] == symbol_query:
+            rank = 0
+        elif container_name == class_part:
+            rank = 1
+        elif container_name.endswith(f"\\{class_part}"):
+            rank = 2
+        elif container_short == class_part:
+            rank = 3
+        else:
+            continue
+        ranked.append(((rank, row["fqname"], row["line"]), row))
+
+    ranked.sort(key=lambda item: item[0])
+    return [row for _, row in ranked[:limit]]
+
+
+def _serialize_definition_match(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """Return one IDE-style definition payload."""
+
+    inheritance = _method_inheritance_context(connection, row) if row["symbol_type"] == "method" else {}
+    return {
+        "symbol_type": row["symbol_type"],
+        "name": row["name"],
+        "fqname": row["fqname"],
+        "component": row["component_name"],
+        "file": row["moodle_path"],
+        "repository_relative_path": row["repository_relative_path"],
+        "line": row["line"],
+        "namespace": row["namespace"],
+        "class_name": row["container_name"],
+        "signature": row["signature"],
+        "parameters": json.loads(row["parameters_json"]),
+        "return_type": row["return_type"],
+        "docblock_summary": row["docblock_summary"],
+        "docblock_tags": json.loads(row["docblock_tags_json"]),
+        "visibility": row["visibility"],
+        "is_static": bool(row["is_static"]),
+        "is_final": bool(row["is_final"]),
+        "is_abstract": bool(row["is_abstract"]),
+        "inheritance_role": inheritance.get("inheritance_role"),
+        "overrides": inheritance.get("overrides"),
+        "implements_method": inheritance.get("implements_method"),
+        "parent_class": inheritance.get("parent_class"),
+        "interface_names": inheritance.get("interface_names", []),
+    }
+
+
+def _method_inheritance_context(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """Return practical Phase 1 inheritance context for a method definition."""
+
+    container_name = row["container_name"]
+    if not container_name:
+        return {
+            "inheritance_role": "unknown",
+            "overrides": None,
+            "implements_method": [],
+            "parent_class": None,
+            "interface_names": [],
+        }
+
+    relationships = connection.execute(
+        """
+        SELECT relationship_type, target_name
+        FROM relationships
+        WHERE source_fqname = ?
+          AND relationship_type IN ('extends', 'implements')
+        ORDER BY relationship_type, target_name
+        """,
+        (container_name,),
+    ).fetchall()
+
+    parent_class = next((item["target_name"] for item in relationships if item["relationship_type"] == "extends"), None)
+    interface_names = [item["target_name"] for item in relationships if item["relationship_type"] == "implements"]
+
+    overrides = None
+    if parent_class:
+        parent_method = _find_method_in_container(connection, parent_class, row["name"])
+        if parent_method is not None:
+            overrides = parent_method["fqname"]
+
+    implemented_methods: list[str] = []
+    for interface_name in interface_names:
+        interface_method = _find_method_in_container(connection, interface_name, row["name"])
+        if interface_method is not None:
+            implemented_methods.append(interface_method["fqname"])
+
+    if implemented_methods:
+        inheritance_role = "interface_implementation"
+    elif overrides:
+        inheritance_role = "override"
+    elif row["visibility"] == "private":
+        inheritance_role = "unknown"
+    else:
+        inheritance_role = "base_definition"
+
+    return {
+        "inheritance_role": inheritance_role,
+        "overrides": overrides,
+        "implements_method": implemented_methods,
+        "parent_class": parent_class,
+        "interface_names": interface_names,
+    }
+
+
+def _find_method_in_container(connection: sqlite3.Connection, container_name: str, method_name: str) -> sqlite3.Row | None:
+    """Find a method by container name using exact or short-name matching."""
+
+    normalized = str(container_name).lstrip("\\")
+    short_name = normalized.split("\\")[-1]
+    return connection.execute(
+        """
+        SELECT fqname
+        FROM symbols
+        WHERE symbol_type = 'method'
+          AND name = ?
+          AND (
+                container_name = ?
+             OR container_name = ?
+             OR container_name LIKE ? ESCAPE '\\'
+             OR container_name LIKE ? ESCAPE '\\'
+          )
+        ORDER BY fqname
+        LIMIT 1
+        """,
+        (
+            method_name,
+            normalized,
+            f"\\{normalized}",
+            f"%\\{short_name}",
+            short_name,
+        ),
+    ).fetchone()
+
+
+def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit: int) -> list[dict[str, object]]:
+    """Return a bounded set of pragmatic usage examples for a symbol."""
+
+    file_rows = connection.execute(
+        """
+        SELECT id, moodle_path, absolute_path, extension
+        FROM files
+        WHERE extension = '.php'
+        ORDER BY moodle_path
+        """
+    ).fetchall()
+
+    examples: list[dict[str, object]] = []
+    for file_row in file_rows:
+        if len(examples) >= limit:
+            break
+        absolute_path = Path(file_row["absolute_path"])
+        try:
+            source = absolute_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            if file_row["id"] == row["file_id"] and line_number == row["line"]:
+                continue
+            usage_kind = _usage_kind_for_line(row, line)
+            if usage_kind is None:
+                continue
+            examples.append(
+                {
+                    "file": file_row["moodle_path"],
+                    "line": line_number,
+                    "usage_kind": usage_kind,
+                    "snippet": line.strip(),
+                }
+            )
+            if len(examples) >= limit:
+                break
+    return examples
+
+
+def _usage_kind_for_line(row: sqlite3.Row, line: str) -> str | None:
+    """Return a best-effort usage kind for a single source line."""
+
+    name = re.escape(str(row["name"]))
+    if row["symbol_type"] == "function":
+        pattern = re.compile(rf"(?<!function\s)\b{name}\s*\(")
+        return "function_call" if pattern.search(line) else None
+    if row["symbol_type"] == "method":
+        if re.search(rf"::\s*{name}\s*\(", line):
+            return "static_method_call"
+        if re.search(rf"->\s*{name}\s*\(", line):
+            return "instance_method_call"
+        return None
+    if row["symbol_type"] == "class":
+        class_name = re.escape(str(row["name"]))
+        if re.search(rf"\bnew\s+{class_name}\s*\(", line):
+            return "class_instantiation"
+        if re.search(rf"\bextends\s+{class_name}\b", line):
+            return "extends_reference"
+        if re.search(rf"\bimplements\b.*\b{class_name}\b", line):
+            return "implements_reference"
+    return None
 
 
 def _resolve_file_row(

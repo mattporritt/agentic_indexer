@@ -16,7 +16,7 @@ from moodle_indexer.config import build_index_config
 from moodle_indexer.errors import IndexerError
 from moodle_indexer.indexer import build_index
 from moodle_indexer.json_output import dumps_json, error_payload, success_payload
-from moodle_indexer.queries import component_summary, file_context, find_symbol, suggest_related
+from moodle_indexer.queries import component_summary, file_context, find_definition, find_symbol, suggest_related
 from moodle_indexer.store import open_database
 
 
@@ -42,6 +42,31 @@ def build_parser() -> argparse.ArgumentParser:
     find_parser = subparsers.add_parser("find-symbol", help="Find symbol definitions by name or fully qualified name.")
     find_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     find_parser.add_argument("--symbol", required=True, help="Symbol name or fully qualified name.")
+
+    definition_parser = subparsers.add_parser(
+        "find-definition",
+        help="Return IDE-style definition details for a function, method, or class.",
+    )
+    definition_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    definition_parser.add_argument("--symbol", required=True, help="Function, class, or method query such as get_string or assign::view.")
+    definition_parser.add_argument(
+        "--type",
+        choices=["any", "function", "method", "class", "interface", "trait"],
+        default="any",
+        help="Optional symbol-type filter.",
+    )
+    definition_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of matches to return.",
+    )
+    definition_parser.add_argument(
+        "--include-usages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include a small number of usage examples.",
+    )
 
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
@@ -84,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_index(args.moodle_path, args.db_path, args.workers)
         elif args.command == "find-symbol":
             payload = run_find_symbol(args.db_path, args.symbol)
+        elif args.command == "find-definition":
+            payload = run_find_definition(args.db_path, args.symbol, args.type, args.limit, args.include_usages)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -117,6 +144,19 @@ def run_find_symbol(db_path: str, symbol: str) -> dict:
     connection = open_database(Path(db_path).expanduser().resolve())
     try:
         return success_payload("find-symbol", find_symbol(connection, symbol))
+    finally:
+        connection.close()
+
+
+def run_find_definition(db_path: str, symbol: str, symbol_type: str, limit: int, include_usages: bool) -> dict:
+    """Execute the ``find-definition`` command."""
+
+    connection = open_database(Path(db_path).expanduser().resolve())
+    try:
+        return success_payload(
+            "find-definition",
+            find_definition(connection, symbol, symbol_type=symbol_type, limit=limit, include_usages=include_usages),
+        )
     finally:
         connection.close()
 

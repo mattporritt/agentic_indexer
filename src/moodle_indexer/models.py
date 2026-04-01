@@ -54,6 +54,15 @@ class SymbolRecord:
     line: int
     namespace: str | None = None
     container_name: str | None = None
+    signature: str | None = None
+    parameters: list[dict[str, str | None]] = field(default_factory=list)
+    return_type: str | None = None
+    docblock_summary: str | None = None
+    docblock_tags: dict[str, list[str]] = field(default_factory=dict)
+    visibility: str | None = None
+    is_static: bool = False
+    is_final: bool = False
+    is_abstract: bool = False
 
 
 @dataclass(slots=True)

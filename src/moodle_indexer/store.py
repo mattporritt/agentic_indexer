@@ -60,6 +60,15 @@ SCHEMA_STATEMENTS = [
         symbol_type TEXT NOT NULL,
         namespace TEXT,
         container_name TEXT,
+        signature TEXT,
+        parameters_json TEXT NOT NULL,
+        return_type TEXT,
+        docblock_summary TEXT,
+        docblock_tags_json TEXT NOT NULL,
+        visibility TEXT,
+        is_static INTEGER NOT NULL,
+        is_final INTEGER NOT NULL,
+        is_abstract INTEGER NOT NULL,
         line INTEGER NOT NULL
     );
     """,
@@ -324,8 +333,26 @@ def insert_symbol(connection: sqlite3.Connection, file_id: int, component_id: in
 
     connection.execute(
         """
-        INSERT INTO symbols (file_id, component_id, name, fqname, symbol_type, namespace, container_name, line)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO symbols (
+            file_id,
+            component_id,
+            name,
+            fqname,
+            symbol_type,
+            namespace,
+            container_name,
+            signature,
+            parameters_json,
+            return_type,
+            docblock_summary,
+            docblock_tags_json,
+            visibility,
+            is_static,
+            is_final,
+            is_abstract,
+            line
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             file_id,
@@ -335,6 +362,15 @@ def insert_symbol(connection: sqlite3.Connection, file_id: int, component_id: in
             symbol["symbol_type"],
             symbol.get("namespace"),
             symbol.get("container_name"),
+            symbol.get("signature"),
+            json.dumps(symbol.get("parameters", []), sort_keys=True),
+            symbol.get("return_type"),
+            symbol.get("docblock_summary"),
+            json.dumps(symbol.get("docblock_tags", {}), sort_keys=True),
+            symbol.get("visibility"),
+            int(bool(symbol.get("is_static"))),
+            int(bool(symbol.get("is_final"))),
+            int(bool(symbol.get("is_abstract"))),
             symbol["line"],
         ),
     )
