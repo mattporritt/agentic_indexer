@@ -629,7 +629,9 @@ def _normalize_php_symbol_name(name: str | None) -> str:
 
     if not name:
         return ""
-    return str(name).strip().lstrip("\\")
+    normalized = str(name).strip()
+    normalized = re.sub(r"\\{2,}", r"\\", normalized)
+    return normalized.lstrip("\\")
 
 
 def _serialize_definition_match(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:

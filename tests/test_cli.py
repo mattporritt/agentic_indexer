@@ -307,3 +307,17 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     namespaced_slash_payload = json.loads(capsys.readouterr().out)
     assert namespaced_slash_payload["data"]["total_matches"] == 1
     assert namespaced_slash_payload["data"]["matches"][0]["class_name"] == "mod_assign\\external\\start_submission"
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\\\external\\\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    doubled_slash_payload = json.loads(capsys.readouterr().out)
+    assert doubled_slash_payload["data"]["total_matches"] == 1
+    assert doubled_slash_payload["data"]["matches"][0]["class_name"] == "mod_assign\\external\\start_submission"

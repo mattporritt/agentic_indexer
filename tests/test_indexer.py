@@ -16,6 +16,7 @@ from moodle_indexer import indexer as indexer_module
 from moodle_indexer.indexer import build_index
 from moodle_indexer.js_modules import resolve_js_module
 from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
+from moodle_indexer.php_parser import ParsedMethod, ParsedSymbol, _merge_symbol_metadata
 from moodle_indexer.queries import component_summary, file_context, find_definition, find_symbol, suggest_related
 from moodle_indexer.store import open_database
 
@@ -91,6 +92,39 @@ def test_php_extraction_captures_structural_relationships() -> None:
         "mod_forum\\output\\discussion_list::export_for_template",
         "mod_forum\\output\\discussion_list",
     ) in relationship_pairs
+
+
+def test_merge_symbol_metadata_preserves_regex_only_legacy_methods() -> None:
+    parsed_symbols = [
+        ParsedSymbol(
+            symbol_type="class",
+            name="assign",
+            fqname="assign",
+            line=17,
+            methods=[
+                ParsedMethod(name="__construct", line=129),
+                ParsedMethod(name="set_is_marking", line=258),
+            ],
+        )
+    ]
+    regex_symbols = [
+        ParsedSymbol(
+            symbol_type="class",
+            name="assign",
+            fqname="assign",
+            line=17,
+            methods=[
+                ParsedMethod(name="__construct", line=129),
+                ParsedMethod(name="set_is_marking", line=258),
+                ParsedMethod(name="view", line=400, signature="public function view(): string"),
+            ],
+        )
+    ]
+
+    merged = _merge_symbol_metadata(parsed_symbols, regex_symbols)
+
+    assert len(merged) == 1
+    assert {method.name for method in merged[0].methods} == {"__construct", "set_is_marking", "view"}
 
 
 def test_capability_and_language_string_extractors_capture_metadata() -> None:
@@ -366,6 +400,13 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         assert start_submission_with_leading_slash["total_matches"] == 1
         assert start_submission_with_leading_slash["matches"][0]["fqname"] == start_submission_match["fqname"]
+
+        start_submission_with_doubled_slashes = find_definition(
+            connection,
+            "mod_assign\\\\external\\\\start_submission::execute",
+        )
+        assert start_submission_with_doubled_slashes["total_matches"] == 1
+        assert start_submission_with_doubled_slashes["matches"][0]["fqname"] == start_submission_match["fqname"]
 
         ambiguous_execute = find_definition(connection, "execute", symbol_type="method")
         assert ambiguous_execute["total_matches"] >= 2

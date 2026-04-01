@@ -268,7 +268,13 @@ def _find_matching_brace(source: str, opening_brace_index: int) -> int:
 
 
 def _merge_symbol_metadata(parsed_symbols: list[ParsedSymbol], regex_symbols: list[ParsedSymbol]) -> list[ParsedSymbol]:
-    """Merge parser-derived structure with regex-derived declaration metadata."""
+    """Merge parser-derived structure with regex-derived declaration metadata.
+
+    ``phply`` can sometimes recover only part of a large legacy class body. When
+    that happens we still want regex-discovered methods that are missing from the
+    AST result to survive indexing, rather than disappearing from the merged
+    symbol set.
+    """
 
     regex_by_fqname = {item.fqname: item for item in regex_symbols if item.fqname}
     merged: list[ParsedSymbol] = []
@@ -305,6 +311,12 @@ def _merge_symbol_metadata(parsed_symbols: list[ParsedSymbol], regex_symbols: li
             )
             for method in item.methods
         ]
+        merged_method_names = {method.name for method in merged_methods}
+        merged_methods.extend(
+            method
+            for method in metadata.methods
+            if method.name not in merged_method_names
+        )
 
         merged.append(
             replace(
@@ -387,15 +399,30 @@ def _find_matching_delimiter(source: str, opening_index: int, opening: str, clos
 
     depth = 0
     quote: str | None = None
-    for index in range(opening_index, len(source)):
+    index = opening_index
+    while index < len(source):
         char = source[index]
         previous = source[index - 1] if index > 0 else ""
         if quote:
             if char == quote and previous != "\\":
                 quote = None
+            index += 1
+            continue
+        if source.startswith("//", index) or char == "#":
+            newline_index = source.find("\n", index)
+            if newline_index == -1:
+                return len(source)
+            index = newline_index + 1
+            continue
+        if source.startswith("/*", index):
+            comment_end = source.find("*/", index + 2)
+            if comment_end == -1:
+                return len(source)
+            index = comment_end + 2
             continue
         if char in {"'", '"'}:
             quote = char
+            index += 1
             continue
         if char == opening:
             depth += 1
@@ -403,6 +430,7 @@ def _find_matching_delimiter(source: str, opening_index: int, opening: str, clos
             depth -= 1
             if depth == 0:
                 return index
+        index += 1
     return len(source)
 
 
