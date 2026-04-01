@@ -342,18 +342,58 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert assign_view_match["is_abstract"] is False
         assert assign_view_match["return_type"] == "string"
         assert assign_view_match["docblock_summary"] == "Render the current assignment view."
-        assert assign_view_match["inheritance_role"] == "interface_implementation"
+        assert assign_view_match["inheritance_role"] == "override"
         assert assign_view_match["overrides"] == "mod_assign\\local\\assign_base::view"
         assert assign_view_match["implements_method"] == ["mod_assign\\local\\viewable::view"]
+        assert assign_view_match["matched_via"] == "direct_definition"
+        assert assign_view_match["parent_definition"]["fqname"] == "mod_assign\\local\\assign_base::view"
+        assert assign_view_match["overrides_definition"]["fqname"] == "mod_assign\\local\\assign_base::view"
+        assert len(assign_view_match["implements_definitions"]) == 1
+        implements_definition = assign_view_match["implements_definitions"][0]
+        assert implements_definition["fqname"] == "mod_assign\\local\\viewable::view"
+        assert implements_definition["file"] == "mod/assign/classes/local/viewable.php"
         assert {example["file"] for example in assign_view_match["usage_examples"]} == {
             "mod/assign/externallib.php",
             "mod/assign/renderer.php",
         }
         assert all("->view(" in example["snippet"] for example in assign_view_match["usage_examples"])
+        assert assign_view_match["usage_summary"] == {"instance_method_call": 1, "renderer_usage": 1}
 
         assign_view_with_leading_slash = find_definition(connection, "\\assign::view")
         assert assign_view_with_leading_slash["total_matches"] == 1
         assert assign_view_with_leading_slash["matches"][0]["fqname"] == assign_view_match["fqname"]
+
+        base_view_definition = find_definition(connection, "mod_assign\\local\\assign_base::view")
+        assert base_view_definition["total_matches"] == 1
+        base_view_match = base_view_definition["matches"][0]
+        assert base_view_match["inheritance_role"] == "base_definition"
+        assert {item["fqname"] for item in base_view_match["child_overrides"]} >= {"assign::view"}
+
+        interface_view_definition = find_definition(connection, "mod_assign\\local\\viewable::view")
+        assert interface_view_definition["total_matches"] == 1
+        interface_view_match = interface_view_definition["matches"][0]
+        assert interface_view_match["inheritance_role"] == "base_definition"
+        assert {item["fqname"] for item in interface_view_match["child_overrides"]} >= {
+            "assign::view",
+            "mod_assign\\local\\simple_view::view",
+        }
+
+        simple_view_definition = find_definition(connection, "mod_assign\\local\\simple_view::view")
+        assert simple_view_definition["total_matches"] == 1
+        simple_view_match = simple_view_definition["matches"][0]
+        assert simple_view_match["inheritance_role"] == "interface_implementation"
+        assert simple_view_match["overrides"] is None
+        assert simple_view_match["implements_method"] == ["mod_assign\\local\\viewable::view"]
+        assert simple_view_match["implements_definitions"][0]["fqname"] == "mod_assign\\local\\viewable::view"
+
+        inherited_view_definition = find_definition(connection, "mod_assign\\local\\passive_assign::view")
+        assert inherited_view_definition["total_matches"] == 1
+        inherited_view_match = inherited_view_definition["matches"][0]
+        assert inherited_view_match["inheritance_role"] == "inherited_not_overridden"
+        assert inherited_view_match["matched_via"] == "inherited_definition"
+        assert inherited_view_match["requested_class_name"] == "mod_assign\\local\\passive_assign"
+        assert inherited_view_match["fqname"] == "mod_assign\\local\\assign_base::view"
+        assert inherited_view_match["parent_definition"]["fqname"] == "mod_assign\\local\\assign_base::view"
 
         delete_instance_definition = find_definition(connection, "assign::delete_instance")
         assert delete_instance_definition["total_matches"] == 1
@@ -384,15 +424,18 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         ]
         assert start_submission_match["return_type"] == "array"
         assert start_submission_match["docblock_summary"] == "Start a submission attempt."
-        assert start_submission_match["usage_examples"] == [
-            {
-                "file": "mod/assign/db/services.php",
-                "line": 13,
-                "usage_kind": "service_definition",
-                "confidence": "high",
-                "snippet": "mod_assign_start_submission",
-            }
-        ]
+        assert start_submission_match["inheritance_role"] == "base_definition"
+        assert start_submission_match["parent_class"] == "external_api"
+        assert start_submission_match["usage_examples"][0] == {
+            "file": "mod/assign/db/services.php",
+            "line": 13,
+            "usage_kind": "service_definition",
+            "confidence": "high",
+            "snippet": "mod_assign_start_submission",
+        }
+        assert any(example["usage_kind"] == "test_usage" for example in start_submission_match["usage_examples"][1:])
+        assert start_submission_match["usage_summary"]["service_definition"] == 1
+        assert start_submission_match["usage_summary"]["test_usage"] >= 1
 
         start_submission_with_leading_slash = find_definition(
             connection,

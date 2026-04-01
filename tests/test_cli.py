@@ -253,11 +253,14 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     method_payload = json.loads(capsys.readouterr().out)
     method_match = method_payload["data"]["matches"][0]
     assert method_match["class_name"] == "assign"
-    assert method_match["inheritance_role"] == "interface_implementation"
+    assert method_match["inheritance_role"] == "override"
+    assert method_match["parent_definition"]["fqname"] == "mod_assign\\local\\assign_base::view"
+    assert method_match["implements_definitions"][0]["fqname"] == "mod_assign\\local\\viewable::view"
     assert {item["file"] for item in method_match["usage_examples"]} == {
         "mod/assign/externallib.php",
         "mod/assign/renderer.php",
     }
+    assert method_match["usage_summary"] == {"instance_method_call": 1, "renderer_usage": 1}
 
     exit_code = main(
         [
@@ -291,7 +294,14 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
             "usage_kind": "service_definition",
             "confidence": "high",
             "snippet": "mod_assign_start_submission",
-        }
+        },
+        {
+            "file": "mod/assign/tests/external/start_submission_test.php",
+            "line": 8,
+            "usage_kind": "test_usage",
+            "confidence": "high",
+            "snippet": "start_submission::execute(1, false);",
+        },
     ]
 
     exit_code = main(

@@ -320,13 +320,20 @@ For supported PHP functions, classes, and methods it returns:
 - signature, parameters, defaults, and return type where available
 - docblock summary and selected tags
 - method modifiers such as visibility, `static`, `final`, and `abstract`
-- basic inheritance hints such as `override` or `interface_implementation`
-- a small number of practical, high-confidence usage examples
+- inheritance/navigation context such as `inheritance_role`,
+  `parent_definition`, `overrides_definition`, `implements_definitions`, and a
+  bounded `child_overrides` list where available
+- a small number of ranked usage examples plus a compact `usage_summary`
 
-Phase 1.5 usage examples intentionally prefer precision over recall. The indexer
-will surface direct static calls, simple `new ClassName(...)` to `$var->method()`
-patterns, and a few other high-confidence linkages, and it may return zero
-examples when it cannot do so without becoming misleading.
+Phase 2 usage examples intentionally prefer precision over recall. The indexer
+will rank direct static calls, simple `new ClassName(...)` to `$var->method()`
+patterns, service-definition references, and a few other high-confidence
+linkages above weaker matches, and it may return zero examples when it cannot
+do so without becoming misleading.
+
+Usage examples also include a `usage_kind` and `confidence` field so callers can
+distinguish between, for example, a `service_definition`, `test_usage`,
+`renderer_usage`, `static_method_call`, or `instance_method_call`.
 
 Ambiguity is explicit. If a short query such as `execute` matches multiple
 methods, the command returns multiple distinguishable matches instead of

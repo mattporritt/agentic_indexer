@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from moodle_indexer.components import resolve_classname_to_file_path, resolve_framework_class_to_file_path
@@ -16,6 +17,15 @@ from moodle_indexer.errors import ValidationError
 from moodle_indexer.js_modules import JsModuleResolution, resolve_js_module
 from moodle_indexer.paths import normalize_relative_lookup_path
 from moodle_indexer.suggestions import suggest_related_files
+
+
+@dataclass(slots=True)
+class DefinitionCandidate:
+    """A matched definition plus the context used to resolve it."""
+
+    row: sqlite3.Row
+    matched_via: str = "direct_definition"
+    requested_container: str | None = None
 
 
 def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
@@ -111,12 +121,14 @@ def find_definition(
         matches = _find_named_definitions(connection, symbol_query, symbol_type, limit)
 
     results = []
-    for row in matches[:limit]:
-        payload = _serialize_definition_match(connection, row)
+    for candidate in matches[:limit]:
+        payload = _serialize_definition_match(connection, candidate)
         if include_usages:
-            payload["usage_examples"] = _find_usage_examples(connection, row, limit=min(5, limit))
+            payload["usage_examples"] = _find_usage_examples(connection, candidate.row, limit=min(5, limit))
+            payload["usage_summary"] = _summarize_usage_examples(payload["usage_examples"])
         else:
             payload["usage_examples"] = []
+            payload["usage_summary"] = {}
         results.append(payload)
 
     return {
@@ -532,7 +544,7 @@ def _find_named_definitions(
     symbol_query: str,
     symbol_type: str,
     limit: int,
-) -> list[sqlite3.Row]:
+) -> list[DefinitionCandidate]:
     """Return exact-name or fqname definition matches for non-method queries."""
 
     type_clause = ""
@@ -541,7 +553,7 @@ def _find_named_definitions(
         type_clause = "AND s.symbol_type = ?"
         parameters.append(symbol_type)
     parameters.extend([symbol_query, symbol_query, symbol_query, limit])
-    return connection.execute(
+    rows = connection.execute(
         f"""
         SELECT
             s.*,
@@ -568,6 +580,7 @@ def _find_named_definitions(
         """,
         tuple(parameters),
     ).fetchall()
+    return [DefinitionCandidate(row=item) for item in rows]
 
 
 def _find_method_definitions(
@@ -575,7 +588,7 @@ def _find_method_definitions(
     symbol_query: str,
     symbol_type: str,
     limit: int,
-) -> list[sqlite3.Row]:
+) -> list[DefinitionCandidate]:
     """Return ranked method matches for ``Class::method``-style queries."""
 
     class_part, method_name = symbol_query.split("::", 1)
@@ -621,7 +634,24 @@ def _find_method_definitions(
         ranked.append(((rank, normalized_fqname, row["line"]), row))
 
     ranked.sort(key=lambda item: item[0])
-    return [row for _, row in ranked[:limit]]
+    direct_matches = [DefinitionCandidate(row=row) for _, row in ranked[:limit]]
+    if direct_matches:
+        return direct_matches
+
+    class_symbol = _find_class_symbol(connection, class_part)
+    if class_symbol is None:
+        return []
+
+    inherited_method = _find_inherited_method_definition(connection, class_symbol, normalized_method)
+    if inherited_method is None:
+        return []
+    return [
+        DefinitionCandidate(
+            row=inherited_method,
+            matched_via="inherited_definition",
+            requested_container=class_symbol["fqname"],
+        )
+    ]
 
 
 def _normalize_php_symbol_name(name: str | None) -> str:
@@ -634,10 +664,15 @@ def _normalize_php_symbol_name(name: str | None) -> str:
     return normalized.lstrip("\\")
 
 
-def _serialize_definition_match(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
+def _serialize_definition_match(connection: sqlite3.Connection, candidate: DefinitionCandidate) -> dict:
     """Return one IDE-style definition payload."""
 
-    inheritance = _method_inheritance_context(connection, row) if row["symbol_type"] == "method" else {}
+    row = candidate.row
+    inheritance = (
+        _method_inheritance_context(connection, candidate)
+        if row["symbol_type"] == "method"
+        else {}
+    )
     return {
         "symbol_type": row["symbol_type"],
         "name": row["name"],
@@ -657,17 +692,24 @@ def _serialize_definition_match(connection: sqlite3.Connection, row: sqlite3.Row
         "is_static": bool(row["is_static"]),
         "is_final": bool(row["is_final"]),
         "is_abstract": bool(row["is_abstract"]),
+        "matched_via": candidate.matched_via,
+        "requested_class_name": candidate.requested_container,
         "inheritance_role": inheritance.get("inheritance_role"),
         "overrides": inheritance.get("overrides"),
         "implements_method": inheritance.get("implements_method"),
         "parent_class": inheritance.get("parent_class"),
         "interface_names": inheritance.get("interface_names", []),
+        "parent_definition": inheritance.get("parent_definition"),
+        "overrides_definition": inheritance.get("overrides_definition"),
+        "implements_definitions": inheritance.get("implements_definitions", []),
+        "child_overrides": inheritance.get("child_overrides", []),
     }
 
 
-def _method_inheritance_context(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    """Return practical Phase 1 inheritance context for a method definition."""
+def _method_inheritance_context(connection: sqlite3.Connection, candidate: DefinitionCandidate) -> dict:
+    """Return practical Phase 2 inheritance context for a method definition."""
 
+    row = candidate.row
     container_name = row["container_name"]
     if not container_name:
         return {
@@ -676,6 +718,10 @@ def _method_inheritance_context(connection: sqlite3.Connection, row: sqlite3.Row
             "implements_method": [],
             "parent_class": None,
             "interface_names": [],
+            "parent_definition": None,
+            "overrides_definition": None,
+            "implements_definitions": [],
+            "child_overrides": [],
         }
 
     relationships = connection.execute(
@@ -689,25 +735,47 @@ def _method_inheritance_context(connection: sqlite3.Connection, row: sqlite3.Row
         (container_name,),
     ).fetchall()
 
-    parent_class = next((item["target_name"] for item in relationships if item["relationship_type"] == "extends"), None)
-    interface_names = [item["target_name"] for item in relationships if item["relationship_type"] == "implements"]
+    parent_class = next(
+        (
+            _normalize_php_symbol_name(item["target_name"])
+            for item in relationships
+            if item["relationship_type"] == "extends"
+        ),
+        None,
+    )
+    interface_names = [
+        _normalize_php_symbol_name(item["target_name"])
+        for item in relationships
+        if item["relationship_type"] == "implements"
+    ]
 
+    parent_definition = None
     overrides = None
+    overrides_definition = None
     if parent_class:
         parent_method = _find_method_in_container(connection, parent_class, row["name"])
         if parent_method is not None:
             overrides = parent_method["fqname"]
+            overrides_definition = _serialize_related_definition(parent_method)
+            parent_definition = overrides_definition
 
     implemented_methods: list[str] = []
+    implements_definitions: list[dict[str, object]] = []
     for interface_name in interface_names:
         interface_method = _find_method_in_container(connection, interface_name, row["name"])
         if interface_method is not None:
             implemented_methods.append(interface_method["fqname"])
+            implements_definitions.append(_serialize_related_definition(interface_method))
 
-    if implemented_methods:
-        inheritance_role = "interface_implementation"
+    child_overrides = _find_child_override_definitions(connection, row, limit=5)
+
+    if candidate.matched_via == "inherited_definition":
+        inheritance_role = "inherited_not_overridden"
+        parent_definition = _serialize_related_definition(row)
     elif overrides:
         inheritance_role = "override"
+    elif implemented_methods:
+        inheritance_role = "interface_implementation"
     elif row["visibility"] == "private":
         inheritance_role = "unknown"
     else:
@@ -719,6 +787,10 @@ def _method_inheritance_context(connection: sqlite3.Connection, row: sqlite3.Row
         "implements_method": implemented_methods,
         "parent_class": parent_class,
         "interface_names": interface_names,
+        "parent_definition": parent_definition,
+        "overrides_definition": overrides_definition,
+        "implements_definitions": implements_definitions,
+        "child_overrides": child_overrides,
     }
 
 
@@ -729,17 +801,23 @@ def _find_method_in_container(connection: sqlite3.Connection, container_name: st
     short_name = normalized.split("\\")[-1]
     return connection.execute(
         """
-        SELECT fqname
-        FROM symbols
-        WHERE symbol_type = 'method'
-          AND name = ?
+        SELECT
+            s.*,
+            f.repository_relative_path,
+            f.moodle_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE s.symbol_type = 'method'
+          AND s.name = ?
           AND (
-                container_name = ?
-             OR container_name = ?
-             OR container_name LIKE ? ESCAPE '\\'
-             OR container_name LIKE ? ESCAPE '\\'
+                s.container_name = ?
+             OR s.container_name = ?
+             OR s.container_name LIKE ? ESCAPE '\\'
+             OR s.container_name LIKE ? ESCAPE '\\'
           )
-        ORDER BY fqname
+        ORDER BY s.fqname
         LIMIT 1
         """,
         (
@@ -752,12 +830,161 @@ def _find_method_in_container(connection: sqlite3.Connection, container_name: st
     ).fetchone()
 
 
+def _find_class_symbol(connection: sqlite3.Connection, class_name: str) -> sqlite3.Row | None:
+    """Return the best class symbol match for a legacy or namespaced class name."""
+
+    normalized = _normalize_php_symbol_name(class_name)
+    short_name = normalized.split("\\")[-1]
+    rows = connection.execute(
+        """
+        SELECT
+            s.fqname,
+            s.name,
+            s.namespace,
+            s.line,
+            f.repository_relative_path,
+            f.moodle_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE s.symbol_type IN ('class', 'interface', 'trait')
+          AND (
+                s.fqname = ?
+             OR s.fqname = ?
+             OR s.name = ?
+             OR s.fqname LIKE ? ESCAPE '\\'
+          )
+        ORDER BY s.fqname, s.line
+        """,
+        (normalized, f"\\{normalized}", short_name, f"%\\{short_name}"),
+    ).fetchall()
+    ranked: list[tuple[tuple[int, str, int], sqlite3.Row]] = []
+    for row in rows:
+        fqname = _normalize_php_symbol_name(row["fqname"])
+        name = _normalize_php_symbol_name(row["name"])
+        if fqname == normalized:
+            rank = 0
+        elif name == normalized:
+            rank = 1
+        elif fqname.endswith(f"\\{normalized}"):
+            rank = 2
+        elif name == short_name:
+            rank = 3
+        else:
+            continue
+        ranked.append(((rank, fqname, row["line"]), row))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _find_inherited_method_definition(
+    connection: sqlite3.Connection,
+    class_symbol: sqlite3.Row,
+    method_name: str,
+) -> sqlite3.Row | None:
+    """Return a parent/interface method when the queried class does not override it."""
+
+    class_fqname = _normalize_php_symbol_name(class_symbol["fqname"])
+    visited = {class_fqname}
+    queue = [class_fqname]
+    while queue:
+        current = queue.pop(0)
+        relationships = connection.execute(
+            """
+            SELECT relationship_type, target_name
+            FROM relationships
+            WHERE source_fqname = ?
+              AND relationship_type IN ('extends', 'implements')
+            ORDER BY CASE relationship_type WHEN 'extends' THEN 0 ELSE 1 END, target_name
+            """,
+            (current,),
+        ).fetchall()
+        for relation in relationships:
+            target = _normalize_php_symbol_name(relation["target_name"])
+            if not target or target in visited:
+                continue
+            visited.add(target)
+            method_row = _find_method_in_container(connection, target, method_name)
+            if method_row is not None:
+                return method_row
+            queue.append(target)
+    return None
+
+
+def _serialize_related_definition(row: sqlite3.Row) -> dict[str, object]:
+    """Return a compact linked-definition payload."""
+
+    return {
+        "fqname": row["fqname"],
+        "name": row["name"],
+        "symbol_type": row["symbol_type"],
+        "class_name": row["container_name"],
+        "component": row["component_name"],
+        "file": row["moodle_path"],
+        "repository_relative_path": row["repository_relative_path"],
+        "line": row["line"],
+    }
+
+
+def _find_child_override_definitions(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return a bounded set of child methods overriding or implementing this method."""
+
+    container_name = row["container_name"]
+    if not container_name:
+        return []
+    relationship_types = ("extends", "implements") if row["symbol_type"] == "method" else ("extends",)
+    pending = [container_name]
+    visited = {container_name}
+    descendants: list[str] = []
+    while pending and len(descendants) < limit * 3:
+        current = pending.pop(0)
+        normalized_current = _normalize_php_symbol_name(current)
+        short_current = normalized_current.split("\\")[-1]
+        placeholders = ",".join("?" for _ in relationship_types)
+        rows = connection.execute(
+            f"""
+            SELECT source_fqname
+            FROM relationships
+            WHERE target_name IN (?, ?, ?)
+              AND relationship_type IN ({placeholders})
+            ORDER BY source_fqname
+            """,
+            (current, normalized_current, short_current, *relationship_types),
+        ).fetchall()
+        for item in rows:
+            source = item["source_fqname"]
+            if source in visited:
+                continue
+            visited.add(source)
+            descendants.append(source)
+            pending.append(source)
+
+    results: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for descendant in descendants:
+        method_row = _find_method_in_container(connection, descendant, row["name"])
+        if method_row is None or method_row["fqname"] == row["fqname"] or method_row["fqname"] in seen:
+            continue
+        seen.add(method_row["fqname"])
+        results.append(_serialize_related_definition(method_row))
+        if len(results) >= limit:
+            break
+    return results
+
+
 def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit: int) -> list[dict[str, object]]:
     """Return a bounded set of higher-confidence usage examples for a symbol."""
 
     file_rows = connection.execute(
         """
-        SELECT id, moodle_path, absolute_path, extension
+        SELECT id, moodle_path, absolute_path, extension, file_role
         FROM files
         WHERE extension = '.php'
         ORDER BY moodle_path
@@ -776,10 +1003,8 @@ def _find_usage_examples(connection: sqlite3.Connection, row: sqlite3.Row, limit
 def _find_function_usage_examples(row: sqlite3.Row, file_rows: list[sqlite3.Row], limit: int) -> list[dict[str, object]]:
     """Return bounded function-call examples using exact call matching."""
 
-    examples: list[dict[str, object]] = []
+    examples: list[tuple[int, dict[str, object]]] = []
     for file_row in file_rows:
-        if len(examples) >= limit:
-            break
         absolute_path = Path(file_row["absolute_path"])
         try:
             source = absolute_path.read_text(encoding="utf-8", errors="ignore")
@@ -790,27 +1015,28 @@ def _find_function_usage_examples(row: sqlite3.Row, file_rows: list[sqlite3.Row]
                 continue
             if not _function_call_matches(str(row["name"]), line):
                 continue
+            usage_kind = _classify_usage_kind(file_row, "function_call")
+            score = _usage_score(file_row, usage_kind, "high")
             examples.append(
-                {
-                    "file": file_row["moodle_path"],
-                    "line": line_number,
-                    "usage_kind": "function_call",
-                    "confidence": "high",
-                    "snippet": line.strip(),
-                }
+                (
+                    score,
+                    {
+                        "file": file_row["moodle_path"],
+                        "line": line_number,
+                        "usage_kind": usage_kind,
+                        "confidence": "high",
+                        "snippet": line.strip(),
+                    },
+                )
             )
-            if len(examples) >= limit:
-                break
-    return examples
+    return _sorted_usage_examples(examples, limit)
 
 
 def _find_class_usage_examples(row: sqlite3.Row, file_rows: list[sqlite3.Row], limit: int) -> list[dict[str, object]]:
     """Return bounded class-reference examples."""
 
-    examples: list[dict[str, object]] = []
+    examples: list[tuple[int, dict[str, object]]] = []
     for file_row in file_rows:
-        if len(examples) >= limit:
-            break
         absolute_path = Path(file_row["absolute_path"])
         try:
             source = absolute_path.read_text(encoding="utf-8", errors="ignore")
@@ -822,18 +1048,21 @@ def _find_class_usage_examples(row: sqlite3.Row, file_rows: list[sqlite3.Row], l
             usage_kind = _class_usage_kind_for_line(row, line)
             if usage_kind is None:
                 continue
+            classified_kind = _classify_usage_kind(file_row, usage_kind)
+            score = _usage_score(file_row, classified_kind, "high")
             examples.append(
-                {
-                    "file": file_row["moodle_path"],
-                    "line": line_number,
-                    "usage_kind": usage_kind,
-                    "confidence": "high",
-                    "snippet": line.strip(),
-                }
+                (
+                    score,
+                    {
+                        "file": file_row["moodle_path"],
+                        "line": line_number,
+                        "usage_kind": classified_kind,
+                        "confidence": "high",
+                        "snippet": line.strip(),
+                    },
+                )
             )
-            if len(examples) >= limit:
-                break
-    return examples
+    return _sorted_usage_examples(examples, limit)
 
 
 def _find_method_usage_examples(
@@ -844,7 +1073,7 @@ def _find_method_usage_examples(
 ) -> list[dict[str, object]]:
     """Return bounded method usage examples using class-aware matching."""
 
-    examples: list[dict[str, object]] = []
+    examples: list[tuple[int, dict[str, object]]] = []
     seen: set[tuple[str, int, str]] = set()
 
     if row["is_static"]:
@@ -853,13 +1082,9 @@ def _find_method_usage_examples(
             if key in seen:
                 continue
             seen.add(key)
-            examples.append(item)
-            if len(examples) >= limit:
-                return examples
+            examples.append((_usage_score({"moodle_path": item["file"], "file_role": None}, item["usage_kind"], item["confidence"]), item))
 
     for file_row in file_rows:
-        if len(examples) >= limit:
-            break
         absolute_path = Path(file_row["absolute_path"])
         try:
             source = absolute_path.read_text(encoding="utf-8", errors="ignore")
@@ -872,10 +1097,8 @@ def _find_method_usage_examples(
             if key in seen:
                 continue
             seen.add(key)
-            examples.append(item)
-            if len(examples) >= limit:
-                break
-    return examples
+            examples.append((_usage_score(file_row, item["usage_kind"], item["confidence"]), item))
+    return _sorted_usage_examples(examples, limit)
 
 
 def _function_call_matches(function_name: str, line: str) -> bool:
@@ -940,11 +1163,12 @@ def _scan_method_usage_examples_in_source(row: sqlite3.Row, file_row: sqlite3.Ro
 
         if row["is_static"]:
             if _static_call_matches(line, class_candidates, method_name):
+                usage_kind = _classify_usage_kind(file_row, "static_method_call")
                 examples.append(
                     {
                         "file": file_row["moodle_path"],
                         "line": line_number,
-                        "usage_kind": "static_method_call",
+                        "usage_kind": usage_kind,
                         "confidence": "high",
                         "snippet": line.strip(),
                     }
@@ -953,11 +1177,12 @@ def _scan_method_usage_examples_in_source(row: sqlite3.Row, file_row: sqlite3.Ro
 
         direct_call = _direct_new_call_matches(line, class_candidates, method_name)
         if direct_call:
+            usage_kind = _classify_usage_kind(file_row, "instance_method_call")
             examples.append(
                 {
                     "file": file_row["moodle_path"],
                     "line": line_number,
-                    "usage_kind": "instance_method_call",
+                    "usage_kind": usage_kind,
                     "confidence": "high",
                     "snippet": line.strip(),
                 }
@@ -970,11 +1195,12 @@ def _scan_method_usage_examples_in_source(row: sqlite3.Row, file_row: sqlite3.Ro
 
         variable_name = _instance_call_variable(line, method_name)
         if variable_name and variable_types.get(variable_name) in class_candidates:
+            usage_kind = _classify_usage_kind(file_row, "instance_method_call")
             examples.append(
                 {
                     "file": file_row["moodle_path"],
                     "line": line_number,
-                    "usage_kind": "instance_method_call",
+                    "usage_kind": usage_kind,
                     "confidence": "high",
                     "snippet": line.strip(),
                 }
@@ -1045,6 +1271,71 @@ def _typed_parameters_for_line(line: str) -> dict[str, str]:
             continue
         typed_parameters[match.group("var")] = match.group("type").lstrip("?")
     return typed_parameters
+
+
+def _classify_usage_kind(file_row: sqlite3.Row | dict[str, object], base_kind: str) -> str:
+    """Return a more expressive usage kind for a file-context/call combination."""
+
+    moodle_path = str(file_row["moodle_path"])
+    file_role = file_row["file_role"]
+    if base_kind == "service_definition":
+        return "service_definition"
+    if "/tests/" in moodle_path:
+        return "test_usage"
+    if file_role == "renderer_file":
+        return "renderer_usage"
+    if "/classes/form/" in moodle_path or moodle_path.endswith("_form.php"):
+        return "form_usage"
+    return base_kind
+
+
+def _usage_score(file_row: sqlite3.Row | dict[str, object], usage_kind: str, confidence: str) -> int:
+    """Return a stable ranking score for usage examples."""
+
+    moodle_path = str(file_row["moodle_path"])
+    score = {
+        "service_definition": 100,
+        "renderer_usage": 92,
+        "form_usage": 90,
+        "static_method_call": 88,
+        "instance_method_call": 85,
+        "function_call": 82,
+        "test_usage": 76,
+        "class_instantiation": 70,
+        "extends_reference": 66,
+        "implements_reference": 66,
+    }.get(usage_kind, 50)
+    if moodle_path.endswith("/view.php") or moodle_path.endswith("/index.php"):
+        score += 4
+    if confidence == "medium":
+        score -= 10
+    elif confidence == "low":
+        score -= 25
+    return score
+
+
+def _sorted_usage_examples(examples: list[tuple[int, dict[str, object]]], limit: int) -> list[dict[str, object]]:
+    """Return usage examples sorted by score, path, line, and kind."""
+
+    examples.sort(
+        key=lambda item: (
+            -item[0],
+            str(item[1]["file"]),
+            int(item[1]["line"]),
+            str(item[1]["usage_kind"]),
+        )
+    )
+    return [item for _, item in examples[:limit]]
+
+
+def _summarize_usage_examples(examples: list[dict[str, object]]) -> dict[str, int]:
+    """Return a compact usage-kind count summary."""
+
+    summary: dict[str, int] = {}
+    for item in examples:
+        kind = str(item["usage_kind"])
+        summary[kind] = summary.get(kind, 0) + 1
+    return dict(sorted(summary.items()))
 
 
 def _resolve_file_row(

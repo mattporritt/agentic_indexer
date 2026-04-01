@@ -3,7 +3,7 @@ namespace mod_assign\external;
 
 defined('MOODLE_INTERNAL') || die();
 
-class start_submission {
+class start_submission extends \external_api {
     /**
      * Start a submission attempt.
      *
