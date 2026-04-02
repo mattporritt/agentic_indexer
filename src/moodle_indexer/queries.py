@@ -795,11 +795,17 @@ def _method_inheritance_context(connection: sqlite3.Connection, candidate: Defin
 
 
 def _find_method_in_container(connection: sqlite3.Connection, container_name: str, method_name: str) -> sqlite3.Row | None:
-    """Find a method by container name using exact or short-name matching."""
+    """Find a method by container name using exact matches before legacy fallbacks.
+
+    Exact fully-qualified container matches must win over short-name matches so
+    sibling classes such as ``aiprovider_openai\\provider`` and
+    ``aiprovider_awsbedrock\\provider`` cannot be confused when the caller is
+    explicitly walking a real extends/implements chain.
+    """
 
     normalized = str(container_name).lstrip("\\")
     short_name = normalized.split("\\")[-1]
-    return connection.execute(
+    rows = connection.execute(
         """
         SELECT
             s.*,
@@ -818,7 +824,6 @@ def _find_method_in_container(connection: sqlite3.Connection, container_name: st
              OR s.container_name LIKE ? ESCAPE '\\'
           )
         ORDER BY s.fqname
-        LIMIT 1
         """,
         (
             method_name,
@@ -827,7 +832,25 @@ def _find_method_in_container(connection: sqlite3.Connection, container_name: st
             f"%\\{short_name}",
             short_name,
         ),
-    ).fetchone()
+    ).fetchall()
+    ranked: list[tuple[tuple[int, str, int], sqlite3.Row]] = []
+    for row in rows:
+        container = _normalize_php_symbol_name(row["container_name"] or "")
+        if container == normalized:
+            rank = 0
+        elif container.endswith(f"\\{normalized}"):
+            rank = 1
+        elif container == short_name:
+            rank = 2
+        elif container.endswith(f"\\{short_name}"):
+            rank = 3
+        else:
+            continue
+        ranked.append(((rank, row["fqname"], row["line"]), row))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
 
 
 def _find_class_symbol(connection: sqlite3.Connection, class_name: str) -> sqlite3.Row | None:

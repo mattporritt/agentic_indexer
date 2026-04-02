@@ -331,3 +331,21 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     doubled_slash_payload = json.loads(capsys.readouterr().out)
     assert doubled_slash_payload["data"]["total_matches"] == 1
     assert doubled_slash_payload["data"]["matches"][0]["class_name"] == "mod_assign\\external\\start_submission"
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "aiprovider_openai\\provider::get_action_settings",
+        ]
+    )
+    assert exit_code == 0
+    provider_payload = json.loads(capsys.readouterr().out)
+    provider_match = provider_payload["data"]["matches"][0]
+    assert provider_match["inheritance_role"] == "override"
+    assert provider_match["parent_class"] == "core_ai\\provider"
+    assert provider_match["overrides"] == "core_ai\\provider::get_action_settings"
+    assert provider_match["parent_definition"]["fqname"] == "core_ai\\provider::get_action_settings"
+    assert provider_match["overrides_definition"]["fqname"] == "core_ai\\provider::get_action_settings"

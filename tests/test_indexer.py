@@ -451,6 +451,23 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert start_submission_with_doubled_slashes["total_matches"] == 1
         assert start_submission_with_doubled_slashes["matches"][0]["fqname"] == start_submission_match["fqname"]
 
+        base_provider_definition = find_definition(connection, "core_ai\\provider::get_action_settings")
+        assert base_provider_definition["total_matches"] == 1
+        base_provider_match = base_provider_definition["matches"][0]
+        assert base_provider_match["inheritance_role"] == "base_definition"
+        assert base_provider_match["fqname"] == "core_ai\\provider::get_action_settings"
+
+        openai_provider_definition = find_definition(connection, "aiprovider_openai\\provider::get_action_settings")
+        assert openai_provider_definition["total_matches"] == 1
+        openai_provider_match = openai_provider_definition["matches"][0]
+        assert openai_provider_match["inheritance_role"] == "override"
+        assert openai_provider_match["parent_class"] == "core_ai\\provider"
+        assert openai_provider_match["overrides"] == "core_ai\\provider::get_action_settings"
+        assert openai_provider_match["parent_definition"]["fqname"] == "core_ai\\provider::get_action_settings"
+        assert openai_provider_match["overrides_definition"]["fqname"] == "core_ai\\provider::get_action_settings"
+        assert openai_provider_match["parent_definition"]["fqname"] != "aiprovider_awsbedrock\\provider::get_action_settings"
+        assert openai_provider_match["overrides_definition"]["fqname"] != "aiprovider_awsbedrock\\provider::get_action_settings"
+
         ambiguous_execute = find_definition(connection, "execute", symbol_type="method")
         assert ambiguous_execute["total_matches"] >= 2
         assert {
