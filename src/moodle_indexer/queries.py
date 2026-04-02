@@ -28,6 +28,14 @@ class DefinitionCandidate:
     requested_container: str | None = None
 
 
+@dataclass(slots=True)
+class JsDefinitionCandidate:
+    """A matched JavaScript module definition plus its indexed context."""
+
+    row: sqlite3.Row
+    matched_via: str = "direct_definition"
+
+
 def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
     """Return symbol definitions and basic relationships for a name or fqname."""
 
@@ -115,20 +123,33 @@ def find_definition(
 ) -> dict:
     """Return IDE-style definition records for functions, methods, and classes."""
 
-    if "::" in symbol_query:
+    if symbol_type == "js_module":
+        matches = _find_js_module_definitions(connection, symbol_query, limit)
+    elif "::" in symbol_query:
         matches = _find_method_definitions(connection, symbol_query, symbol_type, limit)
     else:
         matches = _find_named_definitions(connection, symbol_query, symbol_type, limit)
+        if not matches and symbol_type == "any" and "/" in symbol_query:
+            matches = _find_js_module_definitions(connection, symbol_query, limit)
 
     results = []
     for candidate in matches[:limit]:
-        payload = _serialize_definition_match(connection, candidate)
-        if include_usages:
-            payload["usage_examples"] = _find_usage_examples(connection, candidate.row, limit=min(5, limit))
-            payload["usage_summary"] = _summarize_usage_examples(payload["usage_examples"])
+        if isinstance(candidate, JsDefinitionCandidate):
+            payload = _serialize_js_definition_match(connection, candidate)
+            if include_usages:
+                payload["usage_examples"] = _find_js_usage_examples(connection, candidate.row, limit=min(5, limit))
+                payload["usage_summary"] = _summarize_usage_examples(payload["usage_examples"])
+            else:
+                payload["usage_examples"] = []
+                payload["usage_summary"] = {}
         else:
-            payload["usage_examples"] = []
-            payload["usage_summary"] = {}
+            payload = _serialize_definition_match(connection, candidate)
+            if include_usages:
+                payload["usage_examples"] = _find_usage_examples(connection, candidate.row, limit=min(5, limit))
+                payload["usage_summary"] = _summarize_usage_examples(payload["usage_examples"])
+            else:
+                payload["usage_examples"] = []
+                payload["usage_summary"] = {}
         results.append(payload)
 
     return {
@@ -235,17 +256,19 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     js_module = connection.execute(
         """
         SELECT
-            id,
-            module_name,
-            export_kind,
-            export_name,
-            superclass_name,
-            superclass_module,
-            resolved_superclass_file,
-            build_file,
-            build_status
+            js_modules.id,
+            js_modules.module_name,
+            f.moodle_path,
+            js_modules.export_kind,
+            js_modules.export_name,
+            js_modules.superclass_name,
+            js_modules.superclass_module,
+            js_modules.resolved_superclass_file,
+            js_modules.build_file,
+            js_modules.build_status
         FROM js_modules
-        WHERE file_id = ?
+        JOIN files f ON f.id = js_modules.file_id
+        WHERE js_modules.file_id = ?
         """,
         (file_id,),
     ).fetchone()
@@ -271,6 +294,25 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     linked_tests = _linked_service_tests(connection, webservices)
     class_references = _linked_class_artifacts(connection, relationships)
     rendering_references = [item for item in class_references if item["artifact_kind"] == "output_class"]
+    service_artifacts = _build_service_linked_artifacts(
+        connection,
+        [
+            {
+                **dict(item),
+                "source_file": moodle_path,
+            }
+            for item in webservices
+        ],
+    )
+    rendering_artifacts = _build_rendering_linked_artifacts(connection, row, class_references)
+    js_navigation = _build_js_navigation_artifacts(connection, js_module, js_imports)
+    entrypoint_links = _build_entrypoint_links(
+        connection,
+        row,
+        service_artifacts,
+        rendering_artifacts,
+        js_navigation,
+    )
 
     related_suggestions = [
         {"path": item.path, "reason": item.reason}
@@ -280,6 +322,12 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
     related_suggestions.extend(_service_test_suggestions(connection, webservices))
     related_suggestions.extend(_class_related_suggestions(class_references))
     related_suggestions.extend(_js_related_suggestions(connection, js_module, js_imports))
+    related_suggestions.extend(
+        [
+            {"path": item["path"], "reason": item["reason"]}
+            for item in entrypoint_links
+        ]
+    )
     related_suggestions = _deduplicate_suggestions(related_suggestions)
 
     return {
@@ -323,6 +371,12 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
         "js_imports": js_imports,
         "class_references": class_references,
         "rendering_references": rendering_references,
+        "linked_artifacts": {
+            "services": service_artifacts,
+            "rendering": rendering_artifacts,
+            "javascript": js_navigation,
+            "entrypoints": entrypoint_links,
+        },
         "relationships": [dict(item) for item in relationships],
         "related_suggestions": related_suggestions,
         "repository_root": repository["repository_root"],
@@ -419,6 +473,48 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
         "SELECT COUNT(*) AS count FROM relationships JOIN files ON files.id = relationships.file_id WHERE files.component_id = ?",
         (component["id"],),
     ).fetchone()["count"]
+    js_modules = connection.execute(
+        """
+        SELECT jm.module_name, f.moodle_path, jm.build_file, jm.export_kind, jm.superclass_module
+        FROM js_modules jm
+        JOIN files f ON f.id = jm.file_id
+        WHERE jm.component_id = ?
+        ORDER BY jm.module_name
+        LIMIT 20
+        """,
+        (component["id"],),
+    ).fetchall()
+    rendering_files = connection.execute(
+        """
+        SELECT moodle_path, file_role
+        FROM files
+        WHERE component_id = ?
+          AND file_role IN ('renderer_file', 'output_class', 'template_file')
+        ORDER BY file_role, moodle_path
+        LIMIT 20
+        """,
+        (component["id"],),
+    ).fetchall()
+    entrypoints = connection.execute(
+        """
+        SELECT moodle_path, file_role
+        FROM files
+        WHERE component_id = ?
+          AND file_role IN (
+              'lib_file',
+              'locallib_file',
+              'settings_file',
+              'services_definition',
+              'renderer_file',
+              'output_class',
+              'template_file',
+              'amd_source'
+          )
+        ORDER BY file_role, moodle_path
+        LIMIT 20
+        """,
+        (component["id"],),
+    ).fetchall()
 
     role_counts: dict[str, int] = {}
     for file_row in files:
@@ -454,8 +550,23 @@ def component_summary(connection: sqlite3.Connection, component_name: str) -> di
         ],
         "language_strings": [{"string_key": item["string_key"], "line": item["line"]} for item in strings],
         "webservices": [dict(item) for item in webservices],
+        "js_modules": [dict(item) for item in js_modules],
         "tests": [dict(item) for item in tests],
         "sample_symbols": [dict(item) for item in symbols],
+        "linked_artifacts": {
+            "service_navigation": _build_service_linked_artifacts(
+                connection,
+                [
+                    {
+                        **dict(item),
+                        "source_file": f"{component['root_path']}/db/services.php",
+                    }
+                    for item in webservices
+                ],
+            ),
+            "rendering_files": [dict(item) for item in rendering_files],
+            "entrypoints": [dict(item) for item in entrypoints],
+        },
     }
 
 
@@ -503,17 +614,19 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
     js_module = connection.execute(
         """
         SELECT
-            id,
-            module_name,
-            export_kind,
-            export_name,
-            superclass_name,
-            superclass_module,
-            resolved_superclass_file,
-            build_file,
-            build_status
+            js_modules.id,
+            js_modules.module_name,
+            f.moodle_path,
+            js_modules.export_kind,
+            js_modules.export_name,
+            js_modules.superclass_name,
+            js_modules.superclass_module,
+            js_modules.resolved_superclass_file,
+            js_modules.build_file,
+            js_modules.build_status
         FROM js_modules
-        WHERE file_id = ?
+        JOIN files f ON f.id = js_modules.file_id
+        WHERE js_modules.file_id = ?
         """,
         (row["id"],),
     ).fetchone()
@@ -529,12 +642,48 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
             (js_module["id"],),
         ).fetchall()
         js_imports = [_serialize_js_import(connection, item) for item in raw_js_imports]
+    class_references = _linked_class_artifacts(connection, rendering_relationships)
+    service_artifacts = _build_service_linked_artifacts(
+        connection,
+        [
+            {
+                **dict(item),
+                "source_file": moodle_path,
+            }
+            for item in webservices
+        ],
+    )
+    rendering_artifacts = _build_rendering_linked_artifacts(connection, row, class_references)
+    js_navigation = _build_js_navigation_artifacts(connection, js_module, js_imports)
+    entrypoint_links = _build_entrypoint_links(
+        connection,
+        row,
+        service_artifacts,
+        rendering_artifacts,
+        js_navigation,
+    )
     suggestions.extend(_indexed_js_suggestions(connection, js_module, js_imports))
+    suggestions.extend(
+        [
+            {
+                "path": item["path"],
+                "reason": item["reason"],
+                "indexed": bool(item["indexed"]),
+            }
+            for item in entrypoint_links
+        ]
+    )
     suggestions = _deduplicate_indexed_suggestions(suggestions)
     return {
         "file": moodle_path,
         "repository_relative_path": row["repository_relative_path"],
         "moodle_path": moodle_path,
+        "linked_artifacts": {
+            "services": service_artifacts,
+            "rendering": rendering_artifacts,
+            "javascript": js_navigation,
+            "entrypoints": entrypoint_links,
+        },
         "suggestions": suggestions,
     }
 
@@ -581,6 +730,50 @@ def _find_named_definitions(
         tuple(parameters),
     ).fetchall()
     return [DefinitionCandidate(row=item) for item in rows]
+
+
+def _find_js_module_definitions(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    limit: int,
+) -> list[JsDefinitionCandidate]:
+    """Return JS module definitions for Moodle AMD source module queries."""
+
+    rows = connection.execute(
+        """
+        SELECT
+            jm.*,
+            f.repository_relative_path,
+            f.moodle_path,
+            f.file_role,
+            c.name AS component_name
+        FROM js_modules jm
+        JOIN files f ON f.id = jm.file_id
+        JOIN components c ON c.id = jm.component_id
+        WHERE jm.module_name = ?
+           OR f.moodle_path = ?
+           OR jm.build_file = ?
+        ORDER BY
+            CASE
+                WHEN jm.module_name = ? THEN 0
+                WHEN f.moodle_path = ? THEN 1
+                WHEN jm.build_file = ? THEN 2
+                ELSE 3
+            END,
+            jm.module_name
+        LIMIT ?
+        """,
+        (
+            symbol_query,
+            symbol_query,
+            symbol_query,
+            symbol_query,
+            symbol_query,
+            symbol_query,
+            limit,
+        ),
+    ).fetchall()
+    return [JsDefinitionCandidate(row=item) for item in rows]
 
 
 def _find_method_definitions(
@@ -703,6 +896,68 @@ def _serialize_definition_match(connection: sqlite3.Connection, candidate: Defin
         "overrides_definition": inheritance.get("overrides_definition"),
         "implements_definitions": inheritance.get("implements_definitions", []),
         "child_overrides": inheritance.get("child_overrides", []),
+    }
+
+
+def _serialize_js_definition_match(connection: sqlite3.Connection, candidate: JsDefinitionCandidate) -> dict:
+    """Return an IDE-style definition payload for one indexed JS module."""
+
+    row = candidate.row
+    imports = connection.execute(
+        """
+        SELECT module_name, line, import_kind, imported_name, local_name, resolved_target_file, resolution_status
+        FROM js_imports
+        WHERE js_module_id = ?
+        ORDER BY line, module_name, local_name
+        """,
+        (row["id"],),
+    ).fetchall()
+    js_imports = [_serialize_js_import(connection, item) for item in imports]
+    js_navigation = _build_js_navigation_artifacts(connection, row, js_imports)
+    return {
+        "symbol_type": "js_module",
+        "name": row["module_name"].split("/", 1)[-1],
+        "fqname": row["module_name"],
+        "module_name": row["module_name"],
+        "component": row["component_name"],
+        "file": row["moodle_path"],
+        "repository_relative_path": row["repository_relative_path"],
+        "line": 1,
+        "namespace": None,
+        "class_name": None,
+        "signature": None,
+        "parameters": [],
+        "return_type": None,
+        "docblock_summary": None,
+        "docblock_tags": [],
+        "visibility": None,
+        "is_static": False,
+        "is_final": False,
+        "is_abstract": False,
+        "matched_via": candidate.matched_via,
+        "requested_class_name": None,
+        "inheritance_role": "base_definition" if not row["superclass_module"] else "override",
+        "overrides": row["superclass_module"],
+        "implements_method": [],
+        "parent_class": row["superclass_module"],
+        "interface_names": [],
+        "parent_definition": js_navigation.get("superclass"),
+        "overrides_definition": js_navigation.get("superclass"),
+        "implements_definitions": [],
+        "child_overrides": js_navigation.get("imported_by", []),
+        "export_kind": row["export_kind"],
+        "export_name": row["export_name"],
+        "superclass_name": row["superclass_name"],
+        "superclass_module": row["superclass_module"],
+        "resolved_superclass_file": js_navigation.get("superclass", {}).get("file")
+        if js_navigation.get("superclass")
+        else row["resolved_superclass_file"],
+        "build_file": row["build_file"],
+        "build_status": row["build_status"],
+        "imports": js_imports,
+        "linked_artifacts": {
+            "javascript": js_navigation,
+        },
     }
 
 
@@ -1671,6 +1926,135 @@ def _indexed_class_suggestions(
     return suggestions
 
 
+def _build_rendering_linked_artifacts(
+    connection: sqlite3.Connection,
+    file_row: sqlite3.Row,
+    class_references: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return bounded rendering/navigation chains for one file."""
+
+    moodle_path = str(file_row["moodle_path"])
+    file_role = str(file_row["file_role"])
+    component_root = _component_root_for_file(connection, moodle_path)
+    artifacts: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_artifact(path: str, artifact_type: str, reason: str, class_name: str | None = None) -> None:
+        key = (artifact_type, path)
+        if key in seen:
+            return
+        seen.add(key)
+        indexed = bool(
+            connection.execute(
+                "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+                (path, path),
+            ).fetchone()
+        )
+        artifacts.append(
+            {
+                "artifact_type": artifact_type,
+                "path": path,
+                "class_name": class_name,
+                "indexed": indexed,
+                "reason": reason,
+            }
+        )
+
+    for item in class_references:
+        target_path = str(item["resolved_target_file"])
+        add_artifact(target_path, str(item["artifact_kind"]), _class_artifact_reason(item), str(item["class_name"]))
+        for template_path in item["template_files"]:
+            add_artifact(
+                template_path,
+                "template_file",
+                (
+                    f"suggested because output class \\{item['class_name']} likely renders "
+                    "through this Mustache template"
+                ),
+                str(item["class_name"]),
+            )
+        if component_root:
+            renderer_path = f"{component_root}/renderer.php"
+            if target_path != renderer_path:
+                add_artifact(
+                    renderer_path,
+                    "renderer_file",
+                    "suggested because this component renderer often coordinates output classes and templates",
+                )
+
+    if file_role == "output_class" and component_root:
+        template_path = _template_for_output_file(moodle_path)
+        if template_path:
+            add_artifact(
+                template_path,
+                "template_file",
+                "suggested because this output class likely renders through this Mustache template",
+            )
+        add_artifact(
+            f"{component_root}/renderer.php",
+            "renderer_file",
+            "suggested because this component renderer commonly instantiates or renders this output class",
+        )
+
+    if file_role == "template_file" and component_root:
+        output_path = _output_file_for_template(moodle_path)
+        if output_path:
+            add_artifact(
+                output_path,
+                "output_class",
+                "suggested because this Mustache template likely pairs with this output class",
+            )
+        add_artifact(
+            f"{component_root}/renderer.php",
+            "renderer_file",
+            "suggested because this component renderer commonly renders this Mustache template",
+        )
+
+    if file_role == "renderer_file":
+        output_rows = connection.execute(
+            """
+            SELECT moodle_path
+            FROM files
+            WHERE component_id = (
+                SELECT component_id
+                FROM files
+                WHERE id = ?
+            )
+              AND file_role IN ('output_class', 'template_file')
+            ORDER BY moodle_path
+            LIMIT 6
+            """,
+            (file_row["id"],),
+        ).fetchall()
+        for item in output_rows:
+            artifact_type = "template_file" if str(item["moodle_path"]).endswith(".mustache") else "output_class"
+            add_artifact(
+                str(item["moodle_path"]),
+                artifact_type,
+                "suggested because this renderer is closely coupled to these rendering artifacts",
+            )
+
+    return artifacts
+
+
+def _template_for_output_file(output_file: str) -> str | None:
+    """Return the paired Mustache template path for one output class file."""
+
+    if "/classes/output/" not in output_file:
+        return None
+    component_root, suffix = output_file.split("/classes/output/", 1)
+    return f"{component_root}/templates/{suffix.removesuffix('.php')}.mustache"
+
+
+def _output_file_for_template(template_file: str) -> str | None:
+    """Return the paired output class path for one Mustache template."""
+
+    if "/templates/" not in template_file or not template_file.endswith(".mustache"):
+        return None
+    component_root, suffix = template_file.split("/templates/", 1)
+    return f"{component_root}/classes/output/{suffix.removesuffix('.mustache')}.php"
+
+
 def _linked_service_tests(
     connection: sqlite3.Connection,
     webservices: list[sqlite3.Row],
@@ -1701,6 +2085,52 @@ def _linked_service_tests(
             }
         )
     return _deduplicate_tests(linked)
+
+
+def _build_service_linked_artifacts(
+    connection: sqlite3.Connection,
+    webservices: list[sqlite3.Row],
+) -> list[dict[str, object]]:
+    """Return bounded service-definition navigation chains."""
+
+    artifacts: list[dict[str, object]] = []
+    for item in webservices:
+        target_file = item["resolved_target_file"]
+        linked_tests: list[dict[str, str]] = []
+        if target_file:
+            linked_tests = _service_tests_for_definition(connection, item)
+        artifacts.append(
+            {
+                "service_name": item["service_name"],
+                "resolution_type": item["resolution_type"],
+                "resolution_status": item.get("resolution_status", "resolved"),
+                "source_file": item.get("source_file"),
+                "implementation_file": target_file,
+                "classname": item["classname"],
+                "classpath": item["classpath"],
+                "methodname": item.get("methodname"),
+                "related_tests": linked_tests,
+            }
+        )
+    return artifacts
+
+
+def _service_tests_for_definition(
+    connection: sqlite3.Connection,
+    webservice: sqlite3.Row | dict[str, object],
+) -> list[dict[str, str]]:
+    """Return likely tests for one resolved service definition."""
+
+    candidates = _service_test_candidates([webservice])
+    linked: list[dict[str, str]] = []
+    for item in candidates:
+        exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (item["path"], item["path"]),
+        ).fetchone()
+        if exists:
+            linked.append({"file": item["path"], "reason": item["reason"]})
+    return linked
 
 
 def _service_test_candidates(webservices: list[sqlite3.Row]) -> list[dict[str, str]]:
@@ -1875,6 +2305,151 @@ def _serialize_js_module(js_module: sqlite3.Row | None, connection: sqlite3.Conn
     }
 
 
+def _build_js_navigation_artifacts(
+    connection: sqlite3.Connection,
+    js_module: sqlite3.Row | None,
+    js_imports: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """Return a bounded JS navigation chain for one indexed module."""
+
+    if js_module is None:
+        return None
+    imported_by_rows = connection.execute(
+        """
+        SELECT
+            importer.module_name AS importer_module,
+            f.moodle_path AS file,
+            ji.line,
+            ji.import_kind
+        FROM js_imports ji
+        JOIN js_modules importer ON importer.id = ji.js_module_id
+        JOIN files f ON f.id = importer.file_id
+        WHERE ji.module_name = ?
+        ORDER BY f.moodle_path, ji.line, importer.module_name
+        LIMIT 5
+        """,
+        (js_module["module_name"],),
+    ).fetchall()
+    superclass = None
+    if js_module["superclass_module"]:
+        superclass_resolution = resolve_js_module(connection, js_module["superclass_module"])
+        if superclass_resolution.source_file:
+            superclass = {
+                "module_name": js_module["superclass_module"],
+                "class_name": js_module["superclass_name"],
+                "file": superclass_resolution.source_file,
+                "build_file": superclass_resolution.build_file,
+                "reason": (
+                    f"suggested because this source module extends {js_module['superclass_name']} "
+                    f"from {js_module['superclass_module']}"
+                ),
+            }
+    build_artifact = None
+    if js_module["build_file"]:
+        build_artifact = {
+            "path": js_module["build_file"],
+            "reason": "built artifact generated from the AMD source module",
+        }
+    return {
+        "module_name": js_module["module_name"],
+        "source_file": js_module["moodle_path"],
+        "build_artifact": build_artifact,
+        "superclass": superclass,
+        "imports": [
+            {
+                "module_name": item["module_name"],
+                "file": item["resolved_target_file"],
+                "build_file": item["build_file"],
+                "import_kind": item["import_kind"],
+                "imported_name": item["imported_name"],
+                "local_name": item["local_name"],
+                "resolution_status": item["resolution_status"],
+                "resolution_strategy": item["resolution_strategy"],
+            }
+            for item in js_imports
+        ],
+        "imported_by": [
+            {
+                "module_name": item["importer_module"],
+                "file": item["file"],
+                "line": item["line"],
+                "usage_kind": "js_import_usage",
+                "reason": f"suggested because this module imports {js_module['module_name']}",
+            }
+            for item in imported_by_rows
+        ],
+    }
+
+
+def _find_js_usage_examples(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded high-confidence usage examples for one JS module."""
+
+    examples: list[tuple[int, dict[str, object]]] = []
+    import_rows = connection.execute(
+        """
+        SELECT
+            importer.module_name AS importer_module,
+            f.moodle_path AS file,
+            ji.line
+        FROM js_imports ji
+        JOIN js_modules importer ON importer.id = ji.js_module_id
+        JOIN files f ON f.id = importer.file_id
+        WHERE ji.module_name = ?
+        ORDER BY f.moodle_path, ji.line, importer.module_name
+        LIMIT 10
+        """,
+        (row["module_name"],),
+    ).fetchall()
+    for item in import_rows:
+        usage_kind = "js_import_usage"
+        if row["module_name"] == row["superclass_module"]:
+            usage_kind = "js_superclass_usage"
+        examples.append(
+            (
+                90,
+                {
+                    "file": item["file"],
+                    "line": item["line"],
+                    "usage_kind": usage_kind,
+                    "confidence": "high",
+                    "snippet": item["importer_module"],
+                },
+            )
+        )
+    superclass_rows = connection.execute(
+        """
+        SELECT
+            jm.module_name,
+            f.moodle_path,
+            1 AS line
+        FROM js_modules jm
+        JOIN files f ON f.id = jm.file_id
+        WHERE jm.superclass_module = ?
+        ORDER BY f.moodle_path, jm.module_name
+        LIMIT 10
+        """,
+        (row["module_name"],),
+    ).fetchall()
+    for item in superclass_rows:
+        examples.append(
+            (
+                95,
+                {
+                    "file": item["moodle_path"],
+                    "line": item["line"],
+                    "usage_kind": "js_superclass_usage",
+                    "confidence": "high",
+                    "snippet": item["module_name"],
+                },
+            )
+        )
+    return _sorted_usage_examples(examples, limit)
+
+
 def _serialize_js_import(connection: sqlite3.Connection, js_import: sqlite3.Row) -> dict[str, object]:
     """Return a JSON-friendly JS import payload using registry-first resolution."""
 
@@ -1891,6 +2466,109 @@ def _serialize_js_import(connection: sqlite3.Connection, js_import: sqlite3.Row)
         "resolution_strategy": resolution.resolution_strategy,
         "is_external": resolution.is_external,
     }
+
+
+def _component_root_for_file(connection: sqlite3.Connection, moodle_path: str) -> str | None:
+    """Return the component root path for one indexed file path."""
+
+    row = connection.execute(
+        """
+        SELECT c.root_path
+        FROM files f
+        JOIN components c ON c.id = f.component_id
+        WHERE f.moodle_path = ? OR f.repository_relative_path = ?
+        ORDER BY CASE WHEN f.moodle_path = ? THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        (moodle_path, moodle_path, moodle_path),
+    ).fetchone()
+    return str(row["root_path"]) if row is not None else None
+
+
+def _build_entrypoint_links(
+    connection: sqlite3.Connection,
+    file_row: sqlite3.Row,
+    service_artifacts: list[dict[str, object]],
+    rendering_artifacts: list[dict[str, object]],
+    js_navigation: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    """Return bounded, workflow-oriented entrypoint links for one file."""
+
+    moodle_path = str(file_row["moodle_path"])
+    file_role = str(file_row["file_role"])
+    entrypoints: list[dict[str, object]] = []
+
+    def add_link(path: str, artifact_type: str, reason: str) -> None:
+        if any(item["path"] == path for item in entrypoints):
+            return
+        indexed = bool(
+            connection.execute(
+                "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+                (path, path),
+            ).fetchone()
+        )
+        entrypoints.append(
+            {
+                "path": path,
+                "artifact_type": artifact_type,
+                "indexed": indexed,
+                "reason": reason,
+            }
+        )
+
+    if file_role == "settings_file":
+        add_link(
+            "lib/adminlib.php",
+            "framework_base",
+            "suggested because settings.php uses Moodle admin settings APIs defined in lib/adminlib.php",
+        )
+    if file_role == "services_definition":
+        for item in service_artifacts:
+            if item["implementation_file"]:
+                add_link(
+                    str(item["implementation_file"]),
+                    "service_implementation",
+                    f"suggested because service {item['service_name']} resolves to this implementation file",
+                )
+            for test in item["related_tests"]:
+                add_link(
+                    str(test["file"]),
+                    "service_test",
+                    str(test["reason"]),
+                )
+    if file_role in {"lib_file", "locallib_file", "renderer_file", "output_class", "template_file"}:
+        for item in rendering_artifacts[:6]:
+            add_link(str(item["path"]), str(item["artifact_type"]), str(item["reason"]))
+    if file_role == "amd_source" and js_navigation is not None:
+        for item in js_navigation["imports"][:5]:
+            if item["file"]:
+                add_link(
+                    str(item["file"]),
+                    "js_import",
+                    f"suggested because this source module imports {item['module_name']}",
+                )
+        if js_navigation.get("superclass") and js_navigation["superclass"]["file"]:
+            add_link(
+                str(js_navigation["superclass"]["file"]),
+                "js_superclass",
+                str(js_navigation["superclass"]["reason"]),
+            )
+        if js_navigation.get("build_artifact"):
+            add_link(
+                str(js_navigation["build_artifact"]["path"]),
+                "js_build_artifact",
+                str(js_navigation["build_artifact"]["reason"]),
+            )
+
+    if moodle_path.endswith("/db/services.php"):
+        for item in service_artifacts:
+            if item["implementation_file"]:
+                add_link(
+                    str(item["implementation_file"]),
+                    "service_implementation",
+                    f"suggested because db/services.php registers {item['service_name']} here",
+                )
+    return entrypoints
 
 
 def _js_related_suggestions(

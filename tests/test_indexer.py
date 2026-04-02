@@ -544,6 +544,19 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         }
         assert service_resolution_types["mod_assign_submit_grading_form"] == "classpath"
         assert service_resolution_types["mod_assign_start_submission"] == "classname"
+        assert "mod_assign_start_submission" in {
+            item["service_name"] for item in assign_summary["linked_artifacts"]["service_navigation"]
+        }
+        assert {
+            item["moodle_path"] for item in assign_summary["linked_artifacts"]["rendering_files"]
+        } >= {
+            "mod/assign/renderer.php",
+            "mod/assign/classes/output/grading_app.php",
+            "mod/assign/templates/grading_app.mustache",
+        }
+        assert "core_ai/aiprovider_action_management_table" in {
+            item["module_name"] for item in component_summary(connection, "core_ai")["js_modules"]
+        }
 
         services_context = file_context(connection, "mod/assign/db/services.php")
         assert {item["service_name"] for item in services_context["webservices"]} == {
@@ -577,6 +590,18 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/classes/external/start_submission.php" in service_related_paths
         assert "mod/assign/tests/external/start_submission_test.php" in service_related_paths
         assert "mod/assign/tests/externallib_test.php" in service_related_paths
+        assert {
+            item["implementation_file"] for item in services_context["linked_artifacts"]["services"]
+        } >= {
+            "mod/assign/externallib.php",
+            "mod/assign/classes/external/start_submission.php",
+        }
+        service_chain = {
+            item["service_name"]: item for item in services_context["linked_artifacts"]["services"]
+        }
+        assert {
+            item["file"] for item in service_chain["mod_assign_start_submission"]["related_tests"]
+        } == {"mod/assign/tests/external/start_submission_test.php"}
 
         assign_related = suggest_related(connection, "mod/assign/db/services.php")
         assign_suggestions = {item["path"]: item for item in assign_related["suggestions"]}
@@ -599,6 +624,9 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "shared web service test coverage" in assign_suggestions[
             "mod/assign/tests/externallib_advanced_testcase.php"
         ]["reason"]
+        assert "mod_assign_start_submission" in {
+            item["service_name"] for item in assign_related["linked_artifacts"]["services"]
+        }
 
         locallib_context = file_context(connection, "mod/assign/locallib.php")
         assert {
@@ -609,10 +637,17 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         rendering_reference = locallib_context["rendering_references"][0]
         assert rendering_reference["resolved_target_file"] == "mod/assign/classes/output/grading_app.php"
         assert rendering_reference["template_files"] == ["mod/assign/templates/grading_app.mustache"]
+        rendering_chain_paths = {
+            item["path"] for item in locallib_context["linked_artifacts"]["rendering"]
+        }
+        assert "mod/assign/classes/output/grading_app.php" in rendering_chain_paths
+        assert "mod/assign/templates/grading_app.mustache" in rendering_chain_paths
+        assert "mod/assign/renderer.php" in rendering_chain_paths
 
         locallib_related_paths = {item["path"] for item in locallib_context["related_suggestions"]}
         assert "mod/assign/classes/output/grading_app.php" in locallib_related_paths
         assert "mod/assign/templates/grading_app.mustache" in locallib_related_paths
+        assert "mod/assign/renderer.php" in locallib_related_paths
 
         locallib_related = suggest_related(connection, "mod/assign/locallib.php")
         locallib_suggestions = {item["path"]: item for item in locallib_related["suggestions"]}
@@ -624,6 +659,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "Mustache template" in locallib_suggestions[
             "mod/assign/templates/grading_app.mustache"
         ]["reason"]
+        assert "mod/assign/renderer.php" in locallib_suggestions
 
         related_result = suggest_related(connection, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
@@ -707,6 +743,16 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "imports core_ai/local_actions" in js_suggestions["ai/amd/src/local_actions.js"]["reason"]
         assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_suggestions
         assert "built artifact" in js_suggestions["ai/amd/build/aiprovider_action_management_table.min.js"]["reason"]
+        assert js_related["linked_artifacts"]["javascript"]["build_artifact"]["path"] == (
+            "ai/amd/build/aiprovider_action_management_table.min.js"
+        )
+        assert {
+            item["file"] for item in js_related["linked_artifacts"]["javascript"]["imports"] if item["file"]
+        } >= {
+            "admin/amd/src/plugin_management_table.js",
+            "lib/amd/src/ajax.js",
+            "ai/amd/src/local_actions.js",
+        }
 
         legacy_js_context = file_context(connection, "mod/forum/amd/src/forum.js")
         assert legacy_js_context["js_module"]["module_name"] == "mod_forum/forum"
@@ -733,6 +779,30 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "imports mod_forum/repository" in legacy_suggestions["mod/forum/amd/src/repository.js"]["reason"]
         assert "mod/forum/amd/build/forum.min.js" in legacy_suggestions
         assert "built artifact" in legacy_suggestions["mod/forum/amd/build/forum.min.js"]["reason"]
+
+        js_definition = find_definition(connection, "core/ajax", symbol_type="js_module")
+        assert js_definition["total_matches"] == 1
+        js_definition_match = js_definition["matches"][0]
+        assert js_definition_match["symbol_type"] == "js_module"
+        assert js_definition_match["module_name"] == "core/ajax"
+        assert js_definition_match["file"] == "lib/amd/src/ajax.js"
+        assert js_definition_match["build_file"] == "lib/amd/build/ajax.min.js"
+        assert {
+            item["file"] for item in js_definition_match["usage_examples"]
+        } >= {
+            "ai/amd/src/aiprovider_action_management_table.js",
+            "mod/forum/amd/src/forum.js",
+        }
+        assert js_definition_match["usage_summary"]["js_import_usage"] >= 2
+
+        ai_js_definition = find_definition(connection, "core_ai/aiprovider_action_management_table")
+        assert ai_js_definition["total_matches"] == 1
+        ai_js_match = ai_js_definition["matches"][0]
+        assert ai_js_match["module_name"] == "core_ai/aiprovider_action_management_table"
+        assert ai_js_match["resolved_superclass_file"] == "admin/amd/src/plugin_management_table.js"
+        assert ai_js_match["linked_artifacts"]["javascript"]["build_artifact"]["path"] == (
+            "ai/amd/build/aiprovider_action_management_table.min.js"
+        )
     finally:
         connection.close()
 

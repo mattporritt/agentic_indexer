@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     definition_parser.add_argument("--symbol", required=True, help="Function, class, or method query such as get_string or assign::view.")
     definition_parser.add_argument(
         "--type",
-        choices=["any", "function", "method", "class", "interface", "trait"],
+        choices=["any", "function", "method", "class", "interface", "trait", "js_module"],
         default="any",
         help="Optional symbol-type filter.",
     )

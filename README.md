@@ -52,9 +52,10 @@ This tool builds a compact local index so those questions become cheap and machi
 - JavaScript import/dependency extraction for both modern ES module syntax and older Moodle `define([...])` AMD modules
 - source/build awareness for `amd/src/*.js` and `amd/build/*.min.js`
 - service-aware suggestions that link `db/services.php` to implementation files and likely PHPUnit coverage
+- coherent linked-artifact navigation across service definitions, rendering artifacts, and Moodle AMD source modules
 - PHPUnit and Behat discovery
 - related-file suggestions with explanation strings
-- IDE-like definition lookup with signatures, modifiers, docblocks, inheritance hints, and bounded usage examples
+- IDE-like definition lookup for PHP symbols and Moodle JS modules, with signatures, modifiers, docblocks, inheritance hints, and bounded usage examples
 - JSON CLI commands for indexing and querying
 
 ## What Phase 1 Does Not Include
@@ -115,6 +116,7 @@ Phase 1 intentionally mixes a few different sources of truth:
   - PHP class references and instantiations can resolve companion files for Moodle output classes and plugin form classes
   - form classes extending `moodleform` suggest the core base implementation in `lib/formslib.php`
   - `amd/src/*.js` files surface resolved imported module source files and related `amd/build/*.min.js` artifacts
+  - file-context and suggest-related now group service, rendering, JavaScript, and entrypoint links into explicit `linked_artifacts` sections
 
 Current JavaScript support is intentionally Moodle-specific rather than a
 generic JS graph. Phase 1 supports:
@@ -260,6 +262,15 @@ moodle-indexer find-definition \
   --symbol get_string
 ```
 
+JavaScript module lookups use the same command:
+
+```bash
+moodle-indexer find-definition \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol core/ajax \
+  --type js_module
+```
+
 Method lookups support both short and fully qualified forms:
 
 ```bash
@@ -314,7 +325,7 @@ python -m moodle_indexer --help
 ```
 
 `find-definition` is designed to feel more like an IDE “go to definition” view.
-For supported PHP functions, classes, and methods it returns:
+For supported PHP functions, classes, methods, and Moodle AMD source modules it returns:
 
 - file, line, component, namespace, and owning class
 - signature, parameters, defaults, and return type where available
@@ -323,6 +334,8 @@ For supported PHP functions, classes, and methods it returns:
 - inheritance/navigation context such as `inheritance_role`,
   `parent_definition`, `overrides_definition`, `implements_definitions`, and a
   bounded `child_overrides` list where available
+- for JS modules: canonical source file, build artifact, import metadata,
+  superclass module/file, and reverse import examples where available
 - a small number of ranked usage examples plus a compact `usage_summary`
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
@@ -333,13 +346,21 @@ do so without becoming misleading.
 
 Usage examples also include a `usage_kind` and `confidence` field so callers can
 distinguish between, for example, a `service_definition`, `test_usage`,
-`renderer_usage`, `static_method_call`, or `instance_method_call`.
+`renderer_usage`, `static_method_call`, `instance_method_call`, or
+`js_import_usage`.
 
 Ambiguity is explicit. If a short query such as `execute` matches multiple
 methods, the command returns multiple distinguishable matches instead of
 pretending there is only one.
 
-`file-context` surfaces the indexed data already known for a file without becoming a dump of the whole database:
+`file-context` surfaces the indexed data already known for a file without becoming a dump of the whole database. In addition to raw extracted records, it now includes bounded `linked_artifacts` chains for:
+
+- services: `db/services.php` -> implementation -> likely tests
+- rendering: output class <-> renderer <-> Mustache template links
+- JavaScript: source module -> imports -> superclass -> build artifact
+- entrypoints: high-value Moodle workflow files such as `settings.php`, `locallib.php`, `externallib.php`, and `amd/src/*.js`
+
+Example:
 
 ```json
 {

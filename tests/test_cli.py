@@ -349,3 +349,28 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert provider_match["overrides"] == "core_ai\\provider::get_action_settings"
     assert provider_match["parent_definition"]["fqname"] == "core_ai\\provider::get_action_settings"
     assert provider_match["overrides_definition"]["fqname"] == "core_ai\\provider::get_action_settings"
+
+    exit_code = main(
+        [
+            "find-definition",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "core/ajax",
+            "--type",
+            "js_module",
+        ]
+    )
+    assert exit_code == 0
+    js_payload = json.loads(capsys.readouterr().out)
+    js_match = js_payload["data"]["matches"][0]
+    assert js_match["symbol_type"] == "js_module"
+    assert js_match["module_name"] == "core/ajax"
+    assert js_match["file"] == "lib/amd/src/ajax.js"
+    assert js_match["build_file"] == "lib/amd/build/ajax.min.js"
+    assert {
+        item["file"] for item in js_match["usage_examples"]
+    } >= {
+        "ai/amd/src/aiprovider_action_management_table.js",
+        "mod/forum/amd/src/forum.js",
+    }
