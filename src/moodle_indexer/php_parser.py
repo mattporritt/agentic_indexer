@@ -505,7 +505,8 @@ def _normalize_parameter_signature(raw_params: str | None) -> str:
 
     if not raw_params:
         return ""
-    return ", ".join(part.strip() for part in _split_parameters(raw_params))
+    normalized = ", ".join(part.strip() for part in _split_parameters(raw_params))
+    return normalized.rstrip(", ").strip()
 
 
 def _parse_parameters(raw_params: str | None) -> list[dict[str, str | None]]:

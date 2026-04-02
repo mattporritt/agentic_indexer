@@ -9,3 +9,4 @@ build/
 .DS_Store
 .db/
 .idea/
+validation_runs/
