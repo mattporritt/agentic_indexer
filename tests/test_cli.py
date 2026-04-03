@@ -287,7 +287,8 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     )
     assert exit_code == 0
     execute_payload = json.loads(capsys.readouterr().out)
-    assert execute_payload["data"]["matches"][0]["usage_examples"] == [
+    execute_match = execute_payload["data"]["matches"][0]
+    assert execute_match["usage_examples"] == [
         {
             "file": "mod/assign/db/services.php",
             "line": 13,
@@ -303,6 +304,10 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
             "snippet": "start_submission::execute(1, false);",
         },
     ]
+    assert execute_match["linked_artifacts"]["services"][0]["service_name"] == "mod_assign_start_submission"
+    assert execute_match["linked_artifacts"]["services"][0]["implementation_file"] == (
+        "mod/assign/classes/external/start_submission.php"
+    )
 
     exit_code = main(
         [
@@ -368,6 +373,7 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert js_match["module_name"] == "core/ajax"
     assert js_match["file"] == "lib/amd/src/ajax.js"
     assert js_match["build_file"] == "lib/amd/build/ajax.min.js"
+    assert js_match["linked_artifacts"]["javascript"]["build_artifact"]["path"] == "lib/amd/build/ajax.min.js"
     assert {
         item["file"] for item in js_match["usage_examples"]
     } >= {

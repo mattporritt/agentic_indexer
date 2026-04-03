@@ -708,6 +708,7 @@ def _find_named_definitions(
             s.*,
             f.repository_relative_path,
             f.moodle_path,
+            f.file_role,
             f.absolute_path,
             c.name AS component_name
         FROM symbols s
@@ -794,6 +795,7 @@ def _find_method_definitions(
             s.*,
             f.repository_relative_path,
             f.moodle_path,
+            f.file_role,
             f.absolute_path,
             c.name AS component_name
         FROM symbols s
@@ -866,6 +868,7 @@ def _serialize_definition_match(connection: sqlite3.Connection, candidate: Defin
         if row["symbol_type"] == "method"
         else {}
     )
+    linked_artifacts = _build_definition_linked_artifacts(connection, row)
     return {
         "symbol_type": row["symbol_type"],
         "name": row["name"],
@@ -896,6 +899,7 @@ def _serialize_definition_match(connection: sqlite3.Connection, candidate: Defin
         "overrides_definition": inheritance.get("overrides_definition"),
         "implements_definitions": inheritance.get("implements_definitions", []),
         "child_overrides": inheritance.get("child_overrides", []),
+        "linked_artifacts": linked_artifacts,
     }
 
 
@@ -958,6 +962,40 @@ def _serialize_js_definition_match(connection: sqlite3.Connection, candidate: Js
         "linked_artifacts": {
             "javascript": js_navigation,
         },
+    }
+
+
+def _build_definition_linked_artifacts(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, object]:
+    """Return bounded linked artifacts for one definition's owning file."""
+
+    file_row = {
+        "id": row["file_id"],
+        "moodle_path": row["moodle_path"],
+        "file_role": row["file_role"],
+    }
+    relationships = connection.execute(
+        """
+        SELECT source_fqname, target_name, relationship_type, line
+        FROM relationships
+        WHERE file_id = ?
+        ORDER BY line, relationship_type, source_fqname, target_name
+        """,
+        (row["file_id"],),
+    ).fetchall()
+    class_references = _linked_class_artifacts(connection, relationships)
+    rendering_artifacts = _build_rendering_linked_artifacts(connection, file_row, class_references)
+    service_artifacts = _service_artifacts_for_definition_file(connection, row["file_id"], row["moodle_path"])
+    entrypoint_links = _build_entrypoint_links(
+        connection,
+        file_row,
+        service_artifacts,
+        rendering_artifacts,
+        None,
+    )
+    return {
+        "services": service_artifacts,
+        "rendering": rendering_artifacts,
+        "entrypoints": entrypoint_links,
     }
 
 
@@ -1066,6 +1104,7 @@ def _find_method_in_container(connection: sqlite3.Connection, container_name: st
             s.*,
             f.repository_relative_path,
             f.moodle_path,
+            f.file_role,
             c.name AS component_name
         FROM symbols s
         JOIN files f ON f.id = s.file_id
@@ -2197,6 +2236,72 @@ def _build_service_linked_artifacts(
             }
         )
     return artifacts
+
+
+def _service_artifacts_for_definition_file(
+    connection: sqlite3.Connection,
+    file_id: int,
+    moodle_path: str,
+) -> list[dict[str, object]]:
+    """Return service navigation touching one definition file.
+
+    This keeps ``find-definition`` coherent with file-level navigation by
+    including both direct ``db/services.php`` rows and reverse links from a
+    resolved implementation file back to its service definitions.
+    """
+
+    direct_rows = connection.execute(
+        """
+        SELECT
+            webservices.service_name,
+            webservices.line,
+            webservices.classpath,
+            webservices.classname,
+            webservices.methodname,
+            webservices.resolved_target_file,
+            webservices.resolution_type,
+            webservices.resolution_status,
+            files.moodle_path AS source_file
+        FROM webservices
+        JOIN files ON files.id = webservices.file_id
+        WHERE webservices.file_id = ?
+        ORDER BY files.moodle_path, webservices.service_name, webservices.line
+        """,
+        (file_id,),
+    ).fetchall()
+    reverse_rows = connection.execute(
+        """
+        SELECT
+            webservices.service_name,
+            webservices.line,
+            webservices.classpath,
+            webservices.classname,
+            webservices.methodname,
+            webservices.resolved_target_file,
+            webservices.resolution_type,
+            webservices.resolution_status,
+            files.moodle_path AS source_file
+        FROM webservices
+        JOIN files ON files.id = webservices.file_id
+        WHERE webservices.resolved_target_file = ?
+        ORDER BY files.moodle_path, webservices.service_name, webservices.line
+        """,
+        (moodle_path,),
+    ).fetchall()
+
+    merged: list[dict[str, object]] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for row_item in [*direct_rows, *reverse_rows]:
+        key = (
+            str(row_item["service_name"]),
+            row_item["source_file"],
+            row_item["resolved_target_file"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(row_item))
+    return _build_service_linked_artifacts(connection, merged)
 
 
 def _service_tests_for_definition(

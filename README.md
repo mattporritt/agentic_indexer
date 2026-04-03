@@ -336,6 +336,10 @@ For supported PHP functions, classes, methods, and Moodle AMD source modules it 
   bounded `child_overrides` list where available
 - for JS modules: canonical source file, build artifact, import metadata,
   superclass module/file, and reverse import examples where available
+- bounded `linked_artifacts` chains so a definition can still navigate into
+  service -> implementation -> test flows, output -> renderer -> template
+  flows, form -> intermediate base -> framework base flows, and JS
+  source/import/build flows
 - a small number of ranked usage examples plus a compact `usage_summary`
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
@@ -359,6 +363,11 @@ pretending there is only one.
 - rendering: output class <-> renderer <-> Mustache template links
 - JavaScript: source module -> imports -> superclass -> build artifact
 - entrypoints: high-value Moodle workflow files such as `settings.php`, `locallib.php`, `externallib.php`, and `amd/src/*.js`
+
+`find-definition` now reuses that same linked-artifact model for the defining
+file where practical, so moving from a PHP method/class or JS module
+definition into the surrounding Moodle feature slice does not require a second
+manual lookup.
 
 Example:
 

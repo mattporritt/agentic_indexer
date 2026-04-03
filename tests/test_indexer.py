@@ -433,6 +433,15 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             "confidence": "high",
             "snippet": "mod_assign_start_submission",
         }
+        assert {
+            item["service_name"] for item in start_submission_match["linked_artifacts"]["services"]
+        } == {"mod_assign_start_submission"}
+        assert start_submission_match["linked_artifacts"]["services"][0]["implementation_file"] == (
+            "mod/assign/classes/external/start_submission.php"
+        )
+        assert {
+            item["file"] for item in start_submission_match["linked_artifacts"]["services"][0]["related_tests"]
+        } == {"mod/assign/tests/external/start_submission_test.php"}
         assert any(example["usage_kind"] == "test_usage" for example in start_submission_match["usage_examples"][1:])
         assert start_submission_match["usage_summary"]["service_definition"] == 1
         assert start_submission_match["usage_summary"]["test_usage"] >= 1
@@ -467,6 +476,21 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert openai_provider_match["overrides_definition"]["fqname"] == "core_ai\\provider::get_action_settings"
         assert openai_provider_match["parent_definition"]["fqname"] != "aiprovider_awsbedrock\\provider::get_action_settings"
         assert openai_provider_match["overrides_definition"]["fqname"] != "aiprovider_awsbedrock\\provider::get_action_settings"
+
+        grading_app_definition = find_definition(connection, "mod_assign\\output\\grading_app")
+        assert grading_app_definition["total_matches"] == 1
+        grading_app_match = grading_app_definition["matches"][0]
+        assert grading_app_match["symbol_type"] == "class"
+        grading_artifacts = {item["path"] for item in grading_app_match["linked_artifacts"]["rendering"]}
+        assert "mod/assign/classes/output/renderer.php" in grading_artifacts
+        assert "mod/assign/templates/grading_app.mustache" in grading_artifacts
+
+        action_form_definition = find_definition(connection, "aiprovider_openai\\form\\action_form")
+        assert action_form_definition["total_matches"] == 1
+        action_form_match = action_form_definition["matches"][0]
+        form_artifacts = {item["path"] for item in action_form_match["linked_artifacts"]["rendering"]}
+        assert "ai/classes/form/action_settings_form.php" in form_artifacts
+        assert "lib/formslib.php" in form_artifacts
 
         ambiguous_execute = find_definition(connection, "execute", symbol_type="method")
         assert ambiguous_execute["total_matches"] >= 2
@@ -810,6 +834,11 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert js_definition_match["module_name"] == "core/ajax"
         assert js_definition_match["file"] == "lib/amd/src/ajax.js"
         assert js_definition_match["build_file"] == "lib/amd/build/ajax.min.js"
+        assert js_definition_match["linked_artifacts"]["javascript"]["build_artifact"]["path"] == "lib/amd/build/ajax.min.js"
+        assert any(
+            item["module_name"] == "core_ai/aiprovider_action_management_table"
+            for item in js_definition_match["linked_artifacts"]["javascript"]["imported_by"]
+        )
         assert {
             item["file"] for item in js_definition_match["usage_examples"]
         } >= {
