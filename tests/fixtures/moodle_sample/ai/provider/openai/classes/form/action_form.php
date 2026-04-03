@@ -3,6 +3,7 @@ namespace aiprovider_openai\form;
 
 defined('MOODLE_INTERNAL') || die();
 
-class action_form extends \moodleform {
-}
+use core_ai\form\action_settings_form;
 
+class action_form extends action_settings_form {
+}

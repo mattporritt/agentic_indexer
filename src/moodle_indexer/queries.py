@@ -1749,6 +1749,23 @@ def _linked_class_artifacts(
 
     artifacts: list[dict[str, object]] = []
     seen_relationships: set[tuple[str, str]] = set()
+
+    def add_artifact(class_name: str, relationship_type: str, target_file: str) -> None:
+        file_exists = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
+            (target_file, target_file),
+        ).fetchone()
+        artifacts.append(
+            {
+                "class_name": class_name,
+                "relationship_type": relationship_type,
+                "resolved_target_file": target_file,
+                "resolved": bool(file_exists),
+                "artifact_kind": _class_artifact_kind(target_file),
+                "template_files": _existing_template_candidates(connection, target_file),
+            }
+        )
+
     for item in relationships:
         if item["relationship_type"] not in {"references_class", "extends"}:
             continue
@@ -1757,28 +1774,75 @@ def _linked_class_artifacts(
         if relationship_key in seen_relationships:
             continue
         seen_relationships.add(relationship_key)
-        target_file = resolve_classname_to_file_path(class_name)
-        if target_file is None:
-            target_file = resolve_framework_class_to_file_path(class_name)
+        target_file = _resolve_class_artifact_target(connection, class_name)
         if target_file is None:
             continue
-        file_exists = connection.execute(
-            "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
-            (target_file, target_file),
-        ).fetchone()
-        template_files = _existing_template_candidates(connection, target_file)
-        artifact_kind = _class_artifact_kind(target_file)
-        artifacts.append(
-            {
-                "class_name": class_name,
-                "relationship_type": item["relationship_type"],
-                "resolved_target_file": target_file,
-                "resolved": bool(file_exists),
-                "artifact_kind": artifact_kind,
-                "template_files": template_files,
-            }
-        )
+        add_artifact(class_name, str(item["relationship_type"]), target_file)
+        if item["relationship_type"] == "extends":
+            for ancestor_name, ancestor_file in _resolve_direct_parent_class_targets(connection, target_file):
+                ancestor_key = ("extends_indirect", ancestor_name)
+                if ancestor_key in seen_relationships:
+                    continue
+                seen_relationships.add(ancestor_key)
+                add_artifact(ancestor_name, "extends_indirect", ancestor_file)
     return artifacts
+
+
+def _resolve_class_artifact_target(connection: sqlite3.Connection, class_name: str) -> str | None:
+    """Resolve one class reference to a concrete file path when confidence is high."""
+
+    target_file = resolve_classname_to_file_path(class_name)
+    if target_file is not None:
+        return target_file
+
+    target_file = resolve_framework_class_to_file_path(class_name)
+    if target_file is not None:
+        return target_file
+
+    symbol_rows = connection.execute(
+        """
+        SELECT files.moodle_path
+        FROM symbols
+        JOIN files ON files.id = symbols.file_id
+        WHERE symbols.symbol_type IN ('class', 'interface', 'trait')
+          AND symbols.name = ?
+        ORDER BY files.moodle_path
+        """,
+        (class_name,),
+    ).fetchall()
+    if len(symbol_rows) == 1:
+        return str(symbol_rows[0]["moodle_path"])
+    return None
+
+
+def _resolve_direct_parent_class_targets(
+    connection: sqlite3.Connection,
+    class_file: str,
+) -> list[tuple[str, str]]:
+    """Return one verified inheritance hop for a resolved class file."""
+
+    rows = connection.execute(
+        """
+        SELECT target_name
+        FROM relationships
+        WHERE file_id = (
+            SELECT id
+            FROM files
+            WHERE moodle_path = ? OR repository_relative_path = ?
+            LIMIT 1
+        )
+          AND relationship_type = 'extends'
+        ORDER BY line, target_name
+        """,
+        (class_file, class_file),
+    ).fetchall()
+    results: list[tuple[str, str]] = []
+    for row in rows:
+        class_name = str(row["target_name"]).lstrip("\\")
+        target_file = _resolve_class_artifact_target(connection, class_name)
+        if target_file is not None:
+            results.append((class_name, target_file))
+    return results
 
 
 def _class_related_suggestions(class_references: list[dict[str, object]]) -> list[dict[str, str]]:
@@ -1974,13 +2038,13 @@ def _build_rendering_linked_artifacts(
                 str(item["class_name"]),
             )
         if component_root:
-            renderer_path = f"{component_root}/renderer.php"
-            if target_path != renderer_path:
-                add_artifact(
-                    renderer_path,
-                    "renderer_file",
-                    "suggested because this component renderer often coordinates output classes and templates",
-                )
+            for renderer_path in _renderer_candidates(connection, component_root):
+                if target_path != renderer_path:
+                    add_artifact(
+                        renderer_path,
+                        "renderer_file",
+                        "suggested because this indexed renderer coordinates this component's output classes and templates",
+                    )
 
     if file_role == "output_class" and component_root:
         template_path = _template_for_output_file(moodle_path)
@@ -1990,11 +2054,12 @@ def _build_rendering_linked_artifacts(
                 "template_file",
                 "suggested because this output class likely renders through this Mustache template",
             )
-        add_artifact(
-            f"{component_root}/renderer.php",
-            "renderer_file",
-            "suggested because this component renderer commonly instantiates or renders this output class",
-        )
+        for renderer_path in _renderer_candidates(connection, component_root):
+            add_artifact(
+                renderer_path,
+                "renderer_file",
+                "suggested because this indexed renderer commonly instantiates or renders this output class",
+            )
 
     if file_role == "template_file" and component_root:
         output_path = _output_file_for_template(moodle_path)
@@ -2004,11 +2069,12 @@ def _build_rendering_linked_artifacts(
                 "output_class",
                 "suggested because this Mustache template likely pairs with this output class",
             )
-        add_artifact(
-            f"{component_root}/renderer.php",
-            "renderer_file",
-            "suggested because this component renderer commonly renders this Mustache template",
-        )
+        for renderer_path in _renderer_candidates(connection, component_root):
+            add_artifact(
+                renderer_path,
+                "renderer_file",
+                "suggested because this indexed renderer commonly renders this Mustache template",
+            )
 
     if file_role == "renderer_file":
         output_rows = connection.execute(
@@ -2044,6 +2110,24 @@ def _template_for_output_file(output_file: str) -> str | None:
         return None
     component_root, suffix = output_file.split("/classes/output/", 1)
     return f"{component_root}/templates/{suffix.removesuffix('.php')}.mustache"
+
+
+def _renderer_candidates(connection: sqlite3.Connection, component_root: str) -> list[str]:
+    """Return verified renderer files for one component root."""
+
+    candidates = [
+        f"{component_root}/classes/output/renderer.php",
+        f"{component_root}/renderer.php",
+    ]
+    found: list[str] = []
+    for path in candidates:
+        row = connection.execute(
+            "SELECT moodle_path FROM files WHERE moodle_path = ? OR repository_relative_path = ? LIMIT 1",
+            (path, path),
+        ).fetchone()
+        if row is not None:
+            found.append(str(row["moodle_path"]))
+    return found
 
 
 def _output_file_for_template(template_file: str) -> str | None:
@@ -2257,6 +2341,12 @@ def _class_artifact_reason(item: dict[str, object]) -> str:
             f"suggested because this class extends {class_name}, whose core base "
             "implementation lives in this file"
         )
+    if relationship_type == "extends_indirect" and artifact_kind == "framework_base":
+        return (
+            f"suggested because this class inherits from {class_name} through an indexed Moodle form/framework base"
+        )
+    if relationship_type == "extends_indirect":
+        return f"suggested because this class inherits from {class_name} through a resolved parent class chain"
     if relationship_type == "extends":
         return f"suggested because this class extends {class_name}, which is implemented in this file"
     if artifact_kind == "output_class":

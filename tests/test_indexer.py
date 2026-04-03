@@ -550,7 +550,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert {
             item["moodle_path"] for item in assign_summary["linked_artifacts"]["rendering_files"]
         } >= {
-            "mod/assign/renderer.php",
+            "mod/assign/classes/output/renderer.php",
             "mod/assign/classes/output/grading_app.php",
             "mod/assign/templates/grading_app.mustache",
         }
@@ -642,12 +642,12 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         }
         assert "mod/assign/classes/output/grading_app.php" in rendering_chain_paths
         assert "mod/assign/templates/grading_app.mustache" in rendering_chain_paths
-        assert "mod/assign/renderer.php" in rendering_chain_paths
+        assert "mod/assign/classes/output/renderer.php" in rendering_chain_paths
 
         locallib_related_paths = {item["path"] for item in locallib_context["related_suggestions"]}
         assert "mod/assign/classes/output/grading_app.php" in locallib_related_paths
         assert "mod/assign/templates/grading_app.mustache" in locallib_related_paths
-        assert "mod/assign/renderer.php" in locallib_related_paths
+        assert "mod/assign/classes/output/renderer.php" in locallib_related_paths
 
         locallib_related = suggest_related(connection, "mod/assign/locallib.php")
         locallib_suggestions = {item["path"]: item for item in locallib_related["suggestions"]}
@@ -659,7 +659,20 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "Mustache template" in locallib_suggestions[
             "mod/assign/templates/grading_app.mustache"
         ]["reason"]
-        assert "mod/assign/renderer.php" in locallib_suggestions
+        assert "mod/assign/classes/output/renderer.php" in locallib_suggestions
+
+        demo_locallib_context = file_context(connection, "mod/demo/locallib.php")
+        demo_rendering_paths = {item["path"] for item in demo_locallib_context["linked_artifacts"]["rendering"]}
+        assert "mod/demo/classes/output/widget.php" in demo_rendering_paths
+        assert "mod/demo/classes/output/renderer.php" in demo_rendering_paths
+        assert "mod/demo/templates/widget.mustache" in demo_rendering_paths
+        assert "mod/demo/renderer.php" not in demo_rendering_paths
+
+        demo_suggestions = {
+            item["path"]: item for item in suggest_related(connection, "mod/demo/locallib.php")["suggestions"]
+        }
+        assert "mod/demo/classes/output/renderer.php" in demo_suggestions
+        assert "mod/demo/renderer.php" not in demo_suggestions
 
         related_result = suggest_related(connection, "admin/tool/demo/settings.php")
         suggestions_by_path = {item["path"]: item for item in related_result["suggestions"]}
@@ -699,16 +712,26 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
 
         action_form_context = file_context(connection, "ai/provider/openai/classes/form/action_form.php")
         action_form_related = {item["path"]: item for item in action_form_context["related_suggestions"]}
+        assert "ai/classes/form/action_settings_form.php" in action_form_related
+        assert "extends action_settings_form" in action_form_related[
+            "ai/classes/form/action_settings_form.php"
+        ]["reason"]
         assert "lib/formslib.php" in action_form_related
-        assert "extends moodleform" in action_form_related["lib/formslib.php"]["reason"]
+        assert "inherits from moodleform" in action_form_related["lib/formslib.php"]["reason"]
+
+        action_form_artifacts = {item["path"]: item for item in action_form_context["linked_artifacts"]["rendering"]}
+        assert "ai/classes/form/action_settings_form.php" in action_form_artifacts
+        assert "lib/formslib.php" in action_form_artifacts
 
         action_form_suggestions = {
             item["path"]: item
             for item in suggest_related(connection, "ai/provider/openai/classes/form/action_form.php")["suggestions"]
         }
+        assert "ai/classes/form/action_settings_form.php" in action_form_suggestions
+        assert action_form_suggestions["ai/classes/form/action_settings_form.php"]["indexed"] is True
         assert "lib/formslib.php" in action_form_suggestions
         assert action_form_suggestions["lib/formslib.php"]["indexed"] is True
-        assert "extends moodleform" in action_form_suggestions["lib/formslib.php"]["reason"]
+        assert "inherits from moodleform" in action_form_suggestions["lib/formslib.php"]["reason"]
 
         js_context = file_context(connection, "ai/amd/src/aiprovider_action_management_table.js")
         assert js_context["js_module"]["module_name"] == "core_ai/aiprovider_action_management_table"
