@@ -382,9 +382,16 @@ Both endpoints are intentionally confidence-aware:
   as service definitions, implementation files, concrete tests, output classes,
   renderers, templates, concrete forms, framework bases, JS imports, and JS
   superclass/build links
+- primary items are path-deduplicated so the same file does not normally appear
+  multiple times under slightly different labels; when multiple relationships
+  converge on one file, the strongest label wins and related relationships are
+  folded into the same item
 - secondary items are usually supporting context or weaker fallbacks
 - low-confidence suggestions are intentionally rare; the tool prefers a smaller
   bounded surface over a noisy graph
+- JS-oriented outputs keep JS-specific relationship wording such as imports,
+  superclass modules, and build artifacts rather than reusing PHP-style
+  inheritance wording in Phase 4A navigation responses
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
 will rank direct static calls, simple `new ClassName(...)` to `$var->method()`

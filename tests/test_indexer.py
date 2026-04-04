@@ -923,15 +923,21 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             connection,
             symbol_query="mod_assign\\external\\start_submission::execute",
         )
-        primary_service_paths = [item["path"] for item in related_service["primary_related_definitions"]]
+        primary_service_items = related_service["primary_related_definitions"]
+        primary_service_paths = [item["path"] for item in primary_service_items]
         assert "mod/assign/db/services.php" in primary_service_paths
         assert "mod/assign/classes/external/start_submission.php" in primary_service_paths
         assert "mod/assign/tests/external/start_submission_test.php" in primary_service_paths
-        assert all(item["confidence"] == "high" for item in related_service["primary_related_definitions"][:3])
+        assert len(primary_service_paths) == len(set(primary_service_paths))
+        assert all(item["confidence"] == "high" for item in primary_service_items[:3])
         assert any(
             item["relationship"] == "service_definition"
-            for item in related_service["primary_related_definitions"]
+            for item in primary_service_items
         )
+        service_registration = next(
+            item for item in primary_service_items if item["path"] == "mod/assign/db/services.php"
+        )
+        assert "service_definition" in service_registration["related_relationships"]
 
         service_edit_surface = suggest_edit_surface(
             connection,
@@ -942,6 +948,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/classes/external/start_submission.php" in service_surface_paths
         assert "mod/assign/tests/external/start_submission_test.php" in service_surface_paths
         assert "mod/assign/tests" not in service_surface_paths
+        assert len(service_surface_paths) == len(set(service_surface_paths))
 
         related_rendering = find_related_definitions(
             connection,
@@ -966,14 +973,34 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             connection,
             symbol_query="core_ai/aiprovider_action_management_table",
         )
-        js_primary_paths = {item["path"] for item in related_js["primary_related_definitions"]}
+        js_primary_items = related_js["primary_related_definitions"]
+        js_primary_paths = {item["path"] for item in js_primary_items}
         assert "admin/amd/src/plugin_management_table.js" in js_primary_paths
         assert "lib/amd/src/ajax.js" in js_primary_paths
         assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_primary_paths
         assert any(
             item["relationship"] == "js_superclass"
-            for item in related_js["primary_related_definitions"]
+            for item in js_primary_items
         )
+        assert sum(
+            1 for item in js_primary_items if item["path"] == "admin/amd/src/plugin_management_table.js"
+        ) == 1
+        js_superclass_item = next(
+            item for item in js_primary_items if item["path"] == "admin/amd/src/plugin_management_table.js"
+        )
+        assert "js_superclass" in js_superclass_item["related_relationships"]
+        assert "js_import" in js_superclass_item["related_relationships"]
+
+        assign_related = find_related_definitions(
+            connection,
+            symbol_query="assign::view",
+        )
+        assign_primary_paths = [item["path"] for item in assign_related["primary_related_definitions"]]
+        assert len(assign_primary_paths) <= 6
+        assert "mod/assign/classes/output/renderer.php" in assign_primary_paths
+        assert "mod/assign/templates/grading_app.mustache" in assign_primary_paths
+        assert "mod/assign/db/access.php" not in assign_primary_paths
+        assert "mod/assign/lang/en/mod_assign.php" not in assign_primary_paths
     finally:
         connection.close()
 

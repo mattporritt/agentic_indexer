@@ -393,14 +393,14 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert exit_code == 0
     related_payload = json.loads(capsys.readouterr().out)
     assert related_payload["status"] == "ok"
-    related_primary_paths = {
-        item["path"] for item in related_payload["data"]["primary_related_definitions"]
-    }
+    related_primary_items = related_payload["data"]["primary_related_definitions"]
+    related_primary_paths = [item["path"] for item in related_primary_items]
     assert "mod/assign/db/services.php" in related_primary_paths
     assert "mod/assign/tests/external/start_submission_test.php" in related_primary_paths
+    assert len(related_primary_paths) == len(set(related_primary_paths))
     assert all(
         item["confidence"] in {"high", "medium"}
-        for item in related_payload["data"]["primary_related_definitions"]
+        for item in related_primary_items
     )
 
     exit_code = main(
@@ -416,8 +416,7 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     edit_payload = json.loads(capsys.readouterr().out)
     assert edit_payload["status"] == "ok"
     assert edit_payload["data"]["primary_edit_surface"][0]["path"] == "mod/assign/db/services.php"
-    edit_primary_paths = {
-        item["path"] for item in edit_payload["data"]["primary_edit_surface"]
-    }
+    edit_primary_paths = [item["path"] for item in edit_payload["data"]["primary_edit_surface"]]
     assert "mod/assign/classes/external/start_submission.php" in edit_primary_paths
     assert "mod/assign/tests/external/start_submission_test.php" in edit_primary_paths
+    assert len(edit_primary_paths) == len(set(edit_primary_paths))

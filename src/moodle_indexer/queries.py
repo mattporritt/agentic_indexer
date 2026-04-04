@@ -1126,7 +1126,10 @@ def _related_items_for_symbol_results(
     items: list[dict[str, object]] = []
     for match in matches:
         anchor = match.get("fqname") or match.get("module_name") or match.get("file")
-        if match.get("parent_definition"):
+        symbol_type = str(match.get("symbol_type") or "")
+        is_js_module = symbol_type == "js_module"
+
+        if not is_js_module and match.get("parent_definition"):
             parent_path, parent_symbol = _related_target(match["parent_definition"])
             if parent_path:
                 items.append(
@@ -1140,7 +1143,7 @@ def _related_items_for_symbol_results(
                         anchor=anchor,
                     )
                 )
-        if match.get("overrides_definition"):
+        if not is_js_module and match.get("overrides_definition"):
             override_path, override_symbol = _related_target(match["overrides_definition"])
             if override_path:
                 items.append(
@@ -1154,7 +1157,7 @@ def _related_items_for_symbol_results(
                         anchor=anchor,
                     )
                 )
-        for implemented in match.get("implements_definitions", []):
+        for implemented in ([] if is_js_module else match.get("implements_definitions", [])):
             implemented_path, implemented_symbol = _related_target(implemented)
             if not implemented_path:
                 continue
@@ -1169,7 +1172,7 @@ def _related_items_for_symbol_results(
                     anchor=anchor,
                 )
             )
-        for child in match.get("child_overrides", [])[:4]:
+        for child in ([] if is_js_module else match.get("child_overrides", [])[:4]):
             child_path, child_symbol = _related_target(child)
             if not child_path:
                 continue
@@ -1184,7 +1187,15 @@ def _related_items_for_symbol_results(
                     anchor=anchor,
                 )
             )
-        items.extend(_artifact_navigation_items(match.get("linked_artifacts", {}), anchor=anchor, include_anchor_file=False))
+        items.extend(
+            _artifact_navigation_items(
+                match.get("linked_artifacts", {}),
+                anchor=anchor,
+                include_anchor_file=False,
+                include_entrypoints=False,
+                include_js_reverse=not is_js_module,
+            )
+        )
     return items
 
 
@@ -1197,6 +1208,7 @@ def _edit_surface_items_for_symbol_results(
     items: list[dict[str, object]] = []
     for match in matches:
         anchor = match.get("fqname") or match.get("module_name") or match.get("file")
+        is_js_module = str(match.get("symbol_type") or "") == "js_module"
         items.append(
             _navigation_item(
                 item_type="definition_file",
@@ -1208,7 +1220,15 @@ def _edit_surface_items_for_symbol_results(
                 anchor=anchor,
             )
         )
-        items.extend(_artifact_navigation_items(match.get("linked_artifacts", {}), anchor=anchor, include_anchor_file=False))
+        items.extend(
+            _artifact_navigation_items(
+                match.get("linked_artifacts", {}),
+                anchor=anchor,
+                include_anchor_file=False,
+                include_entrypoints=False,
+                include_js_reverse=not is_js_module,
+            )
+        )
     return items
 
 
@@ -1216,7 +1236,13 @@ def _related_items_for_file_context(context: dict[str, object]) -> list[dict[str
     """Return related-definition items around one indexed file context."""
 
     anchor = str(context["moodle_path"])
-    items = _artifact_navigation_items(context.get("linked_artifacts", {}), anchor=anchor, include_anchor_file=False)
+    items = _artifact_navigation_items(
+        context.get("linked_artifacts", {}),
+        anchor=anchor,
+        include_anchor_file=False,
+        include_entrypoints=True,
+        include_js_reverse=True,
+    )
     for symbol in list(context.get("symbols", []))[:4]:
         fqname = symbol.get("fqname")
         if not fqname:
@@ -1266,6 +1292,8 @@ def _edit_surface_items_for_file_context(
             context.get("linked_artifacts", {}),
             anchor=anchor,
             include_anchor_file=False,
+            include_entrypoints=True,
+            include_js_reverse=True,
         )
         if str(item["path"]) != anchor
     )
@@ -1293,6 +1321,8 @@ def _artifact_navigation_items(
     *,
     anchor: str | None,
     include_anchor_file: bool,
+    include_entrypoints: bool = True,
+    include_js_reverse: bool = True,
 ) -> list[dict[str, object]]:
     """Flatten existing linked artifacts into Phase 4A navigation items."""
 
@@ -1370,31 +1400,33 @@ def _artifact_navigation_items(
                     anchor=anchor,
                 )
             )
-        for importer in javascript.get("imported_by", [])[:4]:
+        if include_js_reverse:
+            for importer in javascript.get("imported_by", [])[:4]:
+                items.append(
+                    _navigation_item(
+                        item_type="js_module",
+                        relationship="js_imported_by",
+                        confidence="medium",
+                        reason=f"because this module is imported by {importer['module_name']}",
+                        path=str(importer["file"]),
+                        symbol=str(importer["module_name"]),
+                        anchor=anchor,
+                    )
+                )
+
+    if include_entrypoints:
+        for entrypoint in linked_artifacts.get("entrypoints", []) or []:
             items.append(
                 _navigation_item(
-                    item_type="js_module",
-                    relationship="imported_by",
-                    confidence="medium",
-                    reason=f"because this module is imported by {importer['module_name']}",
-                    path=str(importer["file"]),
-                    symbol=str(importer["module_name"]),
+                    item_type=_artifact_item_type(str(entrypoint["path"]), str(entrypoint.get("artifact_type"))),
+                    relationship=str(entrypoint.get("artifact_type") or "entrypoint_link"),
+                    confidence=_artifact_confidence(str(entrypoint.get("artifact_type")), "supporting"),
+                    reason=str(entrypoint["reason"]),
+                    path=str(entrypoint["path"]),
+                    symbol=None,
                     anchor=anchor,
                 )
             )
-
-    for entrypoint in linked_artifacts.get("entrypoints", []) or []:
-        items.append(
-            _navigation_item(
-                item_type=_artifact_item_type(str(entrypoint["path"]), str(entrypoint.get("artifact_type"))),
-                relationship=str(entrypoint.get("artifact_type") or "entrypoint_link"),
-                confidence=_artifact_confidence(str(entrypoint.get("artifact_type")), "supporting"),
-                reason=str(entrypoint["reason"]),
-                path=str(entrypoint["path"]),
-                symbol=None,
-                anchor=anchor,
-            )
-        )
 
     if include_anchor_file and anchor:
         items.append(
@@ -1478,8 +1510,49 @@ def _split_navigation_items(
         if _confidence_rank(str(item["confidence"])) < _confidence_rank(str(existing["confidence"])):
             existing["confidence"] = item["confidence"]
 
+    collapsed: dict[str, dict[str, object]] = {}
+    for item in merged.values():
+        path_key = str(item["path"])
+        existing = collapsed.get(path_key)
+        if existing is None:
+            candidate = dict(item)
+            candidate["related_relationships"] = [str(item["relationship"])]
+            collapsed[path_key] = candidate
+            continue
+
+        existing_relationships = set(existing.get("related_relationships", []))
+        existing_relationships.add(str(item["relationship"]))
+        existing["related_relationships"] = sorted(existing_relationships)
+
+        existing_reasons = {part.strip() for part in str(existing["reason"]).split(" | ") if part.strip()}
+        for part in str(item["reason"]).split(" | "):
+            if part.strip():
+                existing_reasons.add(part.strip())
+        existing["reason"] = " | ".join(sorted(existing_reasons))
+
+        if _confidence_rank(str(item["confidence"])) < _confidence_rank(str(existing["confidence"])):
+            existing["confidence"] = item["confidence"]
+
+        current_score = (
+            _confidence_rank(str(existing["confidence"])),
+            _edit_surface_priority(str(existing["type"]), str(existing["relationship"]), str(existing["path"])),
+            str(existing["path"]),
+            str(existing.get("symbol") or ""),
+        )
+        candidate_score = (
+            _confidence_rank(str(item["confidence"])),
+            _edit_surface_priority(str(item["type"]), str(item["relationship"]), str(item["path"])),
+            str(item["path"]),
+            str(item.get("symbol") or ""),
+        )
+        if candidate_score < current_score:
+            existing["type"] = item["type"]
+            existing["relationship"] = item["relationship"]
+            existing["symbol"] = item.get("symbol")
+            existing["anchor"] = item.get("anchor")
+
     ordered = sorted(
-        merged.values(),
+        collapsed.values(),
         key=lambda item: (
             _confidence_rank(str(item["confidence"])),
             _edit_surface_priority(str(item["type"]), str(item["relationship"]), str(item["path"])),
@@ -1563,6 +1636,14 @@ def _edit_surface_priority(item_type: str, relationship: str, path: str) -> int:
 
     if relationship in {"definition_file", "anchor_file"}:
         return 0
+    if relationship == "js_superclass":
+        return 18
+    if relationship == "js_import":
+        return 19
+    if relationship == "js_build_artifact":
+        return 22
+    if relationship == "js_imported_by":
+        return 28
     if relationship == "service_definition":
         return 3
     if item_type in {"service_definition", "service_implementation", "service_test"}:
