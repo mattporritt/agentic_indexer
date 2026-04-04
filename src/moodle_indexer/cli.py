@@ -18,6 +18,7 @@ from moodle_indexer.indexer import build_index
 from moodle_indexer.json_output import dumps_json, error_payload, success_payload
 from moodle_indexer.queries import (
     component_summary,
+    dependency_neighborhood,
     file_context,
     find_definition,
     find_related_definitions,
@@ -112,6 +113,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of primary or secondary edit-surface items to return.",
     )
 
+    dependency_parser = subparsers.add_parser(
+        "dependency-neighborhood",
+        help="Return a bounded, confidence-aware dependency neighborhood around a symbol or file.",
+    )
+    dependency_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    dependency_target = dependency_parser.add_mutually_exclusive_group(required=True)
+    dependency_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    dependency_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    dependency_parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="Maximum number of items to return per dependency-neighborhood section.",
+    )
+
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     file_parser.add_argument(
@@ -159,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_find_related_definitions(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "suggest-edit-surface":
             payload = run_suggest_edit_surface(args.db_path, args.symbol, args.file, args.limit)
+        elif args.command == "dependency-neighborhood":
+            payload = run_dependency_neighborhood(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -230,6 +251,19 @@ def run_suggest_edit_surface(db_path: str, symbol: str | None, file_path: str | 
         return success_payload(
             "suggest-edit-surface",
             suggest_edit_surface(connection, symbol_query=symbol, file_path=file_path, limit=limit),
+        )
+    finally:
+        connection.close()
+
+
+def run_dependency_neighborhood(db_path: str, symbol: str | None, file_path: str | None, limit: int) -> dict:
+    """Execute the ``dependency-neighborhood`` command."""
+
+    connection = open_database(Path(db_path).expanduser().resolve())
+    try:
+        return success_payload(
+            "dependency-neighborhood",
+            dependency_neighborhood(connection, symbol_query=symbol, file_path=file_path, limit=limit),
         )
     finally:
         connection.close()

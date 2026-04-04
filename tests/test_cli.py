@@ -420,3 +420,20 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert "mod/assign/classes/external/start_submission.php" in edit_primary_paths
     assert "mod/assign/tests/external/start_submission_test.php" in edit_primary_paths
     assert len(edit_primary_paths) == len(set(edit_primary_paths))
+
+    exit_code = main(
+        [
+            "dependency-neighborhood",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    dependency_payload = json.loads(capsys.readouterr().out)
+    assert dependency_payload["status"] == "ok"
+    assert dependency_payload["data"]["likely_callers"][0]["path"] == "mod/assign/db/services.php"
+    assert "mod/assign/tests/external/start_submission_test.php" in {
+        item["path"] for item in dependency_payload["data"]["linked_tests"]
+    }

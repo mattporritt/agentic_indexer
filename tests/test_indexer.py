@@ -19,6 +19,7 @@ from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_
 from moodle_indexer.php_parser import ParsedMethod, ParsedSymbol, _merge_symbol_metadata
 from moodle_indexer.queries import (
     component_summary,
+    dependency_neighborhood,
     file_context,
     find_definition,
     find_related_definitions,
@@ -1001,6 +1002,58 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/templates/grading_app.mustache" in assign_primary_paths
         assert "mod/assign/db/access.php" not in assign_primary_paths
         assert "mod/assign/lang/en/mod_assign.php" not in assign_primary_paths
+
+        service_neighborhood = dependency_neighborhood(
+            connection,
+            symbol_query="mod_assign\\external\\start_submission::execute",
+        )
+        caller_paths = [item["path"] for item in service_neighborhood["likely_callers"]]
+        assert "mod/assign/db/services.php" in caller_paths
+        assert "mod/assign/db/services.php" == service_neighborhood["likely_callers"][0]["path"]
+        linked_test_paths = [item["path"] for item in service_neighborhood["linked_tests"]]
+        assert "mod/assign/tests/external/start_submission_test.php" in linked_test_paths
+        assert all("confidence" in item and "reason" in item for item in service_neighborhood["likely_callers"])
+
+        service_file_neighborhood = dependency_neighborhood(
+            connection,
+            file_path="mod/assign/db/services.php",
+        )
+        assert "mod/assign/classes/external/start_submission.php" in {
+            item["path"] for item in service_file_neighborhood["likely_callees"]
+        }
+        assert "mod/assign/tests/external/start_submission_test.php" in {
+            item["path"] for item in service_file_neighborhood["linked_tests"]
+        }
+
+        rendering_neighborhood = dependency_neighborhood(
+            connection,
+            symbol_query="assign::view",
+        )
+        rendering_paths = [item["path"] for item in rendering_neighborhood["linked_rendering_artifacts"]]
+        assert "mod/assign/classes/output/renderer.php" in rendering_paths
+        assert "mod/assign/templates/grading_app.mustache" in rendering_paths
+        assert len(rendering_paths) <= 6
+
+        provider_neighborhood = dependency_neighborhood(
+            connection,
+            symbol_query="aiprovider_openai\\provider::get_action_settings",
+        )
+        form_paths = [item["path"] for item in provider_neighborhood["linked_forms"]]
+        assert "ai/provider/openai/classes/form/action_form.php" in form_paths
+        assert "ai/classes/form/action_settings_form.php" in form_paths
+        assert "lib/formslib.php" in form_paths
+
+        js_neighborhood = dependency_neighborhood(
+            connection,
+            symbol_query="core_ai/aiprovider_action_management_table",
+        )
+        js_callee_paths = [item["path"] for item in js_neighborhood["likely_callees"]]
+        assert "admin/amd/src/plugin_management_table.js" in js_callee_paths
+        assert "lib/amd/src/ajax.js" in js_callee_paths
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in {
+            item["path"] for item in js_neighborhood["linked_build_artifacts"]
+        }
+        assert all("confidence" in item and "reason" in item for item in js_neighborhood["likely_callees"])
     finally:
         connection.close()
 

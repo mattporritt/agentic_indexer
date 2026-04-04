@@ -278,6 +278,18 @@ moodle-indexer suggest-edit-surface \
   --file mod/assign/db/services.php
 ```
 
+Inspect the bounded dependency neighborhood around a symbol or file:
+
+```bash
+moodle-indexer dependency-neighborhood \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+
+moodle-indexer dependency-neighborhood \
+  --db-path /path/to/moodle-index.sqlite \
+  --file mod/assign/locallib.php
+```
+
 Find a definition:
 
 ```bash
@@ -376,7 +388,14 @@ relationships:
 - `suggest-edit-surface`: the likely primary and secondary files/definitions an
   agent would inspect or edit next
 
-Both endpoints are intentionally confidence-aware:
+Phase 4B adds one more bounded, graph-like view:
+
+- `dependency-neighborhood`: a small confidence-aware neighborhood around a
+  symbol or file, split into likely callers, likely callees, linked tests, and
+  linked artifact companion sections where the current index has strong local
+  evidence
+
+These agent-oriented navigation endpoints are intentionally confidence-aware:
 
 - primary items are usually high-confidence, directly connected artifacts such
   as service definitions, implementation files, concrete tests, output classes,
@@ -392,6 +411,19 @@ Both endpoints are intentionally confidence-aware:
 - JS-oriented outputs keep JS-specific relationship wording such as imports,
   superclass modules, and build artifacts rather than reusing PHP-style
   inheritance wording in Phase 4A navigation responses
+
+For `dependency-neighborhood`, "likely callers" and "likely callees" are
+bounded local edges, not a full call graph:
+
+- likely callers come from strong direct evidence such as service
+  registrations, direct usage examples, and direct JS importers
+- likely callees come from direct linked artifacts such as service
+  implementations, output classes, renderers, templates, concrete forms,
+  framework bases, JS imports, and JS superclass modules
+- linked tests are returned as a first-class section when concrete PHPUnit
+  files can be tied directly to the symbol or file
+- each section is bounded and confidence-aware so the output stays small enough
+  for an agent to inspect immediately
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
 will rank direct static calls, simple `new ClassName(...)` to `$var->method()`

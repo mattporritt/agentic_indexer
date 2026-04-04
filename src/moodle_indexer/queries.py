@@ -781,6 +781,50 @@ def suggest_edit_surface(
     }
 
 
+def dependency_neighborhood(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    limit: int = 8,
+) -> dict[str, object]:
+    """Return a bounded dependency neighborhood around a symbol or file.
+
+    Phase 4B stays intentionally local and high-confidence:
+    - likely callers come from direct usage examples, service registrations, and
+      direct JS importers where the index already has concrete evidence
+    - likely callees come from direct service/rendering/form/JS links already
+      extracted during indexing
+    - linked tests and linked artifact companions are exposed as first-class
+      sections so agents can inspect a small, practical implementation surface
+    """
+
+    if bool(symbol_query) == bool(file_path):
+        raise ValidationError("Provide exactly one of --symbol or --file.")
+
+    if symbol_query:
+        definition_data = find_definition(connection, symbol_query, limit=max(1, min(limit, 4)), include_usages=True)
+        matches = definition_data["matches"]
+        payload = {
+            "query": symbol_query,
+            "query_kind": "symbol",
+            "matched_definitions": [_compact_match_summary(item) for item in matches],
+            "total_matches": definition_data["total_matches"],
+        }
+        payload.update(_dependency_sections_for_symbol_results(matches, limit=limit))
+        return payload
+
+    context = file_context(connection, file_path or "")
+    payload = {
+        "query": context["moodle_path"],
+        "query_kind": "file",
+        "matched_definitions": [],
+        "total_matches": 1,
+    }
+    payload.update(_dependency_sections_for_file_context(context, limit=limit))
+    return payload
+
+
 def _find_named_definitions(
     connection: sqlite3.Connection,
     symbol_query: str,
@@ -1314,6 +1358,470 @@ def _edit_surface_items_for_file_context(
             )
         )
     return items
+
+
+def _dependency_sections_for_symbol_results(
+    matches: list[dict[str, object]],
+    *,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded dependency sections for symbol-driven workflows."""
+
+    sections: dict[str, list[dict[str, object]]] = {
+        "likely_callers": [],
+        "likely_callees": [],
+        "linked_tests": [],
+        "linked_services": [],
+        "linked_rendering_artifacts": [],
+        "linked_forms": [],
+        "linked_javascript": [],
+        "linked_build_artifacts": [],
+    }
+
+    for match in matches:
+        anchor = str(match.get("fqname") or match.get("module_name") or match.get("file") or "")
+        symbol_type = str(match.get("symbol_type") or "")
+
+        for usage in match.get("usage_examples", []):
+            item = _dependency_item_from_usage(usage, anchor=anchor)
+            if item is not None:
+                sections["likely_callers"].append(item)
+                if item["type"] == "service_test":
+                    sections["linked_tests"].append(
+                        _dependency_item(
+                            item_type="service_test",
+                            relationship="test_usage",
+                            confidence=str(item["confidence"]),
+                            reason=str(item["reason"]),
+                            path=str(item["path"]),
+                            symbol=None,
+                            anchor=anchor,
+                            line=item.get("line"),
+                        )
+                    )
+
+        linked_artifacts = match.get("linked_artifacts", {})
+        _extend_dependency_sections_from_linked_artifacts(
+            sections,
+            linked_artifacts,
+            anchor=anchor,
+            include_js_importers=symbol_type != "js_module",
+            include_entrypoints=False,
+            owning_file=str(match.get("file") or ""),
+        )
+
+    return _finalize_dependency_sections(sections, limit=limit)
+
+
+def _dependency_sections_for_file_context(
+    context: dict[str, object],
+    *,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded dependency sections for file-driven workflows."""
+
+    anchor = str(context["moodle_path"])
+    sections: dict[str, list[dict[str, object]]] = {
+        "likely_callers": [],
+        "likely_callees": [],
+        "linked_tests": [],
+        "linked_services": [],
+        "linked_rendering_artifacts": [],
+        "linked_forms": [],
+        "linked_javascript": [],
+        "linked_build_artifacts": [],
+    }
+
+    for test in context.get("tests", []):
+        test_file = test.get("file")
+        if not test_file:
+            continue
+        sections["linked_tests"].append(
+            _dependency_item(
+                item_type="service_test",
+                relationship="linked_test",
+                confidence="high",
+                reason=str(test.get("reason") or "because this concrete test file is directly linked to the queried file"),
+                path=str(test_file),
+                symbol=None,
+                anchor=anchor,
+                line=test.get("line"),
+            )
+        )
+
+    _extend_dependency_sections_from_linked_artifacts(
+        sections,
+        context.get("linked_artifacts", {}),
+        anchor=anchor,
+        include_js_importers=True,
+        include_entrypoints=True,
+        owning_file=anchor,
+    )
+
+    return _finalize_dependency_sections(sections, limit=limit)
+
+
+def _extend_dependency_sections_from_linked_artifacts(
+    sections: dict[str, list[dict[str, object]]],
+    linked_artifacts: dict[str, object],
+    *,
+    anchor: str,
+    include_js_importers: bool,
+    include_entrypoints: bool,
+    owning_file: str,
+) -> None:
+    """Project trusted linked-artifact structures into dependency sections."""
+
+    for service in linked_artifacts.get("services", []) or []:
+        service_name = str(service["service_name"])
+        source_file = service.get("source_file")
+        if source_file:
+            service_item = _dependency_item(
+                item_type="service_definition",
+                relationship="service_definition",
+                confidence="high",
+                reason=f"because this implementation is registered by service {service_name} in db/services.php",
+                path=str(source_file),
+                symbol=service_name,
+                anchor=anchor,
+            )
+            sections["linked_services"].append(service_item)
+            sections["likely_callers"].append(service_item)
+        implementation_file = service.get("implementation_file")
+        if implementation_file and str(implementation_file) != owning_file:
+            implementation_item = _dependency_item(
+                item_type="service_implementation",
+                relationship="service_implementation",
+                confidence="high",
+                reason=f"because service {service_name} resolves to this implementation file",
+                path=str(implementation_file),
+                symbol=None,
+                anchor=anchor,
+            )
+            sections["linked_services"].append(implementation_item)
+            sections["likely_callees"].append(implementation_item)
+        for test in service.get("related_tests", []):
+            sections["linked_tests"].append(
+                _dependency_item(
+                    item_type="service_test",
+                    relationship="service_test",
+                    confidence="high",
+                    reason=str(test["reason"]),
+                    path=str(test["file"]),
+                    symbol=None,
+                    anchor=anchor,
+                )
+            )
+
+    for rendering in linked_artifacts.get("rendering", []) or []:
+        for item in _dependency_rendering_items(rendering, anchor=anchor):
+            if item["type"] in {"output_class", "renderer_file", "template_file"}:
+                sections["linked_rendering_artifacts"].append(item)
+            if item["type"] in {"form_class", "framework_base", "class_file"}:
+                sections["linked_forms"].append(item)
+            sections["likely_callees"].append(item)
+
+    javascript = linked_artifacts.get("javascript")
+    if isinstance(javascript, dict):
+        for item in javascript.get("imports", []) or []:
+            if not item.get("file"):
+                continue
+            dependency_item = _dependency_item(
+                item_type="js_module",
+                relationship="js_import",
+                confidence="high",
+                reason=f"because this JavaScript module imports {item['module_name']}",
+                path=str(item["file"]),
+                symbol=str(item["module_name"]),
+                anchor=anchor,
+            )
+            sections["likely_callees"].append(dependency_item)
+            sections["linked_javascript"].append(dependency_item)
+        superclass = javascript.get("superclass")
+        if isinstance(superclass, dict) and superclass.get("file"):
+            dependency_item = _dependency_item(
+                item_type="js_module",
+                relationship="js_superclass",
+                confidence="high",
+                reason=str(superclass["reason"]),
+                path=str(superclass["file"]),
+                symbol=str(superclass.get("module_name") or ""),
+                anchor=anchor,
+            )
+            sections["likely_callees"].append(dependency_item)
+            sections["linked_javascript"].append(dependency_item)
+        build_artifact = javascript.get("build_artifact")
+        if isinstance(build_artifact, dict):
+            sections["linked_build_artifacts"].append(
+                _dependency_item(
+                    item_type="js_build_artifact",
+                    relationship="js_build_artifact",
+                    confidence="high",
+                    reason=str(build_artifact["reason"]),
+                    path=str(build_artifact["path"]),
+                    symbol=None,
+                    anchor=anchor,
+                )
+            )
+        if include_js_importers:
+            for importer in javascript.get("imported_by", [])[:5]:
+                sections["likely_callers"].append(
+                    _dependency_item(
+                        item_type="js_module",
+                        relationship="js_imported_by",
+                        confidence="high",
+                        reason=str(importer["reason"]),
+                        path=str(importer["file"]),
+                        symbol=str(importer["module_name"]),
+                        anchor=anchor,
+                        line=importer.get("line"),
+                    )
+                )
+
+    if include_entrypoints:
+        for entrypoint in linked_artifacts.get("entrypoints", []) or []:
+            sections["likely_callees"].append(
+                _dependency_item(
+                    item_type=_artifact_item_type(str(entrypoint["path"]), str(entrypoint.get("artifact_type"))),
+                    relationship=str(entrypoint.get("artifact_type") or "entrypoint_link"),
+                    confidence=_artifact_confidence(str(entrypoint.get("artifact_type")), "supporting"),
+                    reason=str(entrypoint["reason"]),
+                    path=str(entrypoint["path"]),
+                    symbol=None,
+                    anchor=anchor,
+                )
+            )
+
+
+def _dependency_rendering_items(node: dict[str, object], *, anchor: str) -> list[dict[str, object]]:
+    """Return flattened dependency items for a rendering/form artifact chain."""
+
+    items = [
+        _dependency_item(
+            item_type=_artifact_item_type(str(node["path"]), str(node.get("artifact_type"))),
+            relationship=str(node.get("artifact_type") or "linked_artifact"),
+            confidence=_artifact_confidence(str(node.get("artifact_type")), str(node.get("chain_role", "direct"))),
+            reason=str(node["reason"]),
+            path=str(node["path"]),
+            symbol=str(node.get("class_name") or "") or None,
+            anchor=anchor,
+        )
+    ]
+    for hop in node.get("next_hops", []) or []:
+        items.extend(_dependency_rendering_items(hop, anchor=anchor))
+    return items
+
+
+def _dependency_item_from_usage(
+    usage: dict[str, object],
+    *,
+    anchor: str,
+) -> dict[str, object] | None:
+    """Translate one high-confidence usage example into a dependency edge."""
+
+    usage_kind = str(usage["usage_kind"])
+    path = str(usage["file"])
+    confidence = str(usage["confidence"])
+    line = usage.get("line")
+    snippet = str(usage.get("snippet") or "").strip()
+    item_type = "service_test" if _is_concrete_test_path(path) else _artifact_item_type(path, None)
+
+    reason_map = {
+        "service_definition": "because this method is registered in db/services.php",
+        "test_usage": "because this concrete PHPUnit file appears to exercise the queried symbol directly",
+        "renderer_usage": "because this renderer directly calls or renders the queried symbol",
+        "form_usage": "because this form code directly calls or instantiates the queried symbol",
+        "static_method_call": "because this file contains a direct static call to the queried symbol",
+        "instance_method_call": "because this file contains a high-confidence instance call to the queried symbol",
+        "function_call": "because this file contains a direct function call to the queried symbol",
+        "js_import_usage": "because this module directly imports the queried JavaScript module",
+        "js_superclass_usage": "because this module subclasses the queried JavaScript module",
+    }
+    reason = reason_map.get(usage_kind)
+    if reason is None:
+        return None
+    if snippet:
+        reason = f"{reason}: {snippet}"
+    return _dependency_item(
+        item_type=item_type,
+        relationship=usage_kind,
+        confidence=confidence,
+        reason=reason,
+        path=path,
+        symbol=None,
+        anchor=anchor,
+        line=line,
+    )
+
+
+def _dependency_item(
+    *,
+    item_type: str,
+    relationship: str,
+    confidence: str,
+    reason: str,
+    path: str,
+    symbol: str | None,
+    anchor: str,
+    line: int | None = None,
+) -> dict[str, object]:
+    """Return a normalized dependency-neighborhood item."""
+
+    item = {
+        "type": item_type,
+        "relationship": relationship,
+        "confidence": confidence,
+        "reason": reason,
+        "path": path,
+        "symbol": symbol,
+        "anchor": anchor,
+    }
+    if line is not None:
+        item["line"] = line
+    return item
+
+
+def _finalize_dependency_sections(
+    sections: dict[str, list[dict[str, object]]],
+    *,
+    limit: int,
+) -> dict[str, object]:
+    """Deduplicate, rank, bound, and omit empty dependency sections."""
+
+    finalized: dict[str, object] = {}
+    for section_name, items in sections.items():
+        merged = _merge_dependency_section_items(items, section_name=section_name, limit=limit)
+        if merged:
+            finalized[section_name] = merged
+    return finalized
+
+
+def _merge_dependency_section_items(
+    items: list[dict[str, object]],
+    *,
+    section_name: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return one bounded dependency section with same-path items merged."""
+
+    merged: dict[str, dict[str, object]] = {}
+    for item in items:
+        path_key = str(item["path"])
+        existing = merged.get(path_key)
+        if existing is None:
+            candidate = dict(item)
+            candidate["related_relationships"] = [str(item["relationship"])]
+            merged[path_key] = candidate
+            continue
+
+        relationships = set(existing.get("related_relationships", []))
+        relationships.add(str(item["relationship"]))
+        existing["related_relationships"] = sorted(relationships)
+
+        reasons = {part.strip() for part in str(existing["reason"]).split(" | ") if part.strip()}
+        for part in str(item["reason"]).split(" | "):
+            if part.strip():
+                reasons.add(part.strip())
+        existing["reason"] = " | ".join(sorted(reasons))
+
+        if _confidence_rank(str(item["confidence"])) < _confidence_rank(str(existing["confidence"])):
+            existing["confidence"] = item["confidence"]
+
+        current_score = _dependency_section_priority(section_name, existing)
+        candidate_score = _dependency_section_priority(section_name, item)
+        if candidate_score < current_score:
+            existing["type"] = item["type"]
+            existing["relationship"] = item["relationship"]
+            existing["symbol"] = item.get("symbol")
+            if item.get("line") is not None:
+                existing["line"] = item.get("line")
+
+    ordered = sorted(
+        merged.values(),
+        key=lambda item: (
+            _confidence_rank(str(item["confidence"])),
+            _dependency_section_priority(section_name, item),
+            str(item["path"]),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    return ordered[:limit]
+
+
+def _dependency_section_priority(section_name: str, item: dict[str, object]) -> int:
+    """Return a small ranking score for one dependency-neighborhood section item."""
+
+    relationship = str(item["relationship"])
+    item_type = str(item["type"])
+    path = str(item["path"])
+
+    if section_name == "likely_callers":
+        if relationship == "service_definition":
+            return 0
+        if relationship in {"renderer_usage", "form_usage"}:
+            return 5
+        if relationship in {"static_method_call", "instance_method_call", "function_call"}:
+            return 10
+        if relationship in {"test_usage", "js_imported_by", "js_import_usage", "js_superclass_usage"}:
+            return 15
+        return 40
+
+    if section_name == "likely_callees":
+        if item_type == "service_implementation":
+            return 0
+        if item_type in {"output_class", "form_class"}:
+            return 5
+        if relationship == "js_superclass":
+            return 8
+        if relationship == "js_import":
+            return 10
+        if item_type in {"renderer_file", "template_file"}:
+            return 15
+        if item_type in {"framework_base", "class_file"}:
+            return 20
+        return 40
+
+    if section_name == "linked_tests":
+        return 0 if _is_concrete_test_path(path) else 30
+
+    if section_name == "linked_services":
+        if relationship == "service_definition":
+            return 0
+        if item_type == "service_implementation":
+            return 5
+        return 20
+
+    if section_name == "linked_rendering_artifacts":
+        if item_type == "output_class":
+            return 0
+        if item_type == "renderer_file":
+            return 5
+        if item_type == "template_file":
+            return 10
+        return 20
+
+    if section_name == "linked_forms":
+        if item_type == "form_class":
+            return 0
+        if item_type == "framework_base":
+            return 5
+        if item_type == "class_file":
+            return 10
+        return 20
+
+    if section_name == "linked_javascript":
+        if relationship == "js_superclass":
+            return 0
+        if relationship == "js_import":
+            return 5
+        if relationship == "js_imported_by":
+            return 10
+        return 20
+
+    if section_name == "linked_build_artifacts":
+        return 0
+
+    return 50
 
 
 def _artifact_navigation_items(
