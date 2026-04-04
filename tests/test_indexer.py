@@ -1007,53 +1007,73 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             connection,
             symbol_query="mod_assign\\external\\start_submission::execute",
         )
-        caller_paths = [item["path"] for item in service_neighborhood["likely_callers"]]
+        assert service_neighborhood["primary_focus"]
+        assert service_neighborhood["primary_focus"][0]["path"] == "mod/assign/db/services.php"
+        caller_items = service_neighborhood["sections"]["likely_callers"]["items"]
+        caller_paths = [item["path"] for item in caller_items]
         assert "mod/assign/db/services.php" in caller_paths
-        assert "mod/assign/db/services.php" == service_neighborhood["likely_callers"][0]["path"]
-        linked_test_paths = [item["path"] for item in service_neighborhood["linked_tests"]]
+        assert "mod/assign/db/services.php" == caller_items[0]["path"]
+        assert "mod/assign/tests/external/start_submission_test.php" not in caller_paths
+        linked_test_paths = [item["path"] for item in service_neighborhood["sections"]["linked_tests"]["items"]]
         assert "mod/assign/tests/external/start_submission_test.php" in linked_test_paths
-        assert all("confidence" in item and "reason" in item for item in service_neighborhood["likely_callers"])
+        assert "likely_callees" not in service_neighborhood["sections"] or not service_neighborhood["sections"]["likely_callees"]["items"]
+        assert "mod/assign/db/services.php" in {
+            item["path"] for item in service_neighborhood["sections"]["linked_services"]["items"]
+        }
+        assert service_neighborhood["sections"]["likely_callers"]["summary"]
+        assert all("confidence" in item and "explanation" in item and "score" in item for item in caller_items)
 
         service_file_neighborhood = dependency_neighborhood(
             connection,
             file_path="mod/assign/db/services.php",
         )
         assert "mod/assign/classes/external/start_submission.php" in {
-            item["path"] for item in service_file_neighborhood["likely_callees"]
+            item["path"] for item in service_file_neighborhood["sections"]["likely_callees"]["items"]
         }
         assert "mod/assign/tests/external/start_submission_test.php" in {
-            item["path"] for item in service_file_neighborhood["linked_tests"]
+            item["path"] for item in service_file_neighborhood["sections"]["linked_tests"]["items"]
         }
 
         rendering_neighborhood = dependency_neighborhood(
             connection,
             symbol_query="assign::view",
         )
-        rendering_paths = [item["path"] for item in rendering_neighborhood["linked_rendering_artifacts"]]
+        assert "likely_callees" not in rendering_neighborhood["sections"]
+        rendering_paths = [item["path"] for item in rendering_neighborhood["sections"]["linked_rendering_artifacts"]["items"]]
+        assert rendering_paths[0] == "mod/assign/classes/output/grading_app.php"
         assert "mod/assign/classes/output/renderer.php" in rendering_paths
         assert "mod/assign/templates/grading_app.mustache" in rendering_paths
-        assert len(rendering_paths) <= 6
+        assert "mod/assign/classes/local/assign_base.php" not in rendering_paths
+        assert len(rendering_paths) <= 4
 
         provider_neighborhood = dependency_neighborhood(
             connection,
             symbol_query="aiprovider_openai\\provider::get_action_settings",
         )
-        form_paths = [item["path"] for item in provider_neighborhood["linked_forms"]]
+        provider_callee_paths = [item["path"] for item in provider_neighborhood["sections"]["likely_callees"]["items"]]
+        assert provider_callee_paths[0] == "ai/provider/openai/classes/form/action_generate_image_form.php"
+        assert "ai/provider/openai/classes/form/action_form.php" not in provider_callee_paths
+        form_paths = [item["path"] for item in provider_neighborhood["sections"]["linked_forms"]["items"]]
+        assert form_paths[0] == "ai/provider/openai/classes/form/action_generate_image_form.php"
         assert "ai/provider/openai/classes/form/action_form.php" in form_paths
         assert "ai/classes/form/action_settings_form.php" in form_paths
-        assert "lib/formslib.php" in form_paths
+        framework_paths = [item["path"] for item in provider_neighborhood["sections"]["linked_framework"]["items"]]
+        assert "ai/classes/provider.php" in framework_paths
+        assert "lib/formslib.php" in framework_paths
+        assert provider_neighborhood["sections"]["linked_framework"]["items"][0]["path"] == "lib/formslib.php"
 
         js_neighborhood = dependency_neighborhood(
             connection,
             symbol_query="core_ai/aiprovider_action_management_table",
         )
-        js_callee_paths = [item["path"] for item in js_neighborhood["likely_callees"]]
+        js_callee_paths = [item["path"] for item in js_neighborhood["sections"]["likely_callees"]["items"]]
         assert "admin/amd/src/plugin_management_table.js" in js_callee_paths
         assert "lib/amd/src/ajax.js" in js_callee_paths
         assert "ai/amd/build/aiprovider_action_management_table.min.js" in {
-            item["path"] for item in js_neighborhood["linked_build_artifacts"]
+            item["path"] for item in js_neighborhood["sections"]["linked_build_artifacts"]["items"]
         }
-        assert all("confidence" in item and "reason" in item for item in js_neighborhood["likely_callees"])
+        assert "linked_rendering_artifacts" not in js_neighborhood["sections"]
+        assert all("confidence" in item and "explanation" in item and "score" in item for item in js_neighborhood["sections"]["likely_callees"]["items"])
     finally:
         connection.close()
 

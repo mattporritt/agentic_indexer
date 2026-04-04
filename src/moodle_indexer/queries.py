@@ -797,6 +797,14 @@ def dependency_neighborhood(
       extracted during indexing
     - linked tests and linked artifact companions are exposed as first-class
       sections so agents can inspect a small, practical implementation surface
+
+    Phase 4C keeps the same relationships and depth, but upgrades the payload
+    into a ranked, decision-ready view:
+    - each section is summarized and its items are scored deterministically
+    - the output surfaces a small cross-section ``primary_focus`` list so an
+      agent can start with the most actionable files first
+    - explanations and suggested actions are presentation-layer refinements on
+      top of the existing trusted relationships rather than new analysis
     """
 
     if bool(symbol_query) == bool(file_path):
@@ -1374,31 +1382,27 @@ def _dependency_sections_for_symbol_results(
         "linked_services": [],
         "linked_rendering_artifacts": [],
         "linked_forms": [],
+        "linked_framework": [],
         "linked_javascript": [],
         "linked_build_artifacts": [],
     }
 
     for match in matches:
-        anchor = str(match.get("fqname") or match.get("module_name") or match.get("file") or "")
+        # Dependency-neighborhood ranking is path-aware, so symbol-driven
+        # neighborhoods should anchor on the owning file whenever we have one.
+        # Falling back to fqname/module_name is still fine for symbols without a
+        # concrete file anchor, but using the file keeps same-component
+        # rendering/form chains ordered like real "inspect next" steps.
+        anchor = str(match.get("file") or match.get("fqname") or match.get("module_name") or "")
         symbol_type = str(match.get("symbol_type") or "")
 
         for usage in match.get("usage_examples", []):
             item = _dependency_item_from_usage(usage, anchor=anchor)
             if item is not None:
-                sections["likely_callers"].append(item)
-                if item["type"] == "service_test":
-                    sections["linked_tests"].append(
-                        _dependency_item(
-                            item_type="service_test",
-                            relationship="test_usage",
-                            confidence=str(item["confidence"]),
-                            reason=str(item["reason"]),
-                            path=str(item["path"]),
-                            symbol=None,
-                            anchor=anchor,
-                            line=item.get("line"),
-                        )
-                    )
+                if str(item["relationship"]) == "test_usage":
+                    sections["linked_tests"].append(item)
+                else:
+                    sections["likely_callers"].append(item)
 
         linked_artifacts = match.get("linked_artifacts", {})
         _extend_dependency_sections_from_linked_artifacts(
@@ -1408,6 +1412,7 @@ def _dependency_sections_for_symbol_results(
             include_js_importers=symbol_type != "js_module",
             include_entrypoints=False,
             owning_file=str(match.get("file") or ""),
+            execution_mode="symbol",
         )
 
     return _finalize_dependency_sections(sections, limit=limit)
@@ -1428,6 +1433,7 @@ def _dependency_sections_for_file_context(
         "linked_services": [],
         "linked_rendering_artifacts": [],
         "linked_forms": [],
+        "linked_framework": [],
         "linked_javascript": [],
         "linked_build_artifacts": [],
     }
@@ -1456,6 +1462,7 @@ def _dependency_sections_for_file_context(
         include_js_importers=True,
         include_entrypoints=True,
         owning_file=anchor,
+        execution_mode="file",
     )
 
     return _finalize_dependency_sections(sections, limit=limit)
@@ -1469,6 +1476,7 @@ def _extend_dependency_sections_from_linked_artifacts(
     include_js_importers: bool,
     include_entrypoints: bool,
     owning_file: str,
+    execution_mode: str,
 ) -> None:
     """Project trusted linked-artifact structures into dependency sections."""
 
@@ -1517,9 +1525,19 @@ def _extend_dependency_sections_from_linked_artifacts(
         for item in _dependency_rendering_items(rendering, anchor=anchor):
             if item["type"] in {"output_class", "renderer_file", "template_file"}:
                 sections["linked_rendering_artifacts"].append(item)
-            if item["type"] in {"form_class", "framework_base", "class_file"}:
+                continue
+            if item["type"] == "form_class":
                 sections["linked_forms"].append(item)
-            sections["likely_callees"].append(item)
+                if (
+                    execution_mode == "symbol"
+                    and str(item.get("chain_role", "direct")) == "direct"
+                    and _is_direct_form_callee(item)
+                ):
+                    sections["likely_callees"].append(item)
+                continue
+            if item["type"] in {"framework_base", "class_file"}:
+                sections["linked_framework"].append(item)
+                continue
 
     javascript = linked_artifacts.get("javascript")
     if isinstance(javascript, dict):
@@ -1580,31 +1598,55 @@ def _extend_dependency_sections_from_linked_artifacts(
 
     if include_entrypoints:
         for entrypoint in linked_artifacts.get("entrypoints", []) or []:
-            sections["likely_callees"].append(
-                _dependency_item(
-                    item_type=_artifact_item_type(str(entrypoint["path"]), str(entrypoint.get("artifact_type"))),
-                    relationship=str(entrypoint.get("artifact_type") or "entrypoint_link"),
-                    confidence=_artifact_confidence(str(entrypoint.get("artifact_type")), "supporting"),
-                    reason=str(entrypoint["reason"]),
-                    path=str(entrypoint["path"]),
-                    symbol=None,
-                    anchor=anchor,
-                )
+            item = _dependency_item(
+                item_type=_artifact_item_type(str(entrypoint["path"]), str(entrypoint.get("artifact_type"))),
+                relationship=str(entrypoint.get("artifact_type") or "entrypoint_link"),
+                confidence=_artifact_confidence(str(entrypoint.get("artifact_type")), "supporting"),
+                reason=str(entrypoint["reason"]),
+                path=str(entrypoint["path"]),
+                symbol=None,
+                anchor=anchor,
             )
+            if item["type"] in {"output_class", "renderer_file", "template_file"}:
+                sections["linked_rendering_artifacts"].append(item)
+            elif item["type"] == "form_class":
+                sections["linked_forms"].append(item)
+            elif item["type"] in {"framework_base", "class_file"}:
+                sections["linked_framework"].append(item)
+            elif item["type"] in {"service_definition", "service_implementation"}:
+                sections["linked_services"].append(item)
+            elif item["type"] == "service_test":
+                sections["linked_tests"].append(item)
 
 
 def _dependency_rendering_items(node: dict[str, object], *, anchor: str) -> list[dict[str, object]]:
     """Return flattened dependency items for a rendering/form artifact chain."""
 
+    path = str(node["path"])
+    item_type = _artifact_item_type(path, str(node.get("artifact_type")))
+    symbol = str(node.get("class_name") or "") or None
+    reason = str(node["reason"])
+    if item_type == "form_class" and symbol:
+        if str(node.get("chain_role", "direct")) == "direct":
+            reason = f"because the queried code directly references or instantiates form class {symbol}"
+        else:
+            reason = f"because this is an intermediate form class in the resolved form inheritance chain for {symbol}"
+    elif item_type == "framework_base" and path == "lib/formslib.php":
+        reason = "because this is the Moodle form framework base reached through the resolved form inheritance chain"
+    elif item_type == "class_file" and symbol:
+        reason = f"because this is the base class implementation for {symbol}"
+
     items = [
         _dependency_item(
-            item_type=_artifact_item_type(str(node["path"]), str(node.get("artifact_type"))),
+            item_type=item_type,
             relationship=str(node.get("artifact_type") or "linked_artifact"),
             confidence=_artifact_confidence(str(node.get("artifact_type")), str(node.get("chain_role", "direct"))),
-            reason=str(node["reason"]),
-            path=str(node["path"]),
-            symbol=str(node.get("class_name") or "") or None,
+            reason=reason,
+            path=path,
+            symbol=symbol,
             anchor=anchor,
+            chain_role=str(node.get("chain_role", "direct")),
+            has_next_hops=bool(node.get("next_hops")),
         )
     ]
     for hop in node.get("next_hops", []) or []:
@@ -1664,6 +1706,8 @@ def _dependency_item(
     symbol: str | None,
     anchor: str,
     line: int | None = None,
+    chain_role: str | None = None,
+    has_next_hops: bool | None = None,
 ) -> dict[str, object]:
     """Return a normalized dependency-neighborhood item."""
 
@@ -1678,7 +1722,42 @@ def _dependency_item(
     }
     if line is not None:
         item["line"] = line
+    if chain_role is not None:
+        item["chain_role"] = chain_role
+    if has_next_hops is not None:
+        item["has_next_hops"] = has_next_hops
     return item
+
+
+def _same_component_root(anchor: str, path: str) -> bool:
+    """Return whether two Moodle paths appear to belong to the same component root."""
+
+    def component_root(candidate: str) -> str:
+        parts = [part for part in candidate.split("/") if part]
+        if len(parts) >= 3 and parts[:2] == ["admin", "tool"]:
+            return "/".join(parts[:3])
+        if len(parts) >= 3 and parts[:2] == ["ai", "provider"]:
+            return "/".join(parts[:3])
+        if len(parts) >= 2 and parts[0] in {"mod", "block", "local", "theme", "enrol", "report", "question", "course"}:
+            return "/".join(parts[:2])
+        return parts[0] if parts else candidate
+
+    return component_root(anchor) == component_root(path)
+
+
+def _is_direct_form_callee(item: dict[str, object]) -> bool:
+    """Return whether a direct form link should behave like an execution callee.
+
+    Provider neighborhoods often include both concrete forms and shared form
+    bases. Only concrete forms belong in ``likely_callees``; shared bases stay
+    in ``linked_forms``/``linked_framework`` so the neighborhood reads like an
+    actionable chain instead of a mixed bag of instantiations and inheritance.
+    """
+
+    symbol = str(item.get("symbol") or "")
+    if "\\" in symbol:
+        return True
+    return bool(item.get("has_next_hops"))
 
 
 def _finalize_dependency_sections(
@@ -1686,14 +1765,33 @@ def _finalize_dependency_sections(
     *,
     limit: int,
 ) -> dict[str, object]:
-    """Deduplicate, rank, bound, and omit empty dependency sections."""
+    """Deduplicate, rank, decorate, and bound dependency sections.
 
-    finalized: dict[str, object] = {}
+    This stays intentionally local: we score only the already trusted
+    relationships in each bounded section, then derive a tiny cross-section
+    ``primary_focus`` list for agent workflows.
+    """
+
+    finalized_sections: dict[str, dict[str, object]] = {}
+    focus_candidates: list[dict[str, object]] = []
     for section_name, items in sections.items():
-        merged = _merge_dependency_section_items(items, section_name=section_name, limit=limit)
+        section_limit = limit
+        if section_name in {"linked_rendering_artifacts", "linked_forms", "linked_framework"}:
+            section_limit = min(limit, 6)
+        merged = _merge_dependency_section_items(items, section_name=section_name, limit=section_limit)
         if merged:
-            finalized[section_name] = merged
-    return finalized
+            decorated = [_present_dependency_section_item(section_name, item) for item in merged]
+            finalized_sections[section_name] = {
+                "summary": _dependency_section_summary(section_name),
+                "items": decorated,
+            }
+            focus_candidates.extend(
+                [{**item, "_section": section_name} for item in decorated]
+            )
+    return {
+        "primary_focus": _dependency_primary_focus(focus_candidates),
+        "sections": finalized_sections,
+    }
 
 
 def _merge_dependency_section_items(
@@ -1739,13 +1837,271 @@ def _merge_dependency_section_items(
     ordered = sorted(
         merged.values(),
         key=lambda item: (
-            _confidence_rank(str(item["confidence"])),
+            -_dependency_item_score(section_name, item),
             _dependency_section_priority(section_name, item),
             str(item["path"]),
             str(item.get("symbol") or ""),
         ),
     )
     return ordered[:limit]
+
+
+def _present_dependency_section_item(section_name: str, item: dict[str, object]) -> dict[str, object]:
+    """Return the public Phase 4C item shape for one dependency item."""
+
+    presented = {
+        "path": item["path"],
+        "symbol": item.get("symbol"),
+        "type": item["type"],
+        "relationship": item["relationship"],
+        "confidence": item["confidence"],
+        "score": _dependency_item_score(section_name, item),
+        "explanation": _dependency_explanation(section_name, item),
+        "related_relationships": item.get("related_relationships", []),
+    }
+    if item.get("line") is not None:
+        presented["line"] = item["line"]
+    suggested_actions = _dependency_suggested_actions(section_name, item)
+    if suggested_actions:
+        presented["suggested_actions"] = suggested_actions
+    return presented
+
+
+def _dependency_primary_focus(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return the top cross-section starting points for an agent."""
+
+    if not items:
+        return []
+
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            -float(item["score"]),
+            _dependency_primary_focus_priority(str(item["_section"]), str(item["relationship"]), str(item["type"])),
+            str(item["path"]),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    focus: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    for item in ordered:
+        path = str(item["path"])
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        focus.append(
+            {
+                "path": path,
+                "symbol": item.get("symbol"),
+                "reason": item["explanation"],
+                "confidence": item["confidence"],
+                "score": item["score"],
+            }
+        )
+        if len(focus) >= 4:
+            break
+    return focus[: max(2, min(4, len(focus)))] if focus else []
+
+
+def _dependency_primary_focus_priority(section_name: str, relationship: str, item_type: str) -> int:
+    """Prefer the most actionable starting points across sections."""
+
+    if relationship == "service_implementation":
+        return 0
+    if relationship == "service_definition":
+        return 1
+    if item_type == "service_test" or section_name == "linked_tests":
+        return 2
+    if item_type == "output_class":
+        return 3
+    if item_type == "form_class":
+        return 4
+    if relationship in {"js_superclass", "js_import"}:
+        return 5
+    if item_type == "template_file":
+        return 6
+    if item_type == "renderer_file":
+        return 7
+    if item_type == "js_build_artifact":
+        return 8
+    return 20
+
+
+def _dependency_section_summary(section_name: str) -> str:
+    """Return a short explanation of one dependency-neighborhood section."""
+
+    return {
+        "likely_callers": "Primary entrypoints or direct usages invoking this symbol or file.",
+        "likely_callees": "Direct dependencies, implementations, or invoked modules this symbol or file relies on.",
+        "linked_tests": "Tests validating behaviour of this symbol or feature slice.",
+        "linked_services": "Web service registration and implementation companions attached to this slice.",
+        "linked_rendering_artifacts": "Rendering companions such as output classes, renderers, and templates.",
+        "linked_forms": "Concrete and intermediate form classes attached to this provider or workflow.",
+        "linked_framework": "Shared framework or base classes that shape the current behavior.",
+        "linked_javascript": "JavaScript companion modules directly connected to this slice.",
+        "linked_build_artifacts": "Generated build artifacts that should be regenerated or verified after source changes.",
+    }.get(section_name, "Bounded related artifacts for this local dependency neighborhood.")
+
+
+def _dependency_item_score(section_name: str, item: dict[str, object]) -> float:
+    """Return a normalized Phase 4C score in the range 0.0..1.0."""
+
+    score = (
+        _dependency_relationship_weight(section_name, item)
+        + _dependency_confidence_weight(str(item["confidence"]))
+        + _dependency_proximity_weight(str(item.get("anchor") or ""), str(item["path"]))
+        + _dependency_reinforcement_weight(item)
+    )
+    return round(min(1.0, score), 2)
+
+
+def _dependency_relationship_weight(section_name: str, item: dict[str, object]) -> float:
+    """Return the base relationship weight for one dependency item."""
+
+    relationship = str(item["relationship"])
+    item_type = str(item["type"])
+
+    if relationship in {
+        "instance_method_call",
+        "static_method_call",
+        "function_call",
+        "renderer_usage",
+        "form_usage",
+        "js_import",
+        "js_imported_by",
+        "js_superclass",
+        "service_implementation",
+        "form_class",
+    }:
+        return 0.4
+    if relationship == "service_definition":
+        return 0.4
+    if relationship in {"service_test", "linked_test", "test_usage"} or item_type == "service_test":
+        return 0.35
+    if item_type in {"renderer_file", "template_file", "output_class", "js_build_artifact"}:
+        return 0.25
+    if item_type in {"framework_base", "class_file"} or section_name in {"linked_services", "linked_framework"}:
+        return 0.15
+    return 0.15
+
+
+def _dependency_confidence_weight(confidence: str) -> float:
+    """Return the configured confidence weight."""
+
+    return {"high": 0.4, "medium": 0.25, "low": 0.0}.get(confidence, 0.0)
+
+
+def _dependency_proximity_weight(anchor: str, path: str) -> float:
+    """Return the configured proximity weight."""
+
+    if not anchor:
+        return 0.1
+    if anchor == path:
+        return 0.3
+    if _same_component_root(anchor, path):
+        return 0.2
+    return 0.1
+
+
+def _dependency_reinforcement_weight(item: dict[str, object]) -> float:
+    """Return the reinforcement bonus for multi-signal items."""
+
+    related = item.get("related_relationships", [])
+    additional = max(0, len(related) - 1)
+    return min(0.3, additional * 0.1)
+
+
+def _dependency_explanation(section_name: str, item: dict[str, object]) -> str:
+    """Return a decision-grade explanation for one dependency item."""
+
+    relationship = str(item["relationship"])
+    item_type = str(item["type"])
+    path = str(item["path"])
+    symbol = str(item.get("symbol") or "").strip()
+    chain_role = str(item.get("chain_role") or "")
+
+    if relationship == "service_definition":
+        return "Registers this method as a web service entrypoint; update it if the API name, class mapping, or method signature changes."
+    if relationship == "service_implementation":
+        return "Implements the web service behavior behind this slice; update it if the API logic, parameters, or return payload change."
+    if relationship in {"service_test", "linked_test", "test_usage"} or item_type == "service_test":
+        return "Concrete PHPUnit coverage for this behavior; update expected results if the implementation or API contract changes."
+    if relationship == "renderer_usage":
+        return "Direct renderer-side caller of this method; inspect it if the rendered output flow or returned data changes."
+    if relationship == "form_usage":
+        return "Direct form-side caller of this symbol; update it if submitted fields, validation, or downstream behavior change."
+    if relationship == "instance_method_call":
+        return "High-confidence direct caller of this method; update it if the method signature or returned behavior changes."
+    if relationship == "static_method_call":
+        return "Direct static caller of this method; update it if the API signature or class contract changes."
+    if relationship == "function_call":
+        return "Direct function caller; update it if the function signature or behavior changes."
+    if relationship == "js_import":
+        return f"Imports this JavaScript module{' (' + symbol + ')' if symbol else ''}; inspect it if the imported API or expected exports change."
+    if relationship == "js_imported_by":
+        return f"Imports the queried JavaScript module{' as ' + symbol if symbol else ''}; inspect it if source changes ripple into callers."
+    if relationship == "js_superclass":
+        return "Superclass module for this JavaScript code; inspect it if inherited client-side behavior changes."
+    if relationship == "js_build_artifact":
+        return "Built AMD artifact generated from the source module; regenerate or verify it if the source module changes."
+    if item_type == "output_class":
+        return "Output/renderable class for this feature flow; update it if the rendered data structure or exposed fields change."
+    if item_type == "renderer_file":
+        return "Renderer companion for this feature flow; update it if rendering logic or template selection changes."
+    if item_type == "template_file":
+        return "Mustache template used by the linked rendering flow; update it if the rendered structure or template fields change."
+    if item_type == "form_class":
+        if chain_role == "direct":
+            return "Concrete form used by this provider or workflow; update it if form fields, defaults, or validation rules change."
+        return "Intermediate form base in this workflow; inspect it if shared form fields or validation behavior change."
+    if item_type == "framework_base" and path == "lib/formslib.php":
+        return "Moodle form framework base for this form chain; inspect it only if the change affects shared form framework behavior."
+    if item_type == "framework_base":
+        return "Framework companion shaping this workflow; inspect it if the change affects shared framework behavior."
+    if item_type == "class_file":
+        return "Base class implementation in this chain; inspect it if shared inherited behavior or parent contracts change."
+    if section_name == "linked_services":
+        return "Service companion in the same feature slice; inspect it if the external API wiring changes."
+    return str(item.get("reason") or "Related implementation surface for this dependency neighborhood.")
+
+
+def _dependency_suggested_actions(section_name: str, item: dict[str, object]) -> list[str]:
+    """Return optional high-confidence next-step hints for one item."""
+
+    if str(item["confidence"]) != "high":
+        return []
+
+    relationship = str(item["relationship"])
+    item_type = str(item["type"])
+    path = str(item["path"])
+
+    if relationship == "service_definition":
+        return ["Update service registration if the method name, class mapping, or API parameters change."]
+    if relationship == "service_implementation":
+        return ["Update API logic or return payload handling if the service behavior changes."]
+    if relationship in {"service_test", "linked_test", "test_usage"} or item_type == "service_test":
+        return ["Update corresponding PHPUnit test expectations."]
+    if item_type == "output_class":
+        return ["Update renderable data assembly if output fields or structure change."]
+    if item_type == "renderer_file":
+        return ["Update renderer logic if output selection or rendering flow changes."]
+    if item_type == "template_file":
+        return ["Update Mustache template if output structure or exposed fields change."]
+    if item_type == "form_class":
+        return ["Update form fields or validation rules if this workflow changes."]
+    if item_type == "framework_base" and path == "lib/formslib.php":
+        return ["Inspect shared form framework behavior only if the change affects framework-level form handling."]
+    if item_type == "class_file":
+        return ["Check inherited behavior if the change affects shared parent logic."]
+    if relationship == "js_import":
+        return ["Update imported-module usage if the JavaScript API contract changes."]
+    if relationship == "js_superclass":
+        return ["Inspect inherited client-side behavior if subclass behavior changes."]
+    if relationship == "js_build_artifact":
+        return ["Regenerate or verify the built AMD artifact after source changes."]
+    if relationship in {"instance_method_call", "static_method_call", "function_call", "renderer_usage", "form_usage"}:
+        return ["Update this caller if the symbol signature or returned behavior changes."]
+    return []
 
 
 def _dependency_section_priority(section_name: str, item: dict[str, object]) -> int:
@@ -1762,23 +2118,19 @@ def _dependency_section_priority(section_name: str, item: dict[str, object]) -> 
             return 5
         if relationship in {"static_method_call", "instance_method_call", "function_call"}:
             return 10
-        if relationship in {"test_usage", "js_imported_by", "js_import_usage", "js_superclass_usage"}:
+        if relationship in {"js_imported_by", "js_import_usage", "js_superclass_usage"}:
             return 15
         return 40
 
     if section_name == "likely_callees":
         if item_type == "service_implementation":
             return 0
-        if item_type in {"output_class", "form_class"}:
+        if item_type == "form_class":
             return 5
         if relationship == "js_superclass":
             return 8
         if relationship == "js_import":
             return 10
-        if item_type in {"renderer_file", "template_file"}:
-            return 15
-        if item_type in {"framework_base", "class_file"}:
-            return 20
         return 40
 
     if section_name == "linked_tests":
@@ -1792,16 +2144,27 @@ def _dependency_section_priority(section_name: str, item: dict[str, object]) -> 
         return 20
 
     if section_name == "linked_rendering_artifacts":
+        same_component = _same_component_root(str(item.get("anchor") or ""), path)
+        has_next_hops = bool(item.get("has_next_hops"))
         if item_type == "output_class":
-            return 0
+            return 0 if has_next_hops and same_component else 4 if same_component else 12
         if item_type == "renderer_file":
-            return 5
+            return 2 if same_component else 8
         if item_type == "template_file":
-            return 10
+            return 3 if same_component else 9
         return 20
 
     if section_name == "linked_forms":
         if item_type == "form_class":
+            return 0 if str(item.get("chain_role", "direct")) == "direct" else 5
+        if item_type == "framework_base":
+            return 10
+        if item_type == "class_file":
+            return 8
+        return 20
+
+    if section_name == "linked_framework":
+        if path == "lib/formslib.php":
             return 0
         if item_type == "framework_base":
             return 5

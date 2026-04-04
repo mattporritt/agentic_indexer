@@ -391,9 +391,9 @@ relationships:
 Phase 4B adds one more bounded, graph-like view:
 
 - `dependency-neighborhood`: a small confidence-aware neighborhood around a
-  symbol or file, split into likely callers, likely callees, linked tests, and
-  linked artifact companion sections where the current index has strong local
-  evidence
+  symbol or file, split into ranked sections such as likely callers, likely
+  callees, linked tests, and linked artifact companion sections where the
+  current index has strong local evidence
 
 These agent-oriented navigation endpoints are intentionally confidence-aware:
 
@@ -418,12 +418,23 @@ bounded local edges, not a full call graph:
 - likely callers come from strong direct evidence such as service
   registrations, direct usage examples, and direct JS importers
 - likely callees come from direct linked artifacts such as service
-  implementations, output classes, renderers, templates, concrete forms,
-  framework bases, JS imports, and JS superclass modules
+  implementations, concrete forms, JS imports, and JS superclass modules
 - linked tests are returned as a first-class section when concrete PHPUnit
   files can be tied directly to the symbol or file
+- structural companions such as rendering artifacts, templates, form bases, and
+  framework files stay in `linked_*` sections rather than leaking into
+  `likely_callers` or `likely_callees`
 - each section is bounded and confidence-aware so the output stays small enough
   for an agent to inspect immediately
+- each dependency-neighborhood section now carries:
+  - a short `summary`
+  - ranked `items`
+  - a deterministic `score` per item based on relationship strength,
+    confidence, proximity, and reinforced multi-signal evidence
+- the payload also exposes a small `primary_focus` list so an agent can start
+  with the most actionable files first instead of scanning every section
+- item `explanation` values are decision-oriented and try to answer both why a
+  file matters and when it would need to change
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
 will rank direct static calls, simple `new ClassName(...)` to `$var->method()`
