@@ -16,7 +16,15 @@ from moodle_indexer.config import build_index_config
 from moodle_indexer.errors import IndexerError
 from moodle_indexer.indexer import build_index
 from moodle_indexer.json_output import dumps_json, error_payload, success_payload
-from moodle_indexer.queries import component_summary, file_context, find_definition, find_symbol, suggest_related
+from moodle_indexer.queries import (
+    component_summary,
+    file_context,
+    find_definition,
+    find_related_definitions,
+    find_symbol,
+    suggest_edit_surface,
+    suggest_related,
+)
 from moodle_indexer.store import open_database
 
 
@@ -68,6 +76,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include a small number of usage examples.",
     )
 
+    related_definitions_parser = subparsers.add_parser(
+        "find-related-definitions",
+        help="Return bounded related definitions and artifacts around a symbol or file.",
+    )
+    related_definitions_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    related_definitions_target = related_definitions_parser.add_mutually_exclusive_group(required=True)
+    related_definitions_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    related_definitions_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    related_definitions_parser.add_argument(
+        "--limit",
+        type=int,
+        default=12,
+        help="Maximum number of primary or secondary related items to return.",
+    )
+
+    edit_surface_parser = subparsers.add_parser(
+        "suggest-edit-surface",
+        help="Return the likely primary and secondary edit surface around a symbol or file.",
+    )
+    edit_surface_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    edit_surface_target = edit_surface_parser.add_mutually_exclusive_group(required=True)
+    edit_surface_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    edit_surface_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    edit_surface_parser.add_argument(
+        "--limit",
+        type=int,
+        default=12,
+        help="Maximum number of primary or secondary edit-surface items to return.",
+    )
+
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     file_parser.add_argument(
@@ -111,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_find_symbol(args.db_path, args.symbol)
         elif args.command == "find-definition":
             payload = run_find_definition(args.db_path, args.symbol, args.type, args.limit, args.include_usages)
+        elif args.command == "find-related-definitions":
+            payload = run_find_related_definitions(args.db_path, args.symbol, args.file, args.limit)
+        elif args.command == "suggest-edit-surface":
+            payload = run_suggest_edit_surface(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -156,6 +204,32 @@ def run_find_definition(db_path: str, symbol: str, symbol_type: str, limit: int,
         return success_payload(
             "find-definition",
             find_definition(connection, symbol, symbol_type=symbol_type, limit=limit, include_usages=include_usages),
+        )
+    finally:
+        connection.close()
+
+
+def run_find_related_definitions(db_path: str, symbol: str | None, file_path: str | None, limit: int) -> dict:
+    """Execute the ``find-related-definitions`` command."""
+
+    connection = open_database(Path(db_path).expanduser().resolve())
+    try:
+        return success_payload(
+            "find-related-definitions",
+            find_related_definitions(connection, symbol_query=symbol, file_path=file_path, limit=limit),
+        )
+    finally:
+        connection.close()
+
+
+def run_suggest_edit_surface(db_path: str, symbol: str | None, file_path: str | None, limit: int) -> dict:
+    """Execute the ``suggest-edit-surface`` command."""
+
+    connection = open_database(Path(db_path).expanduser().resolve())
+    try:
+        return success_payload(
+            "suggest-edit-surface",
+            suggest_edit_surface(connection, symbol_query=symbol, file_path=file_path, limit=limit),
         )
     finally:
         connection.close()

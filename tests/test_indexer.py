@@ -17,7 +17,15 @@ from moodle_indexer.indexer import build_index
 from moodle_indexer.js_modules import resolve_js_module
 from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
 from moodle_indexer.php_parser import ParsedMethod, ParsedSymbol, _merge_symbol_metadata
-from moodle_indexer.queries import component_summary, file_context, find_definition, find_symbol, suggest_related
+from moodle_indexer.queries import (
+    component_summary,
+    file_context,
+    find_definition,
+    find_related_definitions,
+    find_symbol,
+    suggest_edit_surface,
+    suggest_related,
+)
 from moodle_indexer.store import open_database
 
 
@@ -442,6 +450,10 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert {
             item["file"] for item in start_submission_match["linked_artifacts"]["services"][0]["related_tests"]
         } == {"mod/assign/tests/external/start_submission_test.php"}
+        assert [item["path"] for item in start_submission_match["linked_artifacts"]["services"][0]["navigation_chain"]] == [
+            "mod/assign/classes/external/start_submission.php",
+            "mod/assign/tests/external/start_submission_test.php",
+        ]
         assert any(example["usage_kind"] == "test_usage" for example in start_submission_match["usage_examples"][1:])
         assert start_submission_match["usage_summary"]["service_definition"] == 1
         assert start_submission_match["usage_summary"]["test_usage"] >= 1
@@ -491,6 +503,10 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         form_artifacts = {item["path"] for item in action_form_match["linked_artifacts"]["rendering"]}
         assert "ai/classes/form/action_settings_form.php" in form_artifacts
         assert "lib/formslib.php" in form_artifacts
+        action_form_chain = {
+            item["path"]: item for item in action_form_match["linked_artifacts"]["rendering"]
+        }
+        assert action_form_chain["ai/classes/form/action_settings_form.php"]["next_hops"][0]["path"] == "lib/formslib.php"
 
         ambiguous_execute = find_definition(connection, "execute", symbol_type="method")
         assert ambiguous_execute["total_matches"] >= 2
@@ -614,6 +630,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/classes/external/start_submission.php" in service_related_paths
         assert "mod/assign/tests/external/start_submission_test.php" in service_related_paths
         assert "mod/assign/tests/externallib_test.php" in service_related_paths
+        assert "mod/assign/tests" not in service_related_paths
         assert {
             item["implementation_file"] for item in services_context["linked_artifacts"]["services"]
         } >= {
@@ -626,6 +643,10 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert {
             item["file"] for item in service_chain["mod_assign_start_submission"]["related_tests"]
         } == {"mod/assign/tests/external/start_submission_test.php"}
+        assert [item["path"] for item in service_chain["mod_assign_start_submission"]["navigation_chain"]] == [
+            "mod/assign/classes/external/start_submission.php",
+            "mod/assign/tests/external/start_submission_test.php",
+        ]
 
         assign_related = suggest_related(connection, "mod/assign/db/services.php")
         assign_suggestions = {item["path"]: item for item in assign_related["suggestions"]}
@@ -648,6 +669,13 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "shared web service test coverage" in assign_suggestions[
             "mod/assign/tests/externallib_advanced_testcase.php"
         ]["reason"]
+        assert "mod/assign/tests" not in assign_suggestions
+        assert [item["path"] for item in assign_related["suggestions"][:4]] == [
+            "mod/assign/tests/external/remove_submission_test.php",
+            "mod/assign/tests/external/start_submission_test.php",
+            "mod/assign/tests/externallib_advanced_testcase.php",
+            "mod/assign/tests/externallib_test.php",
+        ]
         assert "mod_assign_start_submission" in {
             item["service_name"] for item in assign_related["linked_artifacts"]["services"]
         }
@@ -667,6 +695,15 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/classes/output/grading_app.php" in rendering_chain_paths
         assert "mod/assign/templates/grading_app.mustache" in rendering_chain_paths
         assert "mod/assign/classes/output/renderer.php" in rendering_chain_paths
+        rendering_chain = {
+            item["path"]: item for item in locallib_context["linked_artifacts"]["rendering"]
+        }
+        assert {
+            hop["path"] for hop in rendering_chain["mod/assign/classes/output/grading_app.php"]["next_hops"]
+        } == {
+            "mod/assign/classes/output/renderer.php",
+            "mod/assign/templates/grading_app.mustache",
+        }
 
         locallib_related_paths = {item["path"] for item in locallib_context["related_suggestions"]}
         assert "mod/assign/classes/output/grading_app.php" in locallib_related_paths
@@ -684,6 +721,11 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             "mod/assign/templates/grading_app.mustache"
         ]["reason"]
         assert "mod/assign/classes/output/renderer.php" in locallib_suggestions
+        locallib_top_paths = [item["path"] for item in locallib_related["suggestions"][:6]]
+        assert "mod/assign/classes/output/grading_app.php" in locallib_top_paths
+        assert "mod/assign/classes/output/renderer.php" in locallib_top_paths
+        assert "mod/assign/templates/grading_app.mustache" in locallib_top_paths
+        assert "mod/assign/renderer.php" not in locallib_top_paths
 
         demo_locallib_context = file_context(connection, "mod/demo/locallib.php")
         demo_rendering_paths = {item["path"] for item in demo_locallib_context["linked_artifacts"]["rendering"]}
@@ -711,6 +753,13 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "lib/adminlib.php" in mfa_suggestions
         assert mfa_suggestions["lib/adminlib.php"]["indexed"] is True
         assert "admin settings APIs" in mfa_suggestions["lib/adminlib.php"]["reason"]
+        mfa_ordered = suggest_related(connection, "admin/tool/mfa/settings.php")["suggestions"]
+        assert mfa_ordered[0]["path"] == "lib/adminlib.php"
+        assert mfa_ordered[-1]["path"] in {
+            "admin/tool/mfa/lang/en/tool_mfa.php",
+            "admin/tool/mfa/version.php",
+            "admin/tool/mfa/tests",
+        }
 
         provider_context = file_context(connection, "ai/provider/openai/classes/provider.php")
         provider_class_references = {
@@ -733,6 +782,11 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "form\\action_generate_image_form" in provider_suggestions[
             "ai/provider/openai/classes/form/action_generate_image_form.php"
         ]["reason"]
+        provider_ordered = suggest_related(connection, "ai/provider/openai/classes/provider.php")["suggestions"]
+        assert provider_ordered[0]["path"] == "ai/provider/openai/classes/form/action_generate_image_form.php"
+        assert provider_ordered[1]["path"] == "ai/provider/openai/classes/form/action_form.php"
+        assert provider_ordered[2]["path"] == "ai/classes/form/action_settings_form.php"
+        assert provider_ordered[3]["path"] == "lib/formslib.php"
 
         action_form_context = file_context(connection, "ai/provider/openai/classes/form/action_form.php")
         action_form_related = {item["path"]: item for item in action_form_context["related_suggestions"]}
@@ -746,6 +800,10 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         action_form_artifacts = {item["path"]: item for item in action_form_context["linked_artifacts"]["rendering"]}
         assert "ai/classes/form/action_settings_form.php" in action_form_artifacts
         assert "lib/formslib.php" in action_form_artifacts
+        action_form_chain = {
+            item["path"]: item for item in action_form_context["linked_artifacts"]["rendering"]
+        }
+        assert action_form_chain["ai/classes/form/action_settings_form.php"]["next_hops"][0]["path"] == "lib/formslib.php"
 
         action_form_suggestions = {
             item["path"]: item
@@ -756,6 +814,11 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "lib/formslib.php" in action_form_suggestions
         assert action_form_suggestions["lib/formslib.php"]["indexed"] is True
         assert "inherits from moodleform" in action_form_suggestions["lib/formslib.php"]["reason"]
+        action_form_ordered = suggest_related(connection, "ai/provider/openai/classes/form/action_form.php")["suggestions"]
+        assert [item["path"] for item in action_form_ordered[:2]] == [
+            "ai/classes/form/action_settings_form.php",
+            "lib/formslib.php",
+        ]
 
         js_context = file_context(connection, "ai/amd/src/aiprovider_action_management_table.js")
         assert js_context["js_module"]["module_name"] == "core_ai/aiprovider_action_management_table"
@@ -854,6 +917,62 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert ai_js_match["resolved_superclass_file"] == "admin/amd/src/plugin_management_table.js"
         assert ai_js_match["linked_artifacts"]["javascript"]["build_artifact"]["path"] == (
             "ai/amd/build/aiprovider_action_management_table.min.js"
+        )
+
+        related_service = find_related_definitions(
+            connection,
+            symbol_query="mod_assign\\external\\start_submission::execute",
+        )
+        primary_service_paths = [item["path"] for item in related_service["primary_related_definitions"]]
+        assert "mod/assign/db/services.php" in primary_service_paths
+        assert "mod/assign/classes/external/start_submission.php" in primary_service_paths
+        assert "mod/assign/tests/external/start_submission_test.php" in primary_service_paths
+        assert all(item["confidence"] == "high" for item in related_service["primary_related_definitions"][:3])
+        assert any(
+            item["relationship"] == "service_definition"
+            for item in related_service["primary_related_definitions"]
+        )
+
+        service_edit_surface = suggest_edit_surface(
+            connection,
+            file_path="mod/assign/db/services.php",
+        )
+        assert service_edit_surface["primary_edit_surface"][0]["path"] == "mod/assign/db/services.php"
+        service_surface_paths = [item["path"] for item in service_edit_surface["primary_edit_surface"][:6]]
+        assert "mod/assign/classes/external/start_submission.php" in service_surface_paths
+        assert "mod/assign/tests/external/start_submission_test.php" in service_surface_paths
+        assert "mod/assign/tests" not in service_surface_paths
+
+        related_rendering = find_related_definitions(
+            connection,
+            symbol_query="mod_assign\\output\\grading_app",
+        )
+        rendering_paths = {item["path"] for item in related_rendering["primary_related_definitions"]}
+        assert "mod/assign/classes/output/renderer.php" in rendering_paths
+        assert "mod/assign/templates/grading_app.mustache" in rendering_paths
+
+        provider_edit_surface = suggest_edit_surface(
+            connection,
+            symbol_query="aiprovider_openai\\provider::get_action_settings",
+        )
+        provider_surface_paths = [item["path"] for item in provider_edit_surface["primary_edit_surface"][:6]]
+        assert provider_surface_paths[0] == "ai/provider/openai/classes/provider.php"
+        assert "ai/provider/openai/classes/form/action_generate_image_form.php" in provider_surface_paths
+        assert "ai/provider/openai/classes/form/action_form.php" in provider_surface_paths
+        assert "ai/classes/form/action_settings_form.php" in provider_surface_paths
+        assert "lib/formslib.php" in provider_surface_paths
+
+        related_js = find_related_definitions(
+            connection,
+            symbol_query="core_ai/aiprovider_action_management_table",
+        )
+        js_primary_paths = {item["path"] for item in related_js["primary_related_definitions"]}
+        assert "admin/amd/src/plugin_management_table.js" in js_primary_paths
+        assert "lib/amd/src/ajax.js" in js_primary_paths
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_primary_paths
+        assert any(
+            item["relationship"] == "js_superclass"
+            for item in related_js["primary_related_definitions"]
         )
     finally:
         connection.close()

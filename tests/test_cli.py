@@ -380,3 +380,44 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
         "ai/amd/src/aiprovider_action_management_table.js",
         "mod/forum/amd/src/forum.js",
     }
+
+    exit_code = main(
+        [
+            "find-related-definitions",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    related_payload = json.loads(capsys.readouterr().out)
+    assert related_payload["status"] == "ok"
+    related_primary_paths = {
+        item["path"] for item in related_payload["data"]["primary_related_definitions"]
+    }
+    assert "mod/assign/db/services.php" in related_primary_paths
+    assert "mod/assign/tests/external/start_submission_test.php" in related_primary_paths
+    assert all(
+        item["confidence"] in {"high", "medium"}
+        for item in related_payload["data"]["primary_related_definitions"]
+    )
+
+    exit_code = main(
+        [
+            "suggest-edit-surface",
+            "--db-path",
+            str(db_path),
+            "--file",
+            "mod/assign/db/services.php",
+        ]
+    )
+    assert exit_code == 0
+    edit_payload = json.loads(capsys.readouterr().out)
+    assert edit_payload["status"] == "ok"
+    assert edit_payload["data"]["primary_edit_surface"][0]["path"] == "mod/assign/db/services.php"
+    edit_primary_paths = {
+        item["path"] for item in edit_payload["data"]["primary_edit_surface"]
+    }
+    assert "mod/assign/classes/external/start_submission.php" in edit_primary_paths
+    assert "mod/assign/tests/external/start_submission_test.php" in edit_primary_paths

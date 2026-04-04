@@ -254,6 +254,30 @@ moodle-indexer suggest-related \
   --file admin/tool/demo/settings.php
 ```
 
+Find related definitions around a symbol or file:
+
+```bash
+moodle-indexer find-related-definitions \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+
+moodle-indexer find-related-definitions \
+  --db-path /path/to/moodle-index.sqlite \
+  --file mod/assign/locallib.php
+```
+
+Suggest the likely edit surface around a symbol or file:
+
+```bash
+moodle-indexer suggest-edit-surface \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol aiprovider_openai\\provider::get_action_settings
+
+moodle-indexer suggest-edit-surface \
+  --db-path /path/to/moodle-index.sqlite \
+  --file mod/assign/db/services.php
+```
+
 Find a definition:
 
 ```bash
@@ -340,7 +364,27 @@ For supported PHP functions, classes, methods, and Moodle AMD source modules it 
   service -> implementation -> test flows, output -> renderer -> template
   flows, form -> intermediate base -> framework base flows, and JS
   source/import/build flows
+- bounded follow-on hops on those linked artifacts so a direct hit can still
+  expose one or two trusted next steps without turning into an open-ended graph
 - a small number of ranked usage examples plus a compact `usage_summary`
+
+Phase 4A adds two agent-oriented navigation endpoints on top of those same
+relationships:
+
+- `find-related-definitions`: bounded related symbols and artifacts around a
+  symbol or file
+- `suggest-edit-surface`: the likely primary and secondary files/definitions an
+  agent would inspect or edit next
+
+Both endpoints are intentionally confidence-aware:
+
+- primary items are usually high-confidence, directly connected artifacts such
+  as service definitions, implementation files, concrete tests, output classes,
+  renderers, templates, concrete forms, framework bases, JS imports, and JS
+  superclass/build links
+- secondary items are usually supporting context or weaker fallbacks
+- low-confidence suggestions are intentionally rare; the tool prefers a smaller
+  bounded surface over a noisy graph
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
 will rank direct static calls, simple `new ClassName(...)` to `$var->method()`
@@ -363,6 +407,17 @@ pretending there is only one.
 - rendering: output class <-> renderer <-> Mustache template links
 - JavaScript: source module -> imports -> superclass -> build artifact
 - entrypoints: high-value Moodle workflow files such as `settings.php`, `locallib.php`, `externallib.php`, and `amd/src/*.js`
+
+Those chains remain intentionally small. The query layer prefers explicit,
+trusted follow-on hops that are already derivable from indexed relationships,
+for example:
+
+- provider -> concrete form -> intermediate form base -> `lib/formslib.php`
+- output class -> template + renderer
+- service definition -> implementation -> concrete PHPUnit file
+
+This keeps navigation coherent without turning the indexer into a generic
+recursive scoring engine.
 
 `find-definition` now reuses that same linked-artifact model for the defining
 file where practical, so moving from a PHP method/class or JS module

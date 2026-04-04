@@ -11,6 +11,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from moodle_indexer.components import resolve_classname_to_file_path, resolve_framework_class_to_file_path
 from moodle_indexer.errors import ValidationError
@@ -328,7 +329,10 @@ def file_context(connection: sqlite3.Connection, file_path: str) -> dict:
             for item in entrypoint_links
         ]
     )
-    related_suggestions = _deduplicate_suggestions(related_suggestions)
+    related_suggestions = _deduplicate_suggestions(
+        _prune_generic_suggestions(related_suggestions),
+        limit=20,
+    )
 
     return {
         "file": moodle_path,
@@ -673,7 +677,10 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
             for item in entrypoint_links
         ]
     )
-    suggestions = _deduplicate_indexed_suggestions(suggestions)
+    suggestions = _deduplicate_indexed_suggestions(
+        _prune_generic_suggestions(suggestions),
+        limit=20,
+    )
     return {
         "file": moodle_path,
         "repository_relative_path": row["repository_relative_path"],
@@ -685,6 +692,92 @@ def suggest_related(connection: sqlite3.Connection, file_path: str) -> dict:
             "entrypoints": entrypoint_links,
         },
         "suggestions": suggestions,
+    }
+
+
+def find_related_definitions(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    limit: int = 12,
+) -> dict[str, object]:
+    """Return bounded, high-confidence related definitions around a symbol or file.
+
+    Phase 4A keeps this intentionally practical:
+    - resolve the user's anchor symbol or file using existing query endpoints
+    - reuse the already indexed inheritance/service/rendering/form/JS links
+    - translate them into bounded primary/secondary definition-oriented items
+    """
+
+    if bool(symbol_query) == bool(file_path):
+        raise ValidationError("Provide exactly one of --symbol or --file.")
+
+    if symbol_query:
+        definition_data = find_definition(connection, symbol_query, limit=max(1, min(limit, 5)), include_usages=False)
+        matches = definition_data["matches"]
+        items = _related_items_for_symbol_results(connection, matches)
+        return {
+            "query": symbol_query,
+            "query_type": "symbol",
+            "matched_definitions": [_compact_match_summary(item) for item in matches],
+            "total_matches": definition_data["total_matches"],
+            **_split_navigation_items(items, limit=limit),
+        }
+
+    context = file_context(connection, file_path or "")
+    items = _related_items_for_file_context(context)
+    return {
+        "query": context["moodle_path"],
+        "query_type": "file",
+        "matched_definitions": [],
+        "total_matches": 1,
+        **_split_navigation_items(items, limit=limit),
+    }
+
+
+def suggest_edit_surface(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    limit: int = 12,
+) -> dict[str, object]:
+    """Return the likely primary and secondary edit surface around a symbol or file."""
+
+    if bool(symbol_query) == bool(file_path):
+        raise ValidationError("Provide exactly one of --symbol or --file.")
+
+    if symbol_query:
+        definition_data = find_definition(connection, symbol_query, limit=max(1, min(limit, 5)), include_usages=False)
+        matches = definition_data["matches"]
+        if not matches:
+            return {
+                "query": symbol_query,
+                "query_type": "symbol",
+                "matched_definitions": [],
+                "total_matches": 0,
+                "primary_edit_surface": [],
+                "secondary_edit_surface": [],
+            }
+        items = _edit_surface_items_for_symbol_results(connection, matches)
+        return {
+            "query": symbol_query,
+            "query_type": "symbol",
+            "matched_definitions": [_compact_match_summary(item) for item in matches],
+            "total_matches": definition_data["total_matches"],
+            **_split_navigation_items(items, limit=limit, primary_key="primary_edit_surface", secondary_key="secondary_edit_surface"),
+        }
+
+    context = file_context(connection, file_path or "")
+    related = suggest_related(connection, file_path or "")
+    items = _edit_surface_items_for_file_context(context, related)
+    return {
+        "query": context["moodle_path"],
+        "query_type": "file",
+        "matched_definitions": [],
+        "total_matches": 1,
+        **_split_navigation_items(items, limit=limit, primary_key="primary_edit_surface", secondary_key="secondary_edit_surface"),
     }
 
 
@@ -997,6 +1090,502 @@ def _build_definition_linked_artifacts(connection: sqlite3.Connection, row: sqli
         "rendering": rendering_artifacts,
         "entrypoints": entrypoint_links,
     }
+
+
+def _compact_match_summary(match: dict[str, object]) -> dict[str, object]:
+    """Return a compact anchor summary for Phase 4A navigation responses."""
+
+    summary = {
+        "symbol_type": match.get("symbol_type"),
+        "name": match.get("name"),
+        "fqname": match.get("fqname"),
+        "file": match.get("file"),
+        "component": match.get("component"),
+        "line": match.get("line"),
+    }
+    if match.get("module_name"):
+        summary["module_name"] = match.get("module_name")
+    return summary
+
+
+def _related_items_for_symbol_results(
+    connection: sqlite3.Connection,
+    matches: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return related-definition items around resolved symbol matches."""
+
+    def _related_target(item: dict[str, object]) -> tuple[str | None, str | None]:
+        """Return path/symbol for PHP definitions or JS module summaries."""
+
+        path = item.get("file") or item.get("path")
+        symbol = item.get("fqname") or item.get("module_name")
+        if path is None:
+            return None, None
+        return str(path), str(symbol) if symbol else None
+
+    items: list[dict[str, object]] = []
+    for match in matches:
+        anchor = match.get("fqname") or match.get("module_name") or match.get("file")
+        if match.get("parent_definition"):
+            parent_path, parent_symbol = _related_target(match["parent_definition"])
+            if parent_path:
+                items.append(
+                    _navigation_item(
+                        item_type="definition",
+                        relationship="parent_definition",
+                        confidence="high",
+                        reason="because this definition inherits from or extends this parent/base definition",
+                        path=parent_path,
+                        symbol=parent_symbol,
+                        anchor=anchor,
+                    )
+                )
+        if match.get("overrides_definition"):
+            override_path, override_symbol = _related_target(match["overrides_definition"])
+            if override_path:
+                items.append(
+                    _navigation_item(
+                        item_type="definition",
+                        relationship="overrides_definition",
+                        confidence="high",
+                        reason="because this definition overrides this base method",
+                        path=override_path,
+                        symbol=override_symbol,
+                        anchor=anchor,
+                    )
+                )
+        for implemented in match.get("implements_definitions", []):
+            implemented_path, implemented_symbol = _related_target(implemented)
+            if not implemented_path:
+                continue
+            items.append(
+                _navigation_item(
+                    item_type="definition",
+                    relationship="implements_definition",
+                    confidence="high",
+                    reason="because this definition implements this interface method",
+                    path=implemented_path,
+                    symbol=implemented_symbol,
+                    anchor=anchor,
+                )
+            )
+        for child in match.get("child_overrides", [])[:4]:
+            child_path, child_symbol = _related_target(child)
+            if not child_path:
+                continue
+            items.append(
+                _navigation_item(
+                    item_type="definition",
+                    relationship="child_override",
+                    confidence="medium",
+                    reason="because this definition is overridden by this child implementation",
+                    path=child_path,
+                    symbol=child_symbol,
+                    anchor=anchor,
+                )
+            )
+        items.extend(_artifact_navigation_items(match.get("linked_artifacts", {}), anchor=anchor, include_anchor_file=False))
+    return items
+
+
+def _edit_surface_items_for_symbol_results(
+    connection: sqlite3.Connection,
+    matches: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return likely edit-surface items around resolved symbol matches."""
+
+    items: list[dict[str, object]] = []
+    for match in matches:
+        anchor = match.get("fqname") or match.get("module_name") or match.get("file")
+        items.append(
+            _navigation_item(
+                item_type="definition_file",
+                relationship="definition_file",
+                confidence="high",
+                reason="because this is the defining file for the queried symbol",
+                path=str(match["file"]),
+                symbol=str(match.get("fqname") or match.get("module_name") or ""),
+                anchor=anchor,
+            )
+        )
+        items.extend(_artifact_navigation_items(match.get("linked_artifacts", {}), anchor=anchor, include_anchor_file=False))
+    return items
+
+
+def _related_items_for_file_context(context: dict[str, object]) -> list[dict[str, object]]:
+    """Return related-definition items around one indexed file context."""
+
+    anchor = str(context["moodle_path"])
+    items = _artifact_navigation_items(context.get("linked_artifacts", {}), anchor=anchor, include_anchor_file=False)
+    for symbol in list(context.get("symbols", []))[:4]:
+        fqname = symbol.get("fqname")
+        if not fqname:
+            continue
+        items.append(
+            _navigation_item(
+                item_type="definition",
+                relationship="defines_symbol",
+                confidence="high",
+                reason="because this file directly defines this symbol",
+                path=str(context["moodle_path"]),
+                symbol=str(fqname),
+                anchor=anchor,
+            )
+        )
+    return items
+
+
+def _edit_surface_items_for_file_context(
+    context: dict[str, object],
+    related: dict[str, object],
+) -> list[dict[str, object]]:
+    """Return likely edit-surface items around one indexed file.
+
+    File-driven edit-surface results should start with the anchor file itself,
+    then move outward to the next files a user is likely to edit. We therefore
+    drop linked-artifact items that point back to the anchor file, because they
+    are already represented by the explicit ``anchor_file`` item and otherwise
+    crowd out the real next-hop artifacts.
+    """
+
+    anchor = str(context["moodle_path"])
+    items = [
+        _navigation_item(
+            item_type="file",
+            relationship="anchor_file",
+            confidence="high",
+            reason="because this is the file you are considering changing",
+            path=anchor,
+            symbol=None,
+            anchor=anchor,
+        )
+    ]
+    items.extend(
+        item
+        for item in _artifact_navigation_items(
+            context.get("linked_artifacts", {}),
+            anchor=anchor,
+            include_anchor_file=False,
+        )
+        if str(item["path"]) != anchor
+    )
+    for suggestion in related.get("suggestions", []):
+        path = str(suggestion["path"])
+        if path == anchor:
+            continue
+        confidence = _suggestion_confidence(path, str(suggestion["reason"]))
+        items.append(
+            _navigation_item(
+                item_type=_artifact_item_type(path, None),
+                relationship="suggested_companion",
+                confidence=confidence,
+                reason=str(suggestion["reason"]),
+                path=path,
+                symbol=None,
+                anchor=anchor,
+            )
+        )
+    return items
+
+
+def _artifact_navigation_items(
+    linked_artifacts: dict[str, object],
+    *,
+    anchor: str | None,
+    include_anchor_file: bool,
+) -> list[dict[str, object]]:
+    """Flatten existing linked artifacts into Phase 4A navigation items."""
+
+    items: list[dict[str, object]] = []
+
+    for service in linked_artifacts.get("services", []) or []:
+        service_name = str(service["service_name"])
+        source_file = service.get("source_file")
+        if source_file:
+            items.append(
+                _navigation_item(
+                    item_type="service_definition",
+                    relationship="service_definition",
+                    confidence="high",
+                    reason=f"because this implementation is registered by service {service_name} in db/services.php",
+                    path=str(source_file),
+                    symbol=service_name,
+                    anchor=anchor,
+                )
+            )
+        for step in service.get("navigation_chain", []):
+            items.append(
+                _navigation_item(
+                    item_type=_artifact_item_type(str(step["path"]), str(step.get("artifact_type"))),
+                    relationship=str(step.get("artifact_type", "service_navigation")),
+                    confidence=_artifact_confidence(str(step.get("artifact_type")), str(step.get("chain_role", "primary"))),
+                    reason=str(step["reason"]),
+                    path=str(step["path"]),
+                    symbol=service_name if str(step.get("artifact_type")) == "service_definition" else None,
+                    anchor=anchor,
+                )
+            )
+
+    for rendering in linked_artifacts.get("rendering", []) or []:
+        items.extend(_artifact_node_to_navigation_items(rendering, anchor=anchor))
+
+    javascript = linked_artifacts.get("javascript")
+    if isinstance(javascript, dict):
+        for item in javascript.get("imports", []) or []:
+            if item.get("file"):
+                items.append(
+                    _navigation_item(
+                        item_type="js_module",
+                        relationship="js_import",
+                        confidence="high",
+                        reason=f"because this JavaScript module imports {item['module_name']}",
+                        path=str(item["file"]),
+                        symbol=str(item["module_name"]),
+                        anchor=anchor,
+                    )
+                )
+        superclass = javascript.get("superclass")
+        if isinstance(superclass, dict) and superclass.get("file"):
+            items.append(
+                _navigation_item(
+                    item_type="js_module",
+                    relationship="js_superclass",
+                    confidence="high",
+                    reason=str(superclass["reason"]),
+                    path=str(superclass["file"]),
+                    symbol=str(superclass.get("module_name") or ""),
+                    anchor=anchor,
+                )
+            )
+        build_artifact = javascript.get("build_artifact")
+        if isinstance(build_artifact, dict):
+            items.append(
+                _navigation_item(
+                    item_type="js_build_artifact",
+                    relationship="js_build_artifact",
+                    confidence="high",
+                    reason=str(build_artifact["reason"]),
+                    path=str(build_artifact["path"]),
+                    symbol=None,
+                    anchor=anchor,
+                )
+            )
+        for importer in javascript.get("imported_by", [])[:4]:
+            items.append(
+                _navigation_item(
+                    item_type="js_module",
+                    relationship="imported_by",
+                    confidence="medium",
+                    reason=f"because this module is imported by {importer['module_name']}",
+                    path=str(importer["file"]),
+                    symbol=str(importer["module_name"]),
+                    anchor=anchor,
+                )
+            )
+
+    for entrypoint in linked_artifacts.get("entrypoints", []) or []:
+        items.append(
+            _navigation_item(
+                item_type=_artifact_item_type(str(entrypoint["path"]), str(entrypoint.get("artifact_type"))),
+                relationship=str(entrypoint.get("artifact_type") or "entrypoint_link"),
+                confidence=_artifact_confidence(str(entrypoint.get("artifact_type")), "supporting"),
+                reason=str(entrypoint["reason"]),
+                path=str(entrypoint["path"]),
+                symbol=None,
+                anchor=anchor,
+            )
+        )
+
+    if include_anchor_file and anchor:
+        items.append(
+            _navigation_item(
+                item_type="file",
+                relationship="anchor_file",
+                confidence="high",
+                reason="because this file anchors the current feature slice",
+                path=anchor,
+                symbol=None,
+                anchor=anchor,
+            )
+        )
+    return items
+
+
+def _artifact_node_to_navigation_items(
+    node: dict[str, object],
+    *,
+    anchor: str | None,
+) -> list[dict[str, object]]:
+    """Return one artifact node and its bounded next hops as navigation items."""
+
+    items = [
+        _navigation_item(
+            item_type=_artifact_item_type(str(node["path"]), str(node.get("artifact_type"))),
+            relationship=str(node.get("artifact_type") or "linked_artifact"),
+            confidence=_artifact_confidence(str(node.get("artifact_type")), str(node.get("chain_role", "direct"))),
+            reason=str(node["reason"]),
+            path=str(node["path"]),
+            symbol=str(node.get("class_name") or "") or None,
+            anchor=anchor,
+        )
+    ]
+    for hop in node.get("next_hops", []) or []:
+        items.extend(_artifact_node_to_navigation_items(hop, anchor=anchor))
+    return items
+
+
+def _navigation_item(
+    *,
+    item_type: str,
+    relationship: str,
+    confidence: str,
+    reason: str,
+    path: str,
+    symbol: str | None,
+    anchor: str | None,
+) -> dict[str, object]:
+    """Build a normalized Phase 4A navigation item."""
+
+    return {
+        "type": item_type,
+        "relationship": relationship,
+        "confidence": confidence,
+        "reason": reason,
+        "path": path,
+        "symbol": symbol,
+        "anchor": anchor,
+    }
+
+
+def _split_navigation_items(
+    items: list[dict[str, object]],
+    *,
+    limit: int,
+    primary_key: str = "primary_related_definitions",
+    secondary_key: str = "secondary_related_definitions",
+) -> dict[str, list[dict[str, object]]]:
+    """Split navigation items into bounded primary and secondary groups."""
+
+    merged: dict[tuple[str, str | None, str], dict[str, object]] = {}
+    for item in items:
+        key = (str(item["path"]), item.get("symbol"), str(item["relationship"]))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(item)
+            continue
+        if str(item["reason"]) not in str(existing["reason"]):
+            existing["reason"] = f"{existing['reason']} | {item['reason']}"
+        if _confidence_rank(str(item["confidence"])) < _confidence_rank(str(existing["confidence"])):
+            existing["confidence"] = item["confidence"]
+
+    ordered = sorted(
+        merged.values(),
+        key=lambda item: (
+            _confidence_rank(str(item["confidence"])),
+            _edit_surface_priority(str(item["type"]), str(item["relationship"]), str(item["path"])),
+            str(item["path"]),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    primary = [item for item in ordered if str(item["confidence"]) == "high"][:limit]
+    secondary_pool = [item for item in ordered if item not in primary]
+    secondary = secondary_pool[:limit]
+    return {
+        primary_key: primary,
+        secondary_key: secondary,
+    }
+
+
+def _artifact_item_type(path: str, artifact_type: str | None) -> str:
+    """Return a stable Phase 4A item type."""
+
+    if artifact_type:
+        return artifact_type
+    if path.endswith(".mustache"):
+        return "template_file"
+    if path.endswith("/renderer.php"):
+        return "renderer_file"
+    if "/amd/src/" in path:
+        return "js_module"
+    if "/amd/build/" in path:
+        return "js_build_artifact"
+    if "/classes/form/" in path or path.endswith("_form.php"):
+        return "form_class"
+    if path.endswith("_test.php") or path.endswith("_advanced_testcase.php"):
+        return "service_test"
+    return "file"
+
+
+def _artifact_confidence(artifact_type: str | None, chain_role: str) -> str:
+    """Return a small explicit confidence label for one artifact link."""
+
+    high_types = {
+        "service_definition",
+        "service_implementation",
+        "service_test",
+        "output_class",
+        "renderer_file",
+        "template_file",
+        "form_class",
+        "framework_base",
+        "js_import",
+        "js_superclass",
+        "js_build_artifact",
+        "definition_file",
+    }
+    if artifact_type in high_types:
+        return "high"
+    if chain_role in {"primary", "direct"}:
+        return "high"
+    if chain_role in {"supporting", "derived", "verification"}:
+        return "medium"
+    return "medium"
+
+
+def _suggestion_confidence(path: str, reason: str) -> str:
+    """Return confidence for file-driven edit-surface fallback suggestions."""
+
+    if path.endswith("/tests") or path.endswith("/version.php") or "/lang/en/" in path or path.endswith("/db/access.php"):
+        return "medium"
+    if "imports " in reason or "resolves to this file" in reason or "inherits from" in reason:
+        return "high"
+    return "medium"
+
+
+def _confidence_rank(confidence: str) -> int:
+    """Return sortable rank for a confidence label."""
+
+    return {"high": 0, "medium": 1, "low": 2}.get(confidence, 3)
+
+
+def _edit_surface_priority(item_type: str, relationship: str, path: str) -> int:
+    """Return a lightweight priority for Phase 4A related/edit-surface items."""
+
+    if relationship in {"definition_file", "anchor_file"}:
+        return 0
+    if relationship == "service_definition":
+        return 3
+    if item_type in {"service_definition", "service_implementation", "service_test"}:
+        return 5
+    if item_type in {"output_class", "renderer_file", "template_file"}:
+        return 10
+    if item_type in {"form_class", "framework_base"}:
+        return 15
+    if item_type in {"js_module", "js_build_artifact"}:
+        return 20
+    if relationship in {"parent_definition", "overrides_definition", "implements_definition"}:
+        return 25
+    if relationship == "child_override":
+        return 35
+    if "/lang/en/" in path:
+        return 80
+    if path.endswith("/db/access.php"):
+        return 85
+    if path.endswith("/version.php"):
+        return 90
+    if path.endswith("/tests"):
+        return 95
+    return 50
 
 
 def _method_inheritance_context(connection: sqlite3.Connection, candidate: DefinitionCandidate) -> dict:
@@ -1789,7 +2378,15 @@ def _linked_class_artifacts(
     artifacts: list[dict[str, object]] = []
     seen_relationships: set[tuple[str, str]] = set()
 
-    def add_artifact(class_name: str, relationship_type: str, target_file: str) -> None:
+    def add_artifact(
+        class_name: str,
+        relationship_type: str,
+        target_file: str,
+        *,
+        next_hops: list[dict[str, object]] | None = None,
+        chain_role: str = "direct",
+        chain_depth: int = 0,
+    ) -> None:
         file_exists = connection.execute(
             "SELECT 1 FROM files WHERE moodle_path = ? OR repository_relative_path = ?",
             (target_file, target_file),
@@ -1802,6 +2399,9 @@ def _linked_class_artifacts(
                 "resolved": bool(file_exists),
                 "artifact_kind": _class_artifact_kind(target_file),
                 "template_files": _existing_template_candidates(connection, target_file),
+                "chain_role": chain_role,
+                "chain_depth": chain_depth,
+                "next_hops": next_hops or [],
             }
         )
 
@@ -1816,15 +2416,85 @@ def _linked_class_artifacts(
         target_file = _resolve_class_artifact_target(connection, class_name)
         if target_file is None:
             continue
-        add_artifact(class_name, str(item["relationship_type"]), target_file)
-        if item["relationship_type"] == "extends":
+        next_hops: list[dict[str, object]] = []
+        # Keep this bounded and explicit: only form classes currently grow a
+        # small follow-on chain so provider -> form -> base -> framework flows
+        # stay coherent without turning into open-ended graph traversal.
+        if "/classes/form/" in target_file:
+            next_hops = _class_chain_hops(connection, target_file, depth=3, level=1)
+        add_artifact(class_name, str(item["relationship_type"]), target_file, next_hops=next_hops)
+        if item["relationship_type"] == "extends" or (
+            item["relationship_type"] == "references_class" and "/classes/form/" in target_file
+        ):
             for ancestor_name, ancestor_file in _resolve_direct_parent_class_targets(connection, target_file):
                 ancestor_key = ("extends_indirect", ancestor_name)
                 if ancestor_key in seen_relationships:
                     continue
                 seen_relationships.add(ancestor_key)
-                add_artifact(ancestor_name, "extends_indirect", ancestor_file)
+                add_artifact(ancestor_name, "extends_indirect", ancestor_file, chain_role="derived", chain_depth=1)
     return artifacts
+
+
+def _class_chain_hops(
+    connection: sqlite3.Connection,
+    class_file: str,
+    *,
+    depth: int,
+    level: int = 1,
+    visited: set[str] | None = None,
+) -> list[dict[str, object]]:
+    """Return a bounded follow-on class chain for one resolved class file.
+
+    This intentionally documents the workflow in code rather than inventing a
+    general graph walk:
+    - start from a directly referenced form class
+    - follow a few explicit parent-class hops
+    - stop once we hit the framework base or the depth cap
+    """
+
+    if depth <= 0:
+        return []
+    seen = set(visited or ())
+    seen.add(class_file)
+    hops: list[dict[str, object]] = []
+    for ancestor_name, ancestor_file in _resolve_direct_parent_class_targets(connection, class_file):
+        if ancestor_file in seen:
+            continue
+        short_ancestor = ancestor_name.split("\\")[-1]
+        next_reason = (
+            "suggested because this class inherits from moodleform through an indexed Moodle form/framework base"
+            if ancestor_file == "lib/formslib.php"
+            else f"suggested because this class inherits from {short_ancestor} through a resolved parent class chain"
+        )
+        hops.append(
+            {
+                "path": ancestor_file,
+                "artifact_type": _class_artifact_kind(ancestor_file),
+                "reason": next_reason,
+                "indexed": True,
+                "class_name": ancestor_name,
+                "chain_role": "derived",
+                "chain_depth": level,
+                "next_hops": _class_chain_hops(
+                    connection,
+                    ancestor_file,
+                    depth=depth - 1,
+                    level=level + 1,
+                    visited=seen | {ancestor_file},
+                ),
+            }
+        )
+    return hops
+
+
+def _iter_artifact_nodes(items: list[dict[str, object]]) -> Iterator[dict[str, object]]:
+    """Yield artifact nodes depth-first so follow-on hops can be flattened safely."""
+
+    for item in items:
+        yield item
+        next_hops = item.get("next_hops")
+        if isinstance(next_hops, list):
+            yield from _iter_artifact_nodes([hop for hop in next_hops if isinstance(hop, dict)])
 
 
 def _resolve_class_artifact_target(connection: sqlite3.Connection, class_name: str) -> str | None:
@@ -1888,14 +2558,25 @@ def _class_related_suggestions(class_references: list[dict[str, object]]) -> lis
     """Return file-context related suggestions for resolved class artifacts."""
 
     suggestions: list[dict[str, str]] = []
-    for item in class_references:
+    for item in _iter_artifact_nodes(class_references):
+        if "resolved_target_file" in item:
+            path = str(item["resolved_target_file"])
+            reason = _class_artifact_reason(item)
+            template_files = item.get("template_files", [])
+        else:
+            path = str(item["path"])
+            reason = str(item["reason"])
+            template_files = []
         suggestions.append(
             {
-                "path": str(item["resolved_target_file"]),
-                "reason": _class_artifact_reason(item),
+                "path": path,
+                "reason": reason,
+                "artifact_type": item.get("artifact_kind", item.get("artifact_type")),
+                "chain_role": item.get("chain_role", "direct"),
+                "chain_depth": item.get("chain_depth", 0),
             }
         )
-        for template_path in item["template_files"]:
+        for template_path in template_files:
             suggestions.append(
                 {
                     "path": template_path,
@@ -1903,6 +2584,9 @@ def _class_related_suggestions(class_references: list[dict[str, object]]) -> lis
                         f"suggested because output class \\{item['class_name']} likely renders "
                         "through this Mustache template"
                     ),
+                    "artifact_type": "template_file",
+                    "chain_role": "supporting",
+                    "chain_depth": item.get("chain_depth", 0) + 1,
                 }
             )
     return suggestions
@@ -2005,17 +2689,29 @@ def _indexed_class_suggestions(
 
     artifacts = _linked_class_artifacts(connection, relationships)
     suggestions: list[dict[str, object]] = []
-    for item in artifacts:
-        target_path = str(item["resolved_target_file"])
-        if item["resolved"]:
+    for item in _iter_artifact_nodes(artifacts):
+        if "resolved_target_file" in item:
+            target_path = str(item["resolved_target_file"])
+            indexed = bool(item["resolved"])
+            reason = _class_artifact_reason(item)
+            template_files = item.get("template_files", [])
+        else:
+            target_path = str(item["path"])
+            indexed = bool(item.get("indexed", False))
+            reason = str(item["reason"])
+            template_files = []
+        if indexed:
             suggestions.append(
                 {
                     "path": target_path,
-                    "reason": _class_artifact_reason(item),
+                    "reason": reason,
                     "indexed": True,
+                    "artifact_type": item.get("artifact_kind", item.get("artifact_type")),
+                    "chain_role": item.get("chain_role", "direct"),
+                    "chain_depth": item.get("chain_depth", 0),
                 }
             )
-        for template_path in item["template_files"]:
+        for template_path in template_files:
             suggestions.append(
                 {
                     "path": template_path,
@@ -2024,6 +2720,9 @@ def _indexed_class_suggestions(
                         "through this Mustache template"
                     ),
                     "indexed": True,
+                    "artifact_type": "template_file",
+                    "chain_role": "supporting",
+                    "chain_depth": item.get("chain_depth", 0) + 1,
                 }
             )
     return suggestions
@@ -2034,7 +2733,14 @@ def _build_rendering_linked_artifacts(
     file_row: sqlite3.Row,
     class_references: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Return bounded rendering/navigation chains for one file."""
+    """Return bounded rendering/navigation chains for one file.
+
+    The workflow here stays intentionally small and explicit:
+    - direct output/form references come first
+    - one renderer/template companion layer is attached where confidence is high
+    - form classes can already carry their own parent/base chain from
+      ``_linked_class_artifacts``
+    """
 
     moodle_path = str(file_row["moodle_path"])
     file_role = str(file_row["file_role"])
@@ -2042,7 +2748,15 @@ def _build_rendering_linked_artifacts(
     artifacts: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
 
-    def add_artifact(path: str, artifact_type: str, reason: str, class_name: str | None = None) -> None:
+    def add_artifact(
+        path: str,
+        artifact_type: str,
+        reason: str,
+        class_name: str | None = None,
+        *,
+        next_hops: list[dict[str, object]] | None = None,
+        chain_role: str = "direct",
+    ) -> None:
         key = (artifact_type, path)
         if key in seen:
             return
@@ -2060,12 +2774,49 @@ def _build_rendering_linked_artifacts(
                 "class_name": class_name,
                 "indexed": indexed,
                 "reason": reason,
+                "chain_role": chain_role,
+                "next_hops": next_hops or [],
             }
         )
 
     for item in class_references:
         target_path = str(item["resolved_target_file"])
-        add_artifact(target_path, str(item["artifact_kind"]), _class_artifact_reason(item), str(item["class_name"]))
+        follow_on_hops: list[dict[str, object]] = [dict(hop) for hop in item.get("next_hops", [])]
+        if item["artifact_kind"] == "output_class" and component_root:
+            for template_path in item["template_files"]:
+                follow_on_hops.append(
+                    {
+                        "path": template_path,
+                        "artifact_type": "template_file",
+                        "class_name": str(item["class_name"]),
+                        "indexed": True,
+                        "reason": (
+                            f"suggested because output class \\{item['class_name']} likely renders "
+                            "through this Mustache template"
+                        ),
+                        "chain_role": "supporting",
+                        "next_hops": [],
+                    }
+                )
+            for renderer_path in _renderer_candidates(connection, component_root):
+                if target_path != renderer_path:
+                    follow_on_hops.append(
+                        {
+                            "path": renderer_path,
+                            "artifact_type": "renderer_file",
+                            "indexed": True,
+                            "reason": "suggested because this indexed renderer coordinates this component's output classes and templates",
+                            "chain_role": "supporting",
+                            "next_hops": [],
+                        }
+                    )
+        add_artifact(
+            target_path,
+            str(item["artifact_kind"]),
+            _class_artifact_reason(item),
+            str(item["class_name"]),
+            next_hops=follow_on_hops,
+        )
         for template_path in item["template_files"]:
             add_artifact(
                 template_path,
@@ -2139,7 +2890,7 @@ def _build_rendering_linked_artifacts(
                 "suggested because this renderer is closely coupled to these rendering artifacts",
             )
 
-    return artifacts
+    return _sort_artifact_items(artifacts, limit=12)
 
 
 def _template_for_output_file(output_file: str) -> str | None:
@@ -2154,19 +2905,23 @@ def _template_for_output_file(output_file: str) -> str | None:
 def _renderer_candidates(connection: sqlite3.Connection, component_root: str) -> list[str]:
     """Return verified renderer files for one component root."""
 
-    candidates = [
-        f"{component_root}/classes/output/renderer.php",
-        f"{component_root}/renderer.php",
-    ]
-    found: list[str] = []
-    for path in candidates:
-        row = connection.execute(
-            "SELECT moodle_path FROM files WHERE moodle_path = ? OR repository_relative_path = ? LIMIT 1",
-            (path, path),
-        ).fetchone()
-        if row is not None:
-            found.append(str(row["moodle_path"]))
-    return found
+    output_renderer = f"{component_root}/classes/output/renderer.php"
+    root_renderer = f"{component_root}/renderer.php"
+
+    output_row = connection.execute(
+        "SELECT moodle_path FROM files WHERE moodle_path = ? OR repository_relative_path = ? LIMIT 1",
+        (output_renderer, output_renderer),
+    ).fetchone()
+    if output_row is not None:
+        return [str(output_row["moodle_path"])]
+
+    root_row = connection.execute(
+        "SELECT moodle_path FROM files WHERE moodle_path = ? OR repository_relative_path = ? LIMIT 1",
+        (root_renderer, root_renderer),
+    ).fetchone()
+    if root_row is not None:
+        return [str(root_row["moodle_path"])]
+    return []
 
 
 def _output_file_for_template(template_file: str) -> str | None:
@@ -2222,6 +2977,27 @@ def _build_service_linked_artifacts(
         linked_tests: list[dict[str, str]] = []
         if target_file:
             linked_tests = _service_tests_for_definition(connection, item)
+        navigation_chain: list[dict[str, object]] = []
+        if target_file:
+            navigation_chain.append(
+                {
+                    "path": str(target_file),
+                    "artifact_type": "service_implementation",
+                    "indexed": True,
+                    "reason": f"suggested because service {item['service_name']} resolves to this implementation file",
+                    "chain_role": "primary",
+                }
+            )
+        navigation_chain.extend(
+            {
+                "path": str(test["file"]),
+                "artifact_type": "service_test",
+                "indexed": True,
+                "reason": str(test["reason"]),
+                "chain_role": "verification",
+            }
+            for test in linked_tests
+        )
         artifacts.append(
             {
                 "service_name": item["service_name"],
@@ -2233,9 +3009,19 @@ def _build_service_linked_artifacts(
                 "classpath": item["classpath"],
                 "methodname": item.get("methodname"),
                 "related_tests": linked_tests,
+                "chain_role": "primary",
+                "navigation_chain": navigation_chain,
             }
         )
-    return artifacts
+    return sorted(
+        artifacts,
+        key=lambda item: (
+            0 if item["implementation_file"] else 1,
+            0 if item["related_tests"] else 1,
+            str(item["implementation_file"] or ""),
+            str(item["service_name"]),
+        ),
+    )
 
 
 def _service_artifacts_for_definition_file(
@@ -2366,7 +3152,10 @@ def _service_test_candidates(webservices: list[sqlite3.Row]) -> list[dict[str, s
     return candidates
 
 
-def _deduplicate_suggestions(suggestions: list[dict[str, str]]) -> list[dict[str, str]]:
+def _deduplicate_suggestions(
+    suggestions: list[dict[str, str]],
+    limit: int | None = None,
+) -> list[dict[str, str]]:
     """Deduplicate non-index-aware suggestions by path, merging distinct reasons."""
 
     merged: dict[str, dict[str, str]] = {}
@@ -2377,10 +3166,26 @@ def _deduplicate_suggestions(suggestions: list[dict[str, str]]) -> list[dict[str
             continue
         if item["reason"] not in existing["reason"]:
             existing["reason"] = f"{existing['reason']} | {item['reason']}"
-    return [merged[path] for path in sorted(merged)]
+    ordered = sorted(
+        merged.values(),
+        key=lambda item: (
+            _artifact_priority(
+                str(item["path"]),
+                str(item["reason"]),
+                artifact_type=str(item.get("artifact_type")) if item.get("artifact_type") else None,
+                chain_role=str(item.get("chain_role", "direct")),
+            ),
+            int(item.get("chain_depth", 0)),
+            str(item["path"]),
+        ),
+    )
+    return ordered[:limit] if limit is not None else ordered
 
 
-def _deduplicate_indexed_suggestions(suggestions: list[dict[str, object]]) -> list[dict[str, object]]:
+def _deduplicate_indexed_suggestions(
+    suggestions: list[dict[str, object]],
+    limit: int | None = None,
+) -> list[dict[str, object]]:
     """Deduplicate suggest-related results by path, preserving indexed truthiness."""
 
     merged: dict[str, dict[str, object]] = {}
@@ -2392,7 +3197,21 @@ def _deduplicate_indexed_suggestions(suggestions: list[dict[str, object]]) -> li
         existing["indexed"] = bool(existing["indexed"] or item["indexed"])
         if item["reason"] not in str(existing["reason"]):
             existing["reason"] = f"{existing['reason']} | {item['reason']}"
-    return [merged[path] for path in sorted(merged)]
+    ordered = sorted(
+        merged.values(),
+        key=lambda item: (
+            _artifact_priority(
+                str(item["path"]),
+                str(item["reason"]),
+                indexed=bool(item.get("indexed", False)),
+                artifact_type=str(item.get("artifact_type")) if item.get("artifact_type") else None,
+                chain_role=str(item.get("chain_role", "direct")),
+            ),
+            int(item.get("chain_depth", 0)),
+            str(item["path"]),
+        ),
+    )
+    return ordered[:limit] if limit is not None else ordered
 
 
 def _deduplicate_tests(tests: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -2406,6 +3225,102 @@ def _deduplicate_tests(tests: list[dict[str, object]]) -> list[dict[str, object]
         seen.add(str(item["file"]))
         ordered.append(item)
     return ordered
+
+
+def _prune_generic_suggestions(
+    suggestions: list[dict[str, object]] | list[dict[str, str]],
+) -> list[dict[str, object]] | list[dict[str, str]]:
+    """Drop weak generic fallbacks when stronger concrete links already exist."""
+
+    paths = [str(item["path"]) for item in suggestions]
+    has_concrete_tests = any(_is_concrete_test_path(path) for path in paths)
+    has_service_impl = any(_is_service_implementation_path(path) for path in paths)
+    pruned: list[dict[str, object]] | list[dict[str, str]] = []
+    for item in suggestions:
+        path = str(item["path"])
+        if has_concrete_tests and path.endswith("/tests"):
+            continue
+        if has_service_impl and path.endswith("/db/access.php"):
+            continue
+        pruned.append(item)
+    return pruned
+
+
+def _artifact_priority(
+    path: str,
+    reason: str,
+    *,
+    indexed: bool = True,
+    artifact_type: str | None = None,
+    chain_role: str = "direct",
+) -> int:
+    """Return a lightweight priority for navigation artifacts."""
+
+    if path == "lib/adminlib.php":
+        return 0
+    if artifact_type == "framework_base" or path == "lib/formslib.php":
+        return 0 if chain_role == "direct" else 19
+    if _is_concrete_test_path(path):
+        return 5
+    if artifact_type == "service_implementation" or _is_service_implementation_path(path):
+        return 10
+    if "/classes/form/" in path and "resolved parent class chain" not in reason and "extends " not in reason:
+        return 15
+    if "/classes/form/" in path:
+        return 18
+    if artifact_type == "js_import" or artifact_type == "js_superclass" or "/amd/src/" in path:
+        return 20
+    if artifact_type == "output_class" or ("/classes/output/" in path and not path.endswith("/renderer.php")):
+        return 25
+    if artifact_type == "renderer_file" or path.endswith("/renderer.php"):
+        return 30
+    if artifact_type == "template_file" or ("/templates/" in path and path.endswith(".mustache")):
+        return 35
+    if artifact_type == "js_build_artifact" or "/amd/build/" in path:
+        return 40
+    if "/lang/en/" in path:
+        return 80
+    if path.endswith("/db/access.php"):
+        return 85
+    if path.endswith("/version.php"):
+        return 90
+    if path.endswith("/tests"):
+        return 95
+    if not indexed:
+        return 98
+    if "admin settings APIs" in reason:
+        return 0
+    return 50
+
+
+def _is_concrete_test_path(path: str) -> bool:
+    """Return whether a suggestion points at a concrete test file."""
+
+    return path.endswith("_test.php") or path.endswith("_advanced_testcase.php")
+
+
+def _is_service_implementation_path(path: str) -> bool:
+    """Return whether a path looks like a concrete service implementation target."""
+
+    return path.endswith("/externallib.php") or "/classes/external/" in path
+
+
+def _sort_artifact_items(items: list[dict[str, object]], limit: int | None = None) -> list[dict[str, object]]:
+    """Return artifact items ordered by signal quality."""
+
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            _artifact_priority(
+                str(item["path"]),
+                str(item["reason"]),
+                indexed=bool(item.get("indexed", False)),
+                artifact_type=str(item.get("artifact_type")) if item.get("artifact_type") else None,
+            ),
+            str(item["path"]),
+        ),
+    )
+    return ordered[:limit] if limit is not None else ordered
 
 
 def _existing_template_candidates(connection: sqlite3.Connection, output_file: str) -> list[str]:
@@ -2763,7 +3678,7 @@ def _build_entrypoint_links(
                     "service_implementation",
                     f"suggested because db/services.php registers {item['service_name']} here",
                 )
-    return entrypoints
+    return _sort_artifact_items(entrypoints, limit=10)
 
 
 def _js_related_suggestions(
