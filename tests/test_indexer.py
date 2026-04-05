@@ -1260,6 +1260,23 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert any(path.endswith("/db/services.php") for path in [str(item.get("path") or "") for item in free_text_test_impact["contract_checks"]])
         assert any(path.endswith("_test.php") for path in [item["path"] for item in free_text_test_impact["direct_tests"]])
         assert any("/classes/external/" in str(item.get("path") or "") for item in free_text_test_impact["manual_review_points"])
+        assert any(
+            str(item.get("path") or "") == "mod/assign/classes/external/remove_submission.php"
+            and str(item.get("symbol") or "") == "mod_assign\\external\\remove_submission::execute"
+            for item in free_text_test_impact["manual_review_points"] + free_text_test_impact["contract_checks"]
+        )
+        assert any(
+            str(item.get("path") or "") == "mod/assign/db/services.php"
+            for item in free_text_test_impact["contract_checks"]
+        )
+        assert any(
+            str(item.get("path") or "") == "mod/assign/tests/external/remove_submission_test.php"
+            for item in free_text_test_impact["direct_tests"]
+        )
+        assert any(
+            "signature changes" in item["reason"].lower() or "parameter definitions" in item["reason"].lower()
+            for item in free_text_test_impact["contract_checks"]
+        )
 
         service_guardrails = execution_guardrails(
             connection,
@@ -1312,6 +1329,19 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert any(path.endswith("/db/services.php") for path in [str(item.get("path") or "") for item in free_text_guardrails["pre_edit_checks"] + free_text_guardrails["post_edit_checks"]])
         assert any(path.endswith("_test.php") for path in [str(item.get("path") or "") for item in free_text_guardrails["pre_edit_checks"] + free_text_guardrails["post_edit_checks"]])
         assert any("service registration" in item["reason"].lower() or "api" in item["reason"].lower() for item in free_text_guardrails["watch_points"] + free_text_guardrails["do_not_assume"] + free_text_guardrails["pre_edit_checks"])
+        assert any(
+            str(item.get("path") or "") == "mod/assign/classes/external/remove_submission.php"
+            and str(item.get("symbol") or "") == "mod_assign\\external\\remove_submission::execute"
+            for item in free_text_guardrails["pre_edit_checks"]
+        )
+        assert any(
+            str(item.get("path") or "") == "mod/assign/db/services.php"
+            for item in free_text_guardrails["pre_edit_checks"] + free_text_guardrails["post_edit_checks"]
+        )
+        assert any(
+            str(item.get("path") or "") == "mod/assign/tests/external/remove_submission_test.php"
+            for item in free_text_guardrails["pre_edit_checks"] + free_text_guardrails["post_edit_checks"]
+        )
         assert len(service_test_impact["direct_tests"]) <= 4
         assert len(service_guardrails["pre_edit_checks"]) <= 5
     finally:

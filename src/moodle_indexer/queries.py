@@ -1112,6 +1112,8 @@ def _test_impact_for_query(
     """Return bounded test impact for a free-text change goal."""
 
     profile = _plan_profile_for_query(query_text)
+    if bool(profile.get("service")):
+        profile["representative_pattern"] = _representative_service_pattern(connection)
     plan = propose_change_plan(connection, query_text=query_text, limit=limit)
     return _synthesize_test_impact(
         query=query_text,
@@ -1202,6 +1204,8 @@ def _execution_guardrails_for_query(
     """Return bounded execution guardrails for a free-text change goal."""
 
     profile = _plan_profile_for_query(query_text)
+    if bool(profile.get("service")):
+        profile["representative_pattern"] = _representative_service_pattern(connection)
     plan = propose_change_plan(connection, query_text=query_text, limit=limit)
     test_impact = _synthesize_test_impact(
         query=query_text,
@@ -1426,8 +1430,8 @@ def _synthesize_test_impact(
 ) -> dict[str, object]:
     """Translate one bounded change plan into a bounded validation view."""
 
-    direct_tests = _collect_test_impact_tests(plan, bucket="direct", limit=min(limit, 4))
-    likely_tests = _collect_test_impact_tests(plan, bucket="likely", limit=min(limit, 4))
+    direct_tests = _collect_test_impact_tests(profile, plan, bucket="direct", limit=min(limit, 4))
+    likely_tests = _collect_test_impact_tests(profile, plan, bucket="likely", limit=min(limit, 4))
     direct_paths = {str(item.get("path") or "") for item in direct_tests if item.get("path")}
     likely_tests = [
         item for item in likely_tests
@@ -5003,6 +5007,186 @@ def _test_file_path(path: str) -> bool:
     )
 
 
+def _representative_service_pattern(connection: sqlite3.Connection) -> dict[str, object] | None:
+    """Return one canonical external-service pattern with implementation, registration, and test.
+
+    Free-text service safety queries need one concrete structural pattern in the
+    output fields themselves, not just generic advice. We keep this selector
+    narrow and deterministic by scanning indexed web-service registrations for
+    one well-formed external implementation that also has concrete PHPUnit
+    coverage in the same component.
+    """
+
+    rows = connection.execute(
+        """
+        SELECT
+            w.service_name,
+            w.classname,
+            w.methodname,
+            w.resolved_target_file,
+            files.moodle_path AS service_path
+        FROM webservices w
+        JOIN files ON files.id = w.file_id
+        WHERE w.resolution_status = 'resolved'
+          AND w.resolved_target_file IS NOT NULL
+          AND files.moodle_path LIKE '%/db/services.php'
+        ORDER BY files.moodle_path, w.resolved_target_file, w.service_name
+        """
+    ).fetchall()
+
+    best: dict[str, object] | None = None
+    best_score = -1
+    for row in rows:
+        implementation_path = str(row["resolved_target_file"] or "")
+        service_path = str(row["service_path"] or "")
+        class_name = _normalize_php_symbol_name(str(row["classname"] or ""))
+        method_name = str(row["methodname"] or "").strip()
+        if not implementation_path or "::class" in implementation_path:
+            continue
+        component_root = _component_root_for_path(implementation_path)
+        test_path = _representative_service_test_path(connection, implementation_path, component_root)
+        if not test_path:
+            continue
+
+        score = 0
+        if implementation_path.startswith("mod/"):
+            score += 4
+        elif implementation_path.startswith(("tool/", "admin/tool/")):
+            score += 1
+        if "/classes/external/" in implementation_path:
+            score += 5
+        elif implementation_path.endswith("/externallib.php"):
+            score += 3
+        if service_path.endswith("/db/services.php"):
+            score += 3
+        if test_path.endswith("_test.php"):
+            score += 4
+        if "/tests/external/" in test_path:
+            score += 2
+
+        symbol = _representative_service_symbol(
+            connection,
+            class_name=class_name,
+            method_name=method_name,
+            implementation_path=implementation_path,
+        )
+        candidate = {
+            "service_name": str(row["service_name"] or ""),
+            "service_path": service_path,
+            "implementation_path": implementation_path,
+            "implementation_symbol": symbol,
+            "test_path": test_path,
+            "component_root": component_root,
+        }
+        if score > best_score:
+            best = candidate
+            best_score = score
+
+    return best
+
+
+def _component_root_for_path(path: str) -> str:
+    """Return the component-root prefix for one Moodle path."""
+
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 3 and parts[:2] == ["admin", "tool"]:
+        return "/".join(parts[:3])
+    if len(parts) >= 3 and parts[:2] == ["ai", "provider"]:
+        return "/".join(parts[:3])
+    if len(parts) >= 2 and parts[0] in {"mod", "block", "local", "theme", "enrol", "report", "question", "course", "admin"}:
+        return "/".join(parts[:2])
+    return parts[0] if parts else path
+
+
+def _representative_service_test_path(
+    connection: sqlite3.Connection,
+    implementation_path: str,
+    component_root: str,
+) -> str | None:
+    """Return one concrete representative PHPUnit path for an external service implementation."""
+
+    stem = Path(implementation_path).stem
+    candidates: list[str] = []
+    if "/classes/external/" in implementation_path:
+        candidates.append(f"{component_root}/tests/external/{stem}_test.php")
+    if implementation_path.endswith("/externallib.php"):
+        candidates.extend(
+            [
+                f"{component_root}/tests/externallib_test.php",
+                f"{component_root}/tests/externallib_advanced_testcase.php",
+            ]
+        )
+    for candidate in candidates:
+        row = connection.execute(
+            "SELECT 1 FROM files WHERE moodle_path = ? LIMIT 1",
+            (candidate,),
+        ).fetchone()
+        if row is not None:
+            return candidate
+    return None
+
+
+def _representative_service_symbol(
+    connection: sqlite3.Connection,
+    *,
+    class_name: str,
+    method_name: str,
+    implementation_path: str,
+) -> str | None:
+    """Return one representative external method symbol when it can be resolved cheaply."""
+
+    if class_name:
+        preferred_names = [method_name] if method_name else []
+        preferred_names.append("execute")
+        for candidate_name in preferred_names:
+            row = connection.execute(
+                """
+                SELECT symbols.fqname
+                FROM symbols
+                JOIN files ON files.id = symbols.file_id
+                WHERE files.moodle_path = ?
+                  AND symbols.symbol_type = 'method'
+                  AND symbols.container_name = ?
+                  AND symbols.name = ?
+                ORDER BY symbols.line
+                LIMIT 1
+                """,
+                (implementation_path, class_name, candidate_name),
+            ).fetchone()
+            if row is not None and row["fqname"]:
+                return str(row["fqname"])
+        row = connection.execute(
+            """
+            SELECT symbols.fqname
+            FROM symbols
+            JOIN files ON files.id = symbols.file_id
+            WHERE files.moodle_path = ?
+              AND symbols.symbol_type = 'method'
+              AND symbols.container_name = ?
+            ORDER BY CASE WHEN symbols.name = 'execute' THEN 0 ELSE 1 END, symbols.line
+            LIMIT 1
+            """,
+            (implementation_path, class_name),
+        ).fetchone()
+        if row is not None and row["fqname"]:
+            return str(row["fqname"])
+    row = connection.execute(
+        """
+        SELECT symbols.fqname
+        FROM symbols
+        JOIN files ON files.id = symbols.file_id
+        WHERE files.moodle_path = ?
+          AND symbols.symbol_type = 'method'
+        ORDER BY CASE WHEN symbols.name = 'execute' THEN 0 ELSE 1 END, symbols.line
+        LIMIT 1
+        """,
+        (implementation_path,),
+    ).fetchone()
+    if row is not None and row["fqname"]:
+        return str(row["fqname"])
+    return None
+
+
 def _plan_items(plan: dict[str, object]) -> list[dict[str, object]]:
     """Return all bounded change-plan items in one flat list."""
 
@@ -5013,6 +5197,7 @@ def _plan_items(plan: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _collect_test_impact_tests(
+    profile: dict[str, object],
     plan: dict[str, object],
     *,
     bucket: str,
@@ -5026,6 +5211,18 @@ def _collect_test_impact_tests(
         sources = [plan.get("validation_impact", []), plan.get("likely_edits", []), plan.get("optional_edits", [])]
 
     items: list[dict[str, object]] = []
+    representative_pattern = dict(profile.get("representative_pattern") or {})
+    if bucket == "direct" and bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
+        test_path = str(representative_pattern.get("test_path") or "")
+        if test_path:
+            items.append(
+                _safety_item(
+                    path=test_path,
+                    confidence="high",
+                    reason="Representative PHPUnit coverage for the canonical Moodle external API change pattern; inspect and rerun it when parameters or service behavior change.",
+                    priority=0,
+                )
+            )
     for source in sources:
         for item in source:
             path = str(item.get("path") or "")
@@ -5084,6 +5281,7 @@ def _collect_contract_checks(
     items: list[dict[str, object]] = []
     anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
     anchor_type = str(profile.get("anchor_type") or "")
+    representative_pattern = dict(profile.get("representative_pattern") or {})
     representative_service_added = False
     if bool(profile.get("service")) and anchor_type == "query":
         items.append(
@@ -5093,6 +5291,26 @@ def _collect_contract_checks(
                 priority=0,
             )
         )
+        if representative_pattern.get("implementation_path"):
+            items.append(
+                _safety_item(
+                    path=str(representative_pattern["implementation_path"]),
+                    symbol=_none_if_empty(representative_pattern.get("implementation_symbol")),
+                    confidence="high",
+                    reason="Review parameter definitions and declared return structure on this representative external API method; signature changes usually require coordinated schema updates.",
+                    priority=1,
+                )
+            )
+        if representative_pattern.get("service_path"):
+            items.append(
+                _safety_item(
+                    path=str(representative_pattern["service_path"]),
+                    confidence="high",
+                    reason="Review this representative web-service registration alongside the implementation; API parameter or return-shape changes often require entrypoint/schema updates here.",
+                    priority=2,
+                )
+            )
+            representative_service_added = True
     for item in _plan_items(plan):
         path = str(item.get("path") or "")
         if path.endswith("/db/services.php"):
@@ -5153,24 +5371,36 @@ def _collect_manual_review_points(
     items: list[dict[str, object]] = []
     anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
     if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
-        representative_impl = next(
-            (
-                item for item in plan.get("required_edits", [])
-                if str(item.get("change_role")) == "implementation"
-                and ("/classes/external/" in str(item.get("path") or "") or str(item.get("path") or "").endswith("/externallib.php"))
-            ),
-            None,
-        )
-        if representative_impl is not None:
+        representative_pattern = dict(profile.get("representative_pattern") or {})
+        if representative_pattern.get("implementation_path"):
             items.append(
                 _safety_item(
-                    path=str(representative_impl["path"]),
-                    symbol=_none_if_empty(representative_impl.get("symbol")),
-                    confidence=str(representative_impl.get("confidence") or "high"),
+                    path=str(representative_pattern["implementation_path"]),
+                    symbol=_none_if_empty(representative_pattern.get("implementation_symbol")),
+                    confidence="high",
                     reason=f"Use this representative external implementation as the canonical API-change pattern for {anchor_label}; it is the concrete code surface to compare before editing your real target.",
                     priority=0,
                 )
             )
+        else:
+            representative_impl = next(
+                (
+                    item for item in plan.get("required_edits", [])
+                    if str(item.get("change_role")) == "implementation"
+                    and ("/classes/external/" in str(item.get("path") or "") or str(item.get("path") or "").endswith("/externallib.php"))
+                ),
+                None,
+            )
+            if representative_impl is not None:
+                items.append(
+                    _safety_item(
+                        path=str(representative_impl["path"]),
+                        symbol=_none_if_empty(representative_impl.get("symbol")),
+                        confidence=str(representative_impl.get("confidence") or "high"),
+                        reason=f"Use this representative external implementation as the canonical API-change pattern for {anchor_label}; it is the concrete code surface to compare before editing your real target.",
+                        priority=0,
+                    )
+                )
     if bool(profile.get("service")):
         items.append(
             _safety_item(
@@ -5264,7 +5494,14 @@ def _collect_pre_edit_checks(
     items: list[dict[str, object]] = []
     required = list(plan.get("required_edits", []))
     likely = list(plan.get("likely_edits", []))
+    representative_pattern = dict(profile.get("representative_pattern") or {})
     implementation = next((item for item in required if str(item.get("change_role")) == "implementation"), None)
+    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query" and representative_pattern.get("implementation_path"):
+        implementation = {
+            "path": str(representative_pattern["implementation_path"]),
+            "symbol": representative_pattern.get("implementation_symbol"),
+            "confidence": "high",
+        }
     if implementation is not None:
         items.append(
             _safety_item(
@@ -5283,6 +5520,15 @@ def _collect_pre_edit_checks(
                 priority=0,
             )
         )
+        if representative_pattern.get("service_path"):
+            items.append(
+                _safety_item(
+                    path=str(representative_pattern["service_path"]),
+                    confidence="high",
+                    reason="Inspect this representative service registration before editing so API signature, declared parameters, and routing stay aligned with the implementation change.",
+                    priority=1,
+                )
+            )
     direct_test = next(iter(test_impact.get("direct_tests", [])), None)
     if direct_test is not None:
         items.append(
