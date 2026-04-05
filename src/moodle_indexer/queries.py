@@ -913,6 +913,61 @@ def propose_change_plan(
     return _change_plan_for_query(connection, query_text or "", bounded_limit)
 
 
+def assess_test_impact(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    query_text: str | None = None,
+    limit: int = 8,
+) -> dict[str, object]:
+    """Return a bounded validation view around a symbol, file, or change goal.
+
+    Phase 5B keeps test-impact estimation intentionally conservative:
+    - prefer concrete PHPUnit-linked files over generic test hints
+    - surface contract and environment checks only when structurally justified
+    - keep output short enough that an agent can use it as a practical checklist
+    """
+
+    targets = [bool(symbol_query), bool(file_path), bool(query_text)]
+    if sum(targets) != 1:
+        raise ValidationError("Provide exactly one of --symbol, --file, or --query.")
+
+    bounded_limit = max(1, min(limit, 8))
+    if symbol_query:
+        return _test_impact_for_symbol(connection, symbol_query, bounded_limit)
+    if file_path:
+        return _test_impact_for_file(connection, file_path, bounded_limit)
+    return _test_impact_for_query(connection, query_text or "", bounded_limit)
+
+
+def execution_guardrails(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    query_text: str | None = None,
+    limit: int = 8,
+) -> dict[str, object]:
+    """Return bounded pre/post-edit guardrails around a symbol, file, or goal.
+
+    The guardrails endpoint does not attempt to block changes. It summarizes the
+    strongest local risks, checks, and assumptions an agent should verify before
+    finalizing edits in a Moodle workflow.
+    """
+
+    targets = [bool(symbol_query), bool(file_path), bool(query_text)]
+    if sum(targets) != 1:
+        raise ValidationError("Provide exactly one of --symbol, --file, or --query.")
+
+    bounded_limit = max(1, min(limit, 8))
+    if symbol_query:
+        return _execution_guardrails_for_symbol(connection, symbol_query, bounded_limit)
+    if file_path:
+        return _execution_guardrails_for_file(connection, file_path, bounded_limit)
+    return _execution_guardrails_for_query(connection, query_text or "", bounded_limit)
+
+
 def _change_plan_for_symbol(
     connection: sqlite3.Connection,
     symbol_query: str,
@@ -1000,6 +1055,173 @@ def _change_plan_for_query(
     return plan
 
 
+def _test_impact_for_symbol(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded test impact anchored on one resolved symbol."""
+
+    definition_data = find_definition(connection, symbol_query, limit=1, include_usages=True)
+    matches = definition_data["matches"]
+    if not matches:
+        return _empty_test_impact(symbol_query, "symbol")
+
+    anchor_match = matches[0]
+    profile = _plan_profile_for_symbol(anchor_match)
+    plan = propose_change_plan(connection, symbol_query=symbol_query, limit=limit)
+    return _synthesize_test_impact(
+        query=symbol_query,
+        query_kind="symbol",
+        anchor=_compact_match_summary(anchor_match),
+        profile=profile,
+        plan=plan,
+        limit=limit,
+    )
+
+
+def _test_impact_for_file(
+    connection: sqlite3.Connection,
+    file_path: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded test impact anchored on one indexed file."""
+
+    context = file_context(connection, file_path)
+    profile = _plan_profile_for_file(context)
+    plan = propose_change_plan(connection, file_path=file_path, limit=limit)
+    return _synthesize_test_impact(
+        query=context["moodle_path"],
+        query_kind="file",
+        anchor={
+            "path": context["moodle_path"],
+            "file_role": context["file_role"],
+            "component": context["component"],
+        },
+        profile=profile,
+        plan=plan,
+        limit=limit,
+    )
+
+
+def _test_impact_for_query(
+    connection: sqlite3.Connection,
+    query_text: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded test impact for a free-text change goal."""
+
+    profile = _plan_profile_for_query(query_text)
+    plan = propose_change_plan(connection, query_text=query_text, limit=limit)
+    return _synthesize_test_impact(
+        query=query_text,
+        query_kind="query",
+        anchor=None,
+        profile=profile,
+        plan=plan,
+        limit=limit,
+    )
+
+
+def _execution_guardrails_for_symbol(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded execution guardrails anchored on one resolved symbol."""
+
+    definition_data = find_definition(connection, symbol_query, limit=1, include_usages=True)
+    matches = definition_data["matches"]
+    if not matches:
+        return _empty_execution_guardrails(symbol_query, "symbol")
+
+    anchor_match = matches[0]
+    profile = _plan_profile_for_symbol(anchor_match)
+    plan = propose_change_plan(connection, symbol_query=symbol_query, limit=limit)
+    test_impact = _synthesize_test_impact(
+        query=symbol_query,
+        query_kind="symbol",
+        anchor=_compact_match_summary(anchor_match),
+        profile=profile,
+        plan=plan,
+        limit=limit,
+    )
+    return _synthesize_execution_guardrails(
+        query=symbol_query,
+        query_kind="symbol",
+        anchor=_compact_match_summary(anchor_match),
+        profile=profile,
+        plan=plan,
+        test_impact=test_impact,
+        limit=limit,
+    )
+
+
+def _execution_guardrails_for_file(
+    connection: sqlite3.Connection,
+    file_path: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded execution guardrails anchored on one indexed file."""
+
+    context = file_context(connection, file_path)
+    profile = _plan_profile_for_file(context)
+    plan = propose_change_plan(connection, file_path=file_path, limit=limit)
+    test_impact = _synthesize_test_impact(
+        query=context["moodle_path"],
+        query_kind="file",
+        anchor={
+            "path": context["moodle_path"],
+            "file_role": context["file_role"],
+            "component": context["component"],
+        },
+        profile=profile,
+        plan=plan,
+        limit=limit,
+    )
+    return _synthesize_execution_guardrails(
+        query=context["moodle_path"],
+        query_kind="file",
+        anchor={
+            "path": context["moodle_path"],
+            "file_role": context["file_role"],
+            "component": context["component"],
+        },
+        profile=profile,
+        plan=plan,
+        test_impact=test_impact,
+        limit=limit,
+    )
+
+
+def _execution_guardrails_for_query(
+    connection: sqlite3.Connection,
+    query_text: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded execution guardrails for a free-text change goal."""
+
+    profile = _plan_profile_for_query(query_text)
+    plan = propose_change_plan(connection, query_text=query_text, limit=limit)
+    test_impact = _synthesize_test_impact(
+        query=query_text,
+        query_kind="query",
+        anchor=None,
+        profile=profile,
+        plan=plan,
+        limit=limit,
+    )
+    return _synthesize_execution_guardrails(
+        query=query_text,
+        query_kind="query",
+        anchor=None,
+        profile=profile,
+        plan=plan,
+        test_impact=test_impact,
+        limit=limit,
+    )
+
+
 def _empty_change_plan(query: str, query_kind: str) -> dict[str, object]:
     """Return an empty change-plan payload."""
 
@@ -1016,6 +1238,45 @@ def _empty_change_plan(query: str, query_kind: str) -> dict[str, object]:
         "recommended_sequence": [],
         "notes": [
             "No matching anchor was found, so the planner could not synthesize a bounded edit set.",
+        ],
+    }
+
+
+def _empty_test_impact(query: str, query_kind: str) -> dict[str, object]:
+    """Return an empty test-impact payload."""
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": None,
+        "direct_tests": [],
+        "likely_tests": [],
+        "environment_steps": [],
+        "contract_checks": [],
+        "manual_review_points": [],
+        "notes": [
+            "No matching anchor was found, so the test-impact view could not be synthesized.",
+        ],
+    }
+
+
+def _empty_execution_guardrails(query: str, query_kind: str) -> dict[str, object]:
+    """Return an empty execution-guardrails payload."""
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": None,
+        "change_risk": {
+            "level": "medium",
+            "reason": "No matching anchor was found, so the system could not classify risk from trusted structural context.",
+        },
+        "pre_edit_checks": [],
+        "post_edit_checks": [],
+        "do_not_assume": [],
+        "watch_points": [],
+        "notes": [
+            "No matching anchor was found, so the guardrails could not be synthesized from structural evidence.",
         ],
     }
 
@@ -1150,6 +1411,71 @@ def _synthesize_change_plan(
         "recommended_sequence": recommended_sequence,
         "notes": [
             "This plan is bounded and confidence-aware. It prioritizes direct structural companions over distant semantic examples.",
+        ],
+    }
+
+
+def _synthesize_test_impact(
+    *,
+    query: str,
+    query_kind: str,
+    anchor: dict[str, object] | None,
+    profile: dict[str, object],
+    plan: dict[str, object],
+    limit: int,
+) -> dict[str, object]:
+    """Translate one bounded change plan into a bounded validation view."""
+
+    direct_tests = _collect_test_impact_tests(plan, bucket="direct", limit=min(limit, 4))
+    likely_tests = _collect_test_impact_tests(plan, bucket="likely", limit=min(limit, 4))
+    environment_steps = _collect_environment_steps(profile, plan, limit=min(limit, 4))
+    contract_checks = _collect_contract_checks(profile, plan, limit=min(limit, 4))
+    manual_review_points = _collect_manual_review_points(profile, plan, limit=min(limit, 4))
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": anchor,
+        "direct_tests": direct_tests,
+        "likely_tests": likely_tests,
+        "environment_steps": environment_steps,
+        "contract_checks": contract_checks,
+        "manual_review_points": manual_review_points,
+        "notes": [
+            "This test-impact view is bounded and conservative. It prioritizes concrete tests and contract checks over generic validation advice.",
+        ],
+    }
+
+
+def _synthesize_execution_guardrails(
+    *,
+    query: str,
+    query_kind: str,
+    anchor: dict[str, object] | None,
+    profile: dict[str, object],
+    plan: dict[str, object],
+    test_impact: dict[str, object],
+    limit: int,
+) -> dict[str, object]:
+    """Translate one bounded plan and validation view into execution guardrails."""
+
+    risk = _classify_change_risk(profile, plan, test_impact)
+    pre_edit_checks = _collect_pre_edit_checks(profile, plan, test_impact, limit=min(limit, 5))
+    post_edit_checks = _collect_post_edit_checks(profile, plan, test_impact, limit=min(limit, 5))
+    do_not_assume = _collect_do_not_assume(profile, plan, limit=min(limit, 4))
+    watch_points = _collect_watch_points(profile, plan, limit=min(limit, 4))
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": anchor,
+        "change_risk": risk,
+        "pre_edit_checks": pre_edit_checks,
+        "post_edit_checks": post_edit_checks,
+        "do_not_assume": do_not_assume,
+        "watch_points": watch_points,
+        "notes": [
+            "These guardrails are intentionally short and conservative. They highlight the strongest local risks and checks before finalizing edits.",
         ],
     }
 
@@ -4538,6 +4864,421 @@ def _none_if_empty(value: object) -> str | None:
     if value in {None, ""}:
         return None
     return str(value)
+
+
+def _safety_item(
+    *,
+    reason: str,
+    confidence: str = "high",
+    path: str | None = None,
+    symbol: str | None = None,
+) -> dict[str, object]:
+    """Return one bounded safety/test-impact item."""
+
+    item: dict[str, object] = {
+        "confidence": confidence,
+        "reason": reason,
+    }
+    if path:
+        item["path"] = path
+    if symbol:
+        item["symbol"] = symbol
+    return item
+
+
+def _dedupe_safety_items(items: list[dict[str, object]], *, limit: int) -> list[dict[str, object]]:
+    """Return one bounded list of unique safety items."""
+
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for item in items:
+        key = (str(item.get("path") or ""), str(item.get("reason") or ""))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(item)
+            continue
+        if _confidence_rank(str(item.get("confidence") or "medium")) < _confidence_rank(str(existing.get("confidence") or "medium")):
+            existing["confidence"] = item["confidence"]
+        if not existing.get("symbol") and item.get("symbol"):
+            existing["symbol"] = item["symbol"]
+    ordered = sorted(
+        merged.values(),
+        key=lambda item: (
+            _confidence_rank(str(item.get("confidence") or "medium")),
+            str(item.get("path") or ""),
+            str(item.get("reason") or ""),
+        ),
+    )
+    return ordered[:limit]
+
+
+def _test_file_path(path: str) -> bool:
+    """Return whether one path looks like a concrete automated test."""
+
+    return (
+        "/tests/" in path
+        or path.endswith("_test.php")
+        or path.endswith("_advanced_testcase.php")
+        or path.endswith(".feature")
+    )
+
+
+def _plan_items(plan: dict[str, object]) -> list[dict[str, object]]:
+    """Return all bounded change-plan items in one flat list."""
+
+    items: list[dict[str, object]] = []
+    for key in ("required_edits", "likely_edits", "optional_edits", "validation_impact"):
+        items.extend(list(plan.get(key, [])))
+    return items
+
+
+def _collect_test_impact_tests(
+    plan: dict[str, object],
+    *,
+    bucket: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return direct or likely concrete tests from one bounded plan."""
+
+    if bucket == "direct":
+        sources = [plan.get("required_edits", []), plan.get("validation_impact", [])]
+    else:
+        sources = [plan.get("likely_edits", []), plan.get("optional_edits", [])]
+
+    items: list[dict[str, object]] = []
+    for source in sources:
+        for item in source:
+            path = str(item.get("path") or "")
+            if not _test_file_path(path):
+                continue
+            items.append(
+                _safety_item(
+                    path=path,
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence=str(item.get("confidence") or "medium"),
+                    reason=f"Concrete automated coverage for this change lives here; review and rerun it if behavior, parameters, or output expectations change.",
+                )
+            )
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _collect_environment_steps(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded non-test workflow steps implied by the change plan."""
+
+    items: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    if bool(profile.get("js")):
+        for item in _plan_items(plan):
+            path = str(item.get("path") or "")
+            if "/amd/build/" not in path or path in seen_paths:
+                continue
+            items.append(
+                _safety_item(
+                    path=path,
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence=str(item.get("confidence") or "medium"),
+                    reason="Generated JavaScript artifact linked to the source module; rebuild or verify it if the workflow commits built assets.",
+                )
+            )
+            seen_paths.add(path)
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _collect_contract_checks(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded contract or schema checks implied by the current slice."""
+
+    items: list[dict[str, object]] = []
+    anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
+    for item in _plan_items(plan):
+        path = str(item.get("path") or "")
+        if path.endswith("/db/services.php"):
+            items.append(
+                _safety_item(
+                    path=path,
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence=str(item.get("confidence") or "high"),
+                    reason=f"Review the web-service registration for {anchor_label}; API parameter or return-shape changes often require entrypoint/schema updates here.",
+                )
+            )
+        elif path.endswith("/renderer.php"):
+            items.append(
+                _safety_item(
+                    path=path,
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence="medium",
+                    reason=f"Review renderer expectations for {anchor_label}; output-shape changes often require renderer-side consistency checks.",
+                )
+            )
+        elif path.endswith(".mustache"):
+            items.append(
+                _safety_item(
+                    path=path,
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence="medium",
+                    reason=f"Review template expectations for {anchor_label}; rendered context changes can require template updates or compatibility checks.",
+                )
+            )
+        elif path.endswith("/action_settings_form.php") or path.endswith("/action_form.php"):
+            items.append(
+                _safety_item(
+                    path=path,
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence=str(item.get("confidence") or "medium"),
+                    reason=f"Review form defaults and validation coupled to {anchor_label}; settings or field changes often need contract alignment here.",
+                )
+            )
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _collect_manual_review_points(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded manual review points that are not concrete tests."""
+
+    items: list[dict[str, object]] = []
+    anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
+    if bool(profile.get("service")):
+        items.append(
+            _safety_item(
+                confidence="high",
+                reason=f"Review backwards-compatibility expectations for {anchor_label}; external API signature and return-shape changes can affect callers beyond the direct PHPUnit coverage.",
+            )
+        )
+    if bool(profile.get("rendering")):
+        items.append(
+            _safety_item(
+                confidence="high",
+                reason=f"Review renderer/template blast radius for {anchor_label}; large legacy rendering entrypoints can fan out into multiple output and template surfaces.",
+            )
+        )
+    if bool(profile.get("provider_form")):
+        items.append(
+            _safety_item(
+                confidence="medium",
+                reason=f"Review inherited provider/form behavior for {anchor_label}; field, default, or validation changes can drift from shared base classes.",
+            )
+        )
+    if bool(profile.get("js")):
+        items.append(
+            _safety_item(
+                confidence="medium",
+                reason=f"Review import and superclass expectations around {anchor_label}; client-side changes can regress dependent modules even when local edits are small.",
+            )
+        )
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _classify_change_risk(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    test_impact: dict[str, object],
+) -> dict[str, str]:
+    """Return one conservative change-risk classification with explanation."""
+
+    direct_tests = list(test_impact.get("direct_tests", []))
+    anchor_path = str(profile.get("anchor_path") or "")
+    anchor_type = str(profile.get("anchor_type") or "")
+    if bool(profile.get("service")) and anchor_type == "query":
+        return {
+            "level": "high",
+            "reason": "High risk because this free-text goal implies an external API contract change without one fixed implementation anchor; service registration and compatibility checks need extra care.",
+        }
+    if bool(profile.get("rendering")) and (anchor_path.endswith("/locallib.php") or anchor_path.endswith("/lib.php")):
+        return {
+            "level": "high",
+            "reason": "High risk because this change touches a broad rendering-oriented legacy entrypoint with renderer/template companions and a wider blast radius.",
+        }
+    if bool(profile.get("service")):
+        if direct_tests:
+            return {
+                "level": "medium",
+                "reason": "Medium risk because external API and service-registration changes affect contracts, but concrete PHPUnit coverage and entrypoint checks are available.",
+            }
+        return {
+            "level": "high",
+            "reason": "High risk because this change affects an external API surface without strong direct automated coverage in the current bounded context.",
+        }
+    if bool(profile.get("provider_form")):
+        return {
+            "level": "medium",
+            "reason": "Medium risk because provider settings changes can affect concrete forms and inherited base contracts even when the slice is structurally well-bounded.",
+        }
+    if bool(profile.get("js")):
+        return {
+            "level": "medium",
+            "reason": "Medium risk because source-module changes can affect imports, superclass behavior, and generated build artifacts.",
+        }
+    return {
+        "level": "low" if direct_tests else "medium",
+        "reason": "Risk is bounded to a local implementation slice with the currently visible structural companions.",
+    }
+
+
+def _collect_pre_edit_checks(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    test_impact: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded checks that should happen before editing."""
+
+    items: list[dict[str, object]] = []
+    required = list(plan.get("required_edits", []))
+    likely = list(plan.get("likely_edits", []))
+    implementation = next((item for item in required if str(item.get("change_role")) == "implementation"), None)
+    if implementation is not None:
+        items.append(
+            _safety_item(
+                path=str(implementation["path"]),
+                symbol=_none_if_empty(implementation.get("symbol")),
+                confidence=str(implementation.get("confidence") or "high"),
+                reason="Inspect the defining implementation first so the change starts from the real behavior anchor rather than a companion artifact.",
+            )
+        )
+    direct_test = next(iter(test_impact.get("direct_tests", [])), None)
+    if direct_test is not None:
+        items.append(
+            _safety_item(
+                path=_none_if_empty(direct_test.get("path")),
+                symbol=_none_if_empty(direct_test.get("symbol")),
+                confidence=str(direct_test.get("confidence") or "high"),
+                reason="Inspect the most direct automated coverage before editing so expected behavior and assertions are clear.",
+            )
+        )
+    if bool(profile.get("service")):
+        entrypoint = next((item for item in required + likely if str(item.get("change_role")) == "entrypoint"), None)
+        if entrypoint is not None:
+            items.append(
+                _safety_item(
+                    path=str(entrypoint["path"]),
+                    symbol=_none_if_empty(entrypoint.get("symbol")),
+                    confidence=str(entrypoint.get("confidence") or "high"),
+                    reason="Inspect service registration alongside the implementation before changing parameters or return structures.",
+                )
+            )
+    if bool(profile.get("rendering")):
+        companion = next((item for item in required + likely if str(item.get("change_role")) == "rendering_companion"), None)
+        if companion is not None:
+            items.append(
+                _safety_item(
+                    path=str(companion["path"]),
+                    symbol=_none_if_empty(companion.get("symbol")),
+                    confidence=str(companion.get("confidence") or "medium"),
+                    reason="Inspect the direct rendering companion before editing so output-shape changes stay aligned with renderer/template expectations.",
+                )
+            )
+    if bool(profile.get("provider_form")):
+        companion = next((item for item in required + likely if str(item.get("change_role")) == "form_companion"), None)
+        if companion is not None:
+            items.append(
+                _safety_item(
+                    path=str(companion["path"]),
+                    symbol=_none_if_empty(companion.get("symbol")),
+                    confidence=str(companion.get("confidence") or "medium"),
+                    reason="Inspect the concrete form chain before editing so field and validation expectations stay aligned with the provider method.",
+                )
+            )
+    if bool(profile.get("js")):
+        companion = next((item for item in required + likely if str(item.get("path", "")).startswith("lib/amd/") or "/amd/src/" in str(item.get("path", ""))), None)
+        if companion is not None and str(companion.get("path")) != str(implementation.get("path") if implementation else ""):
+            items.append(
+                _safety_item(
+                    path=str(companion["path"]),
+                    symbol=_none_if_empty(companion.get("symbol")),
+                    confidence=str(companion.get("confidence") or "medium"),
+                    reason="Inspect imported or inherited module behavior before editing the source module so public client-side contracts stay intact.",
+                )
+            )
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _collect_post_edit_checks(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    test_impact: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded checks that should happen after editing."""
+
+    items: list[dict[str, object]] = []
+    items.extend(list(test_impact.get("direct_tests", [])))
+    items.extend(list(test_impact.get("environment_steps", [])))
+    if bool(profile.get("service")):
+        for item in test_impact.get("contract_checks", []):
+            path = str(item.get("path") or "")
+            if path.endswith("/db/services.php"):
+                items.append(
+                    _safety_item(
+                        path=path,
+                        symbol=_none_if_empty(item.get("symbol")),
+                        confidence=str(item.get("confidence") or "high"),
+                        reason="Recheck the service registration after editing to confirm parameter, return-schema, and routing consistency.",
+                    )
+                )
+                break
+    if bool(profile.get("rendering")):
+        items.append(
+            _safety_item(
+                confidence="medium",
+                reason="Review output, renderer, and template consistency after the edit so rendered structure changes stay aligned end to end.",
+            )
+        )
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _collect_do_not_assume(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded assumptions an agent should avoid making."""
+
+    items: list[dict[str, object]] = []
+    if bool(profile.get("service")):
+        items.append(_safety_item(confidence="high", reason="Do not assume service registration updates itself when external API parameters or return structures change."))
+        items.append(_safety_item(confidence="medium", reason="Do not assume one direct PHPUnit file covers every external API compatibility edge around this service."))
+    if bool(profile.get("rendering")):
+        items.append(_safety_item(confidence="high", reason="Do not assume template impact is absent just because the change starts in PHP; rendering contracts often span output classes, renderers, and Mustache templates."))
+    if bool(profile.get("provider_form")):
+        items.append(_safety_item(confidence="medium", reason="Do not assume shared form bases inherit provider-field changes safely without reviewing defaults and validation rules."))
+    if bool(profile.get("js")):
+        items.append(_safety_item(confidence="medium", reason="Do not assume generated AMD build artifacts or dependent imports stay correct without verification after source changes."))
+    return _dedupe_safety_items(items, limit=limit)
+
+
+def _collect_watch_points(
+    profile: dict[str, object],
+    plan: dict[str, object],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded high-signal watch-points for the current slice."""
+
+    items: list[dict[str, object]] = []
+    if bool(profile.get("service")):
+        items.append(_safety_item(confidence="high", reason="Watch backwards-compatibility and consumer expectations if external API parameters, warnings, or return structures change."))
+    if bool(profile.get("rendering")):
+        items.append(_safety_item(confidence="high", reason="Watch the blast radius of large legacy rendering entrypoints; related output classes and templates may need coordinated updates."))
+    if bool(profile.get("provider_form")):
+        items.append(_safety_item(confidence="medium", reason="Watch for drift between concrete provider forms, shared form bases, and provider contract methods."))
+    if bool(profile.get("js")):
+        items.append(_safety_item(confidence="medium", reason="Watch import and superclass regressions, especially when the workflow commits generated AMD build artifacts."))
+    return _dedupe_safety_items(items, limit=limit)
 
 
 def _merge_dependency_section_items(

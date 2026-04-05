@@ -18,8 +18,10 @@ from moodle_indexer.js_modules import resolve_js_module
 from moodle_indexer.paths import build_indexed_paths, normalize_relative_lookup_path, normalize_relative_path
 from moodle_indexer.php_parser import ParsedMethod, ParsedSymbol, _merge_symbol_metadata
 from moodle_indexer.queries import (
+    assess_test_impact,
     component_summary,
     dependency_neighborhood,
+    execution_guardrails,
     file_context,
     find_definition,
     find_related_definitions,
@@ -1212,6 +1214,82 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert any("/classes/external/" in path or path.endswith("/externallib.php") for path in free_text_required_paths)
         assert any(path.endswith("_test.php") for path in free_text_required_paths)
         assert len(free_text_plan["required_edits"]) <= 5
+
+        service_test_impact = assess_test_impact(
+            connection,
+            symbol_query="mod_assign\\external\\start_submission::execute",
+        )
+        direct_test_paths = [item["path"] for item in service_test_impact["direct_tests"]]
+        assert "mod/assign/tests/external/start_submission_test.php" in direct_test_paths
+        contract_paths = [item["path"] for item in service_test_impact["contract_checks"]]
+        assert "mod/assign/db/services.php" in contract_paths
+        assert any("service" in item["reason"].lower() for item in service_test_impact["contract_checks"])
+
+        rendering_test_impact = assess_test_impact(
+            connection,
+            symbol_query="assign::view",
+        )
+        assert any("renderer" in item["reason"].lower() or "template" in item["reason"].lower() for item in rendering_test_impact["contract_checks"] + rendering_test_impact["manual_review_points"])
+
+        provider_test_impact = assess_test_impact(
+            connection,
+            symbol_query="aiprovider_openai\\provider::get_action_settings",
+        )
+        provider_contract_paths = [item.get("path") for item in provider_test_impact["contract_checks"]]
+        assert "ai/provider/openai/classes/form/action_form.php" in provider_contract_paths
+        assert any("form" in item["reason"].lower() for item in provider_test_impact["manual_review_points"] + provider_test_impact["contract_checks"])
+
+        js_test_impact = assess_test_impact(
+            connection,
+            symbol_query="core_ai/aiprovider_action_management_table",
+        )
+        js_environment_paths = [item["path"] for item in js_test_impact["environment_steps"]]
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_environment_paths
+
+        free_text_test_impact = assess_test_impact(
+            connection,
+            query_text="add a parameter to a Moodle external API method and update its tests",
+        )
+        assert any("/classes/external/" in str(item.get("path") or "") or path.endswith("/db/services.php") for item in free_text_test_impact["contract_checks"] for path in [str(item.get("path") or "")])
+        assert any(path.endswith("_test.php") for path in [item["path"] for item in free_text_test_impact["direct_tests"]])
+
+        service_guardrails = execution_guardrails(
+            connection,
+            symbol_query="mod_assign\\external\\start_submission::execute",
+        )
+        assert service_guardrails["change_risk"]["level"] == "medium"
+        assert any("service registration" in item["reason"].lower() for item in service_guardrails["pre_edit_checks"] + service_guardrails["post_edit_checks"])
+        assert any("do not assume" in item["reason"].lower() for item in service_guardrails["do_not_assume"])
+
+        rendering_guardrails = execution_guardrails(
+            connection,
+            symbol_query="assign::view",
+        )
+        assert rendering_guardrails["change_risk"]["level"] == "high"
+        assert any("template" in item["reason"].lower() or "renderer" in item["reason"].lower() for item in rendering_guardrails["watch_points"] + rendering_guardrails["pre_edit_checks"])
+
+        provider_guardrails = execution_guardrails(
+            connection,
+            symbol_query="aiprovider_openai\\provider::get_action_settings",
+        )
+        assert provider_guardrails["change_risk"]["level"] == "medium"
+        assert any("form" in item["reason"].lower() for item in provider_guardrails["pre_edit_checks"] + provider_guardrails["watch_points"])
+
+        js_guardrails = execution_guardrails(
+            connection,
+            symbol_query="core_ai/aiprovider_action_management_table",
+        )
+        assert js_guardrails["change_risk"]["level"] == "medium"
+        assert any("build" in item["reason"].lower() or "import" in item["reason"].lower() for item in js_guardrails["post_edit_checks"] + js_guardrails["watch_points"])
+
+        free_text_guardrails = execution_guardrails(
+            connection,
+            query_text="add a parameter to a Moodle external API method and update its tests",
+        )
+        assert free_text_guardrails["change_risk"]["level"] == "high"
+        assert any("service registration" in item["reason"].lower() or "api" in item["reason"].lower() for item in free_text_guardrails["watch_points"] + free_text_guardrails["do_not_assume"])
+        assert len(service_test_impact["direct_tests"]) <= 4
+        assert len(service_guardrails["pre_edit_checks"]) <= 5
     finally:
         connection.close()
 

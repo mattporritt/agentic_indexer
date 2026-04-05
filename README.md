@@ -322,6 +322,30 @@ moodle-indexer propose-change-plan \
   --query 'add a parameter to a Moodle external API method and update its tests'
 ```
 
+Assess likely test impact and validation surfaces around a symbol, file, or free-text change goal:
+
+```bash
+moodle-indexer assess-test-impact \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+
+moodle-indexer assess-test-impact \
+  --db-path /path/to/moodle-index.sqlite \
+  --query 'add a parameter to a Moodle external API method and update its tests'
+```
+
+Return bounded risk and execution guardrails before finalizing edits:
+
+```bash
+moodle-indexer execution-guardrails \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol assign::view
+
+moodle-indexer execution-guardrails \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol core_ai/aiprovider_action_management_table
+```
+
 Find a definition:
 
 ```bash
@@ -440,6 +464,16 @@ structural and semantic signals:
   `required_edits`, `likely_edits`, and `optional_edits`, adds a compact
   `validation_impact` view, and suggests a short `recommended_sequence`
   without modifying code automatically
+
+Phase 5B adds a bounded safety layer on top of the same plan and structural
+signals:
+
+- `assess-test-impact`: a compact validation view that separates
+  `direct_tests`, `likely_tests`, `environment_steps`, `contract_checks`, and
+  `manual_review_points`
+- `execution-guardrails`: a bounded safety summary that adds a conservative
+  `change_risk`, concise `pre_edit_checks`, `post_edit_checks`, `do_not_assume`
+  reminders, and `watch_points`
 
 These agent-oriented navigation endpoints are intentionally confidence-aware:
 

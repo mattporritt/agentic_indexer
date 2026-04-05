@@ -17,8 +17,10 @@ from moodle_indexer.errors import IndexerError
 from moodle_indexer.indexer import build_index
 from moodle_indexer.json_output import dumps_json, error_payload, success_payload
 from moodle_indexer.queries import (
+    assess_test_impact,
     component_summary,
     dependency_neighborhood,
+    execution_guardrails,
     file_context,
     find_definition,
     find_related_definitions,
@@ -177,6 +179,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of required, likely, or optional plan items to return.",
     )
 
+    test_impact_parser = subparsers.add_parser(
+        "assess-test-impact",
+        help="Return a bounded test-impact and validation view around a symbol, file, or change goal.",
+    )
+    test_impact_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    test_impact_target = test_impact_parser.add_mutually_exclusive_group(required=True)
+    test_impact_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    test_impact_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    test_impact_target.add_argument(
+        "--query",
+        help="Free-text change goal such as add a parameter to a Moodle external API method and update its tests.",
+    )
+    test_impact_parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="Maximum number of direct, likely, or review/test-impact items to return.",
+    )
+
+    guardrails_parser = subparsers.add_parser(
+        "execution-guardrails",
+        help="Return bounded risk, pre/post checks, and execution guardrails around a symbol, file, or change goal.",
+    )
+    guardrails_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    guardrails_target = guardrails_parser.add_mutually_exclusive_group(required=True)
+    guardrails_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    guardrails_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    guardrails_target.add_argument(
+        "--query",
+        help="Free-text change goal such as add a parameter to a Moodle external API method and update its tests.",
+    )
+    guardrails_parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="Maximum number of guardrail items to return per section.",
+    )
+
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     file_parser.add_argument(
@@ -230,6 +276,10 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_semantic_context(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "propose-change-plan":
             payload = run_propose_change_plan(args.db_path, args.symbol, args.file, args.query, args.limit)
+        elif args.command == "assess-test-impact":
+            payload = run_assess_test_impact(args.db_path, args.symbol, args.file, args.query, args.limit)
+        elif args.command == "execution-guardrails":
+            payload = run_execution_guardrails(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -366,6 +416,56 @@ def run_propose_change_plan(
                 symbol_query=symbol,
                 file_path=file_path,
                 query_text=query,
+                limit=limit,
+            ),
+        )
+    finally:
+        connection.close()
+
+
+def run_assess_test_impact(
+    db_path: str,
+    symbol: str | None,
+    file_path: str | None,
+    query_text: str | None,
+    limit: int,
+) -> dict:
+    """Return bounded test-impact details around a symbol, file, or change goal."""
+
+    connection = open_database(Path(db_path))
+    try:
+        return success_payload(
+            "assess-test-impact",
+            assess_test_impact(
+                connection,
+                symbol_query=symbol,
+                file_path=file_path,
+                query_text=query_text,
+                limit=limit,
+            ),
+        )
+    finally:
+        connection.close()
+
+
+def run_execution_guardrails(
+    db_path: str,
+    symbol: str | None,
+    file_path: str | None,
+    query_text: str | None,
+    limit: int,
+) -> dict:
+    """Return bounded execution guardrails around a symbol, file, or change goal."""
+
+    connection = open_database(Path(db_path))
+    try:
+        return success_payload(
+            "execution-guardrails",
+            execution_guardrails(
+                connection,
+                symbol_query=symbol,
+                file_path=file_path,
+                query_text=query_text,
                 limit=limit,
             ),
         )

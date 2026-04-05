@@ -488,3 +488,40 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert "mod/assign/tests/external/start_submission_test.php" in required_paths
     assert plan_payload["data"]["validation_impact"]
     assert plan_payload["data"]["recommended_sequence"][0]["target"] == "mod/assign/classes/external/start_submission.php"
+
+    exit_code = main(
+        [
+            "assess-test-impact",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    test_impact_payload = json.loads(capsys.readouterr().out)
+    assert test_impact_payload["status"] == "ok"
+    assert "mod/assign/tests/external/start_submission_test.php" in {
+        item["path"] for item in test_impact_payload["data"]["direct_tests"]
+    }
+    assert "mod/assign/db/services.php" in {
+        item["path"] for item in test_impact_payload["data"]["contract_checks"]
+    }
+
+    exit_code = main(
+        [
+            "execution-guardrails",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    guardrails_payload = json.loads(capsys.readouterr().out)
+    assert guardrails_payload["status"] == "ok"
+    assert guardrails_payload["data"]["change_risk"]["level"] == "medium"
+    assert any(
+        "service registration" in item["reason"].lower()
+        for item in guardrails_payload["data"]["pre_edit_checks"] + guardrails_payload["data"]["post_edit_checks"]
+    )
