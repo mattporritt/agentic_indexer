@@ -1221,9 +1221,14 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         direct_test_paths = [item["path"] for item in service_test_impact["direct_tests"]]
         assert "mod/assign/tests/external/start_submission_test.php" in direct_test_paths
+        assert "mod/assign/tests/external/remove_submission_test.php" not in direct_test_paths
+        likely_test_paths = [item["path"] for item in service_test_impact["likely_tests"]]
+        assert "mod/assign/tests/external/remove_submission_test.php" in likely_test_paths
         contract_paths = [item["path"] for item in service_test_impact["contract_checks"]]
         assert "mod/assign/db/services.php" in contract_paths
         assert any("service" in item["reason"].lower() for item in service_test_impact["contract_checks"])
+        assert all("/renderer.php" not in str(item.get("path") or "") for item in service_test_impact["contract_checks"])
+        assert all("renderer" not in item["reason"].lower() for item in service_test_impact["manual_review_points"])
 
         rendering_test_impact = assess_test_impact(
             connection,
@@ -1250,7 +1255,9 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             connection,
             query_text="add a parameter to a Moodle external API method and update its tests",
         )
-        assert any("/classes/external/" in str(item.get("path") or "") or path.endswith("/db/services.php") for item in free_text_test_impact["contract_checks"] for path in [str(item.get("path") or "")])
+        assert free_text_test_impact["contract_checks"][0].get("path") is None
+        assert "typical external api contract surface" in free_text_test_impact["contract_checks"][0]["reason"].lower()
+        assert any(path.endswith("/db/services.php") for path in [str(item.get("path") or "") for item in free_text_test_impact["contract_checks"]])
         assert any(path.endswith("_test.php") for path in [item["path"] for item in free_text_test_impact["direct_tests"]])
 
         service_guardrails = execution_guardrails(
@@ -1260,12 +1267,15 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert service_guardrails["change_risk"]["level"] == "medium"
         assert any("service registration" in item["reason"].lower() for item in service_guardrails["pre_edit_checks"] + service_guardrails["post_edit_checks"])
         assert any("do not assume" in item["reason"].lower() for item in service_guardrails["do_not_assume"])
+        assert all("/renderer.php" not in str(item.get("path") or "") for item in service_guardrails["pre_edit_checks"])
 
         rendering_guardrails = execution_guardrails(
             connection,
             symbol_query="assign::view",
         )
         assert rendering_guardrails["change_risk"]["level"] == "high"
+        assert rendering_guardrails["pre_edit_checks"][0]["path"] == "mod/assign/locallib.php"
+        assert rendering_guardrails["pre_edit_checks"][1]["path"] == "mod/assign/classes/output/grading_app.php"
         assert any("template" in item["reason"].lower() or "renderer" in item["reason"].lower() for item in rendering_guardrails["watch_points"] + rendering_guardrails["pre_edit_checks"])
 
         provider_guardrails = execution_guardrails(
@@ -1287,7 +1297,9 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             query_text="add a parameter to a Moodle external API method and update its tests",
         )
         assert free_text_guardrails["change_risk"]["level"] == "high"
-        assert any("service registration" in item["reason"].lower() or "api" in item["reason"].lower() for item in free_text_guardrails["watch_points"] + free_text_guardrails["do_not_assume"])
+        assert free_text_guardrails["pre_edit_checks"][0].get("path") is None
+        assert "canonical moodle service pattern" in free_text_guardrails["pre_edit_checks"][0]["reason"].lower()
+        assert any("service registration" in item["reason"].lower() or "api" in item["reason"].lower() for item in free_text_guardrails["watch_points"] + free_text_guardrails["do_not_assume"] + free_text_guardrails["pre_edit_checks"])
         assert len(service_test_impact["direct_tests"]) <= 4
         assert len(service_guardrails["pre_edit_checks"]) <= 5
     finally:

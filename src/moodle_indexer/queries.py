@@ -1428,6 +1428,11 @@ def _synthesize_test_impact(
 
     direct_tests = _collect_test_impact_tests(plan, bucket="direct", limit=min(limit, 4))
     likely_tests = _collect_test_impact_tests(plan, bucket="likely", limit=min(limit, 4))
+    direct_paths = {str(item.get("path") or "") for item in direct_tests if item.get("path")}
+    likely_tests = [
+        item for item in likely_tests
+        if str(item.get("path") or "") not in direct_paths
+    ][: min(limit, 4)]
     environment_steps = _collect_environment_steps(profile, plan, limit=min(limit, 4))
     contract_checks = _collect_contract_checks(profile, plan, limit=min(limit, 4))
     manual_review_points = _collect_manual_review_points(profile, plan, limit=min(limit, 4))
@@ -4872,12 +4877,14 @@ def _safety_item(
     confidence: str = "high",
     path: str | None = None,
     symbol: str | None = None,
+    priority: int = 50,
 ) -> dict[str, object]:
     """Return one bounded safety/test-impact item."""
 
     item: dict[str, object] = {
         "confidence": confidence,
         "reason": reason,
+        "_priority": priority,
     }
     if path:
         item["path"] = path
@@ -4903,12 +4910,18 @@ def _dedupe_safety_items(items: list[dict[str, object]], *, limit: int) -> list[
     ordered = sorted(
         merged.values(),
         key=lambda item: (
+            int(item.get("_priority", 50)),
             _confidence_rank(str(item.get("confidence") or "medium")),
             str(item.get("path") or ""),
             str(item.get("reason") or ""),
         ),
     )
-    return ordered[:limit]
+    cleaned: list[dict[str, object]] = []
+    for item in ordered[:limit]:
+        public_item = dict(item)
+        public_item.pop("_priority", None)
+        cleaned.append(public_item)
+    return cleaned
 
 
 def _test_file_path(path: str) -> bool:
@@ -4940,9 +4953,9 @@ def _collect_test_impact_tests(
     """Return direct or likely concrete tests from one bounded plan."""
 
     if bucket == "direct":
-        sources = [plan.get("required_edits", []), plan.get("validation_impact", [])]
+        sources = [plan.get("required_edits", [])]
     else:
-        sources = [plan.get("likely_edits", []), plan.get("optional_edits", [])]
+        sources = [plan.get("validation_impact", []), plan.get("likely_edits", []), plan.get("optional_edits", [])]
 
     items: list[dict[str, object]] = []
     for source in sources:
@@ -4950,12 +4963,16 @@ def _collect_test_impact_tests(
             path = str(item.get("path") or "")
             if not _test_file_path(path):
                 continue
+            confidence = str(item.get("confidence") or "medium")
+            if bucket == "direct" and confidence != "high":
+                continue
             items.append(
                 _safety_item(
                     path=path,
                     symbol=_none_if_empty(item.get("symbol")),
-                    confidence=str(item.get("confidence") or "medium"),
+                    confidence=confidence,
                     reason=f"Concrete automated coverage for this change lives here; review and rerun it if behavior, parameters, or output expectations change.",
+                    priority=0 if bucket == "direct" else 10,
                 )
             )
     return _dedupe_safety_items(items, limit=limit)
@@ -4998,42 +5015,60 @@ def _collect_contract_checks(
 
     items: list[dict[str, object]] = []
     anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
+    anchor_type = str(profile.get("anchor_type") or "")
+    representative_service_added = False
+    if bool(profile.get("service")) and anchor_type == "query":
+        items.append(
+            _safety_item(
+                confidence="high",
+                reason="Review the typical external API contract surface together: implementation parameters, service registration, and declared return shape often need coordinated updates.",
+                priority=0,
+            )
+        )
     for item in _plan_items(plan):
         path = str(item.get("path") or "")
         if path.endswith("/db/services.php"):
+            if bool(profile.get("service")) and anchor_type == "query" and representative_service_added:
+                continue
             items.append(
                 _safety_item(
                     path=path,
                     symbol=_none_if_empty(item.get("symbol")),
                     confidence=str(item.get("confidence") or "high"),
                     reason=f"Review the web-service registration for {anchor_label}; API parameter or return-shape changes often require entrypoint/schema updates here.",
+                    priority=1 if bool(profile.get("service")) else 10,
                 )
             )
-        elif path.endswith("/renderer.php"):
+            if bool(profile.get("service")) and anchor_type == "query":
+                representative_service_added = True
+        elif path.endswith("/renderer.php") and bool(profile.get("rendering")) and not bool(profile.get("service")):
             items.append(
                 _safety_item(
                     path=path,
                     symbol=_none_if_empty(item.get("symbol")),
                     confidence="medium",
                     reason=f"Review renderer expectations for {anchor_label}; output-shape changes often require renderer-side consistency checks.",
+                    priority=12,
                 )
             )
-        elif path.endswith(".mustache"):
+        elif path.endswith(".mustache") and bool(profile.get("rendering")) and not bool(profile.get("service")):
             items.append(
                 _safety_item(
                     path=path,
                     symbol=_none_if_empty(item.get("symbol")),
                     confidence="medium",
                     reason=f"Review template expectations for {anchor_label}; rendered context changes can require template updates or compatibility checks.",
+                    priority=13,
                 )
             )
-        elif path.endswith("/action_settings_form.php") or path.endswith("/action_form.php"):
+        elif (path.endswith("/action_settings_form.php") or path.endswith("/action_form.php")) and bool(profile.get("provider_form")):
             items.append(
                 _safety_item(
                     path=path,
                     symbol=_none_if_empty(item.get("symbol")),
                     confidence=str(item.get("confidence") or "medium"),
                     reason=f"Review form defaults and validation coupled to {anchor_label}; settings or field changes often need contract alignment here.",
+                    priority=11,
                 )
             )
     return _dedupe_safety_items(items, limit=limit)
@@ -5054,13 +5089,15 @@ def _collect_manual_review_points(
             _safety_item(
                 confidence="high",
                 reason=f"Review backwards-compatibility expectations for {anchor_label}; external API signature and return-shape changes can affect callers beyond the direct PHPUnit coverage.",
+                priority=0,
             )
         )
-    if bool(profile.get("rendering")):
+    if bool(profile.get("rendering")) and not bool(profile.get("service")):
         items.append(
             _safety_item(
                 confidence="high",
                 reason=f"Review renderer/template blast radius for {anchor_label}; large legacy rendering entrypoints can fan out into multiple output and template surfaces.",
+                priority=1,
             )
         )
     if bool(profile.get("provider_form")):
@@ -5068,6 +5105,7 @@ def _collect_manual_review_points(
             _safety_item(
                 confidence="medium",
                 reason=f"Review inherited provider/form behavior for {anchor_label}; field, default, or validation changes can drift from shared base classes.",
+                priority=2,
             )
         )
     if bool(profile.get("js")):
@@ -5075,6 +5113,7 @@ def _collect_manual_review_points(
             _safety_item(
                 confidence="medium",
                 reason=f"Review import and superclass expectations around {anchor_label}; client-side changes can regress dependent modules even when local edits are small.",
+                priority=2,
             )
         )
     return _dedupe_safety_items(items, limit=limit)
@@ -5146,6 +5185,15 @@ def _collect_pre_edit_checks(
                 symbol=_none_if_empty(implementation.get("symbol")),
                 confidence=str(implementation.get("confidence") or "high"),
                 reason="Inspect the defining implementation first so the change starts from the real behavior anchor rather than a companion artifact.",
+                priority=0,
+            )
+        )
+    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
+        items.append(
+            _safety_item(
+                confidence="high",
+                reason="Inspect one representative external implementation together with its paired PHPUnit coverage before editing so the change follows a canonical Moodle service pattern.",
+                priority=0,
             )
         )
     direct_test = next(iter(test_impact.get("direct_tests", [])), None)
@@ -5156,6 +5204,7 @@ def _collect_pre_edit_checks(
                 symbol=_none_if_empty(direct_test.get("symbol")),
                 confidence=str(direct_test.get("confidence") or "high"),
                 reason="Inspect the most direct automated coverage before editing so expected behavior and assertions are clear.",
+                priority=2,
             )
         )
     if bool(profile.get("service")):
@@ -5167,9 +5216,10 @@ def _collect_pre_edit_checks(
                     symbol=_none_if_empty(entrypoint.get("symbol")),
                     confidence=str(entrypoint.get("confidence") or "high"),
                     reason="Inspect service registration alongside the implementation before changing parameters or return structures.",
+                    priority=1,
                 )
             )
-    if bool(profile.get("rendering")):
+    if bool(profile.get("rendering")) and not bool(profile.get("service")):
         companion = next((item for item in required + likely if str(item.get("change_role")) == "rendering_companion"), None)
         if companion is not None:
             items.append(
@@ -5178,6 +5228,7 @@ def _collect_pre_edit_checks(
                     symbol=_none_if_empty(companion.get("symbol")),
                     confidence=str(companion.get("confidence") or "medium"),
                     reason="Inspect the direct rendering companion before editing so output-shape changes stay aligned with renderer/template expectations.",
+                    priority=1,
                 )
             )
     if bool(profile.get("provider_form")):
@@ -5189,6 +5240,7 @@ def _collect_pre_edit_checks(
                     symbol=_none_if_empty(companion.get("symbol")),
                     confidence=str(companion.get("confidence") or "medium"),
                     reason="Inspect the concrete form chain before editing so field and validation expectations stay aligned with the provider method.",
+                    priority=1,
                 )
             )
     if bool(profile.get("js")):
@@ -5200,6 +5252,7 @@ def _collect_pre_edit_checks(
                     symbol=_none_if_empty(companion.get("symbol")),
                     confidence=str(companion.get("confidence") or "medium"),
                     reason="Inspect imported or inherited module behavior before editing the source module so public client-side contracts stay intact.",
+                    priority=1,
                 )
             )
     return _dedupe_safety_items(items, limit=limit)
@@ -5252,7 +5305,7 @@ def _collect_do_not_assume(
     if bool(profile.get("service")):
         items.append(_safety_item(confidence="high", reason="Do not assume service registration updates itself when external API parameters or return structures change."))
         items.append(_safety_item(confidence="medium", reason="Do not assume one direct PHPUnit file covers every external API compatibility edge around this service."))
-    if bool(profile.get("rendering")):
+    if bool(profile.get("rendering")) and not bool(profile.get("service")):
         items.append(_safety_item(confidence="high", reason="Do not assume template impact is absent just because the change starts in PHP; rendering contracts often span output classes, renderers, and Mustache templates."))
     if bool(profile.get("provider_form")):
         items.append(_safety_item(confidence="medium", reason="Do not assume shared form bases inherit provider-field changes safely without reviewing defaults and validation rules."))
@@ -5272,7 +5325,7 @@ def _collect_watch_points(
     items: list[dict[str, object]] = []
     if bool(profile.get("service")):
         items.append(_safety_item(confidence="high", reason="Watch backwards-compatibility and consumer expectations if external API parameters, warnings, or return structures change."))
-    if bool(profile.get("rendering")):
+    if bool(profile.get("rendering")) and not bool(profile.get("service")):
         items.append(_safety_item(confidence="high", reason="Watch the blast radius of large legacy rendering entrypoints; related output classes and templates may need coordinated updates."))
     if bool(profile.get("provider_form")):
         items.append(_safety_item(confidence="medium", reason="Watch for drift between concrete provider forms, shared form bases, and provider contract methods."))
