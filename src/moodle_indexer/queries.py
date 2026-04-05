@@ -4424,15 +4424,24 @@ def _plan_profile_for_symbol(match: dict[str, object]) -> dict[str, object]:
 
     path = str(match.get("file") or "")
     linked_artifacts = match.get("linked_artifacts", {}) or {}
+    provider_form = "/provider/" in path
+    js = str(match.get("symbol_type") or "") == "js_module" or "/amd/src/" in path
+    rendering = _has_rendering_safety_artifacts(linked_artifacts) or _file_role_for_plan_path(path) in {
+        "locallib_file",
+        "output_class",
+        "renderer_file",
+        "template_file",
+    }
     return {
         "anchor_path": path,
         "anchor_symbol": str(match.get("fqname") or match.get("module_name") or ""),
         "anchor_type": str(match.get("symbol_type") or ""),
         "anchor_file_role": _file_role_for_plan_path(path),
         "service": bool(linked_artifacts.get("services")) or _file_role_for_plan_path(path) in {"external_api_class", "services_definition"},
-        "rendering": bool(linked_artifacts.get("rendering")) or _file_role_for_plan_path(path) in {"locallib_file", "output_class", "renderer_file", "template_file"},
-        "provider_form": "provider" in path and "/form/" not in path,
-        "js": str(match.get("symbol_type") or "") == "js_module" or "/amd/src/" in path,
+        "rendering": rendering and not provider_form and not js,
+        "provider_form": provider_form and not js,
+        "js": js,
+        "usage_files": _component_local_usage_files(match),
         "query_intent": {},
     }
 
@@ -4443,15 +4452,24 @@ def _plan_profile_for_file(context: dict[str, object]) -> dict[str, object]:
     path = str(context["moodle_path"])
     file_role = str(context.get("file_role") or _file_role_for_plan_path(path))
     linked_artifacts = context.get("linked_artifacts", {}) or {}
+    provider_form = "/provider/" in path
+    js = file_role == "amd_source" or "/amd/src/" in path
+    rendering = _has_rendering_safety_artifacts(linked_artifacts) or file_role in {
+        "locallib_file",
+        "output_class",
+        "renderer_file",
+        "template_file",
+    }
     return {
         "anchor_path": path,
         "anchor_symbol": None,
         "anchor_type": "file",
         "anchor_file_role": file_role,
         "service": file_role == "services_definition" or bool(linked_artifacts.get("services")),
-        "rendering": file_role in {"locallib_file", "output_class", "renderer_file", "template_file"} or bool(linked_artifacts.get("rendering")),
-        "provider_form": "provider" in path,
-        "js": file_role == "amd_source" or "/amd/src/" in path,
+        "rendering": rendering and not provider_form and not js,
+        "provider_form": provider_form and not js,
+        "js": js,
+        "usage_files": [],
         "query_intent": {},
     }
 
@@ -4871,6 +4889,56 @@ def _none_if_empty(value: object) -> str | None:
     return str(value)
 
 
+def _artifact_paths_from_nodes(nodes: object) -> list[str]:
+    """Return flattened artifact paths from linked-artifact nodes."""
+
+    paths: list[str] = []
+    if not isinstance(nodes, list):
+        return paths
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        path = str(node.get("path") or "")
+        if path:
+            paths.append(path)
+        for hop in node.get("next_hops", []) or []:
+            if isinstance(hop, dict):
+                hop_path = str(hop.get("path") or "")
+                if hop_path:
+                    paths.append(hop_path)
+    return paths
+
+
+def _has_rendering_safety_artifacts(linked_artifacts: dict[str, object]) -> bool:
+    """Return whether linked artifacts include real rendering companions.
+
+    The broader navigation model reuses the `rendering` bucket for form chains
+    as well as output/renderer/template chains. Safety profiles need a stricter
+    rendering check so provider/form and JS slices do not inherit rendering
+    blast-radius warnings.
+    """
+
+    for path in _artifact_paths_from_nodes(linked_artifacts.get("rendering")):
+        role = _file_role_for_plan_path(path)
+        if role in {"output_class", "renderer_file", "template_file", "locallib_file"}:
+            return True
+    return False
+
+
+def _component_local_usage_files(match: dict[str, object]) -> list[str]:
+    """Return same-component direct usage files for one definition match."""
+
+    anchor_path = str(match.get("file") or "")
+    files: list[str] = []
+    for example in match.get("usage_examples", []) or []:
+        path = str(example.get("file") or "")
+        if not path or not _same_component_root(anchor_path, path):
+            continue
+        if path not in files:
+            files.append(path)
+    return files
+
+
 def _safety_item(
     *,
     reason: str,
@@ -5084,12 +5152,31 @@ def _collect_manual_review_points(
 
     items: list[dict[str, object]] = []
     anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
+    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
+        representative_impl = next(
+            (
+                item for item in plan.get("required_edits", [])
+                if str(item.get("change_role")) == "implementation"
+                and ("/classes/external/" in str(item.get("path") or "") or str(item.get("path") or "").endswith("/externallib.php"))
+            ),
+            None,
+        )
+        if representative_impl is not None:
+            items.append(
+                _safety_item(
+                    path=str(representative_impl["path"]),
+                    symbol=_none_if_empty(representative_impl.get("symbol")),
+                    confidence=str(representative_impl.get("confidence") or "high"),
+                    reason=f"Use this representative external implementation as the canonical API-change pattern for {anchor_label}; it is the concrete code surface to compare before editing your real target.",
+                    priority=0,
+                )
+            )
     if bool(profile.get("service")):
         items.append(
             _safety_item(
                 confidence="high",
                 reason=f"Review backwards-compatibility expectations for {anchor_label}; external API signature and return-shape changes can affect callers beyond the direct PHPUnit coverage.",
-                priority=0,
+                priority=1,
             )
         )
     if bool(profile.get("rendering")) and not bool(profile.get("service")):
@@ -5220,6 +5307,17 @@ def _collect_pre_edit_checks(
                 )
             )
     if bool(profile.get("rendering")) and not bool(profile.get("service")):
+        usage_files = list(profile.get("usage_files") or [])
+        usage_file = next((path for path in usage_files if _same_component_root(str(profile.get("anchor_path") or ""), path)), None)
+        if usage_file is not None:
+            items.append(
+                _safety_item(
+                    path=usage_file,
+                    confidence="high",
+                    reason="Inspect the closest component-local usage next so you can see how this legacy method is invoked before following the broader rendering chain.",
+                    priority=1,
+                )
+            )
         companion = next((item for item in required + likely if str(item.get("change_role")) == "rendering_companion"), None)
         if companion is not None:
             items.append(
@@ -5228,7 +5326,7 @@ def _collect_pre_edit_checks(
                     symbol=_none_if_empty(companion.get("symbol")),
                     confidence=str(companion.get("confidence") or "medium"),
                     reason="Inspect the direct rendering companion before editing so output-shape changes stay aligned with renderer/template expectations.",
-                    priority=1,
+                    priority=2,
                 )
             )
     if bool(profile.get("provider_form")):

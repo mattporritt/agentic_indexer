@@ -1259,6 +1259,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "typical external api contract surface" in free_text_test_impact["contract_checks"][0]["reason"].lower()
         assert any(path.endswith("/db/services.php") for path in [str(item.get("path") or "") for item in free_text_test_impact["contract_checks"]])
         assert any(path.endswith("_test.php") for path in [item["path"] for item in free_text_test_impact["direct_tests"]])
+        assert any("/classes/external/" in str(item.get("path") or "") for item in free_text_test_impact["manual_review_points"])
 
         service_guardrails = execution_guardrails(
             connection,
@@ -1275,7 +1276,8 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         assert rendering_guardrails["change_risk"]["level"] == "high"
         assert rendering_guardrails["pre_edit_checks"][0]["path"] == "mod/assign/locallib.php"
-        assert rendering_guardrails["pre_edit_checks"][1]["path"] == "mod/assign/classes/output/grading_app.php"
+        assert rendering_guardrails["pre_edit_checks"][1]["path"] == "mod/assign/renderer.php"
+        assert rendering_guardrails["pre_edit_checks"][2]["path"] == "mod/assign/classes/output/grading_app.php"
         assert any("template" in item["reason"].lower() or "renderer" in item["reason"].lower() for item in rendering_guardrails["watch_points"] + rendering_guardrails["pre_edit_checks"])
 
         provider_guardrails = execution_guardrails(
@@ -1284,6 +1286,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         assert provider_guardrails["change_risk"]["level"] == "medium"
         assert any("form" in item["reason"].lower() for item in provider_guardrails["pre_edit_checks"] + provider_guardrails["watch_points"])
+        assert all("renderer" not in item["reason"].lower() and "template" not in item["reason"].lower() for item in provider_guardrails["watch_points"] + provider_guardrails["do_not_assume"] + provider_test_impact["manual_review_points"])
 
         js_guardrails = execution_guardrails(
             connection,
@@ -1291,6 +1294,12 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         assert js_guardrails["change_risk"]["level"] == "medium"
         assert any("build" in item["reason"].lower() or "import" in item["reason"].lower() for item in js_guardrails["post_edit_checks"] + js_guardrails["watch_points"])
+        assert all(
+            "form" not in item["reason"].lower()
+            and "renderer" not in item["reason"].lower()
+            and "template" not in item["reason"].lower()
+            for item in js_guardrails["watch_points"] + js_guardrails["do_not_assume"] + js_test_impact["manual_review_points"]
+        )
 
         free_text_guardrails = execution_guardrails(
             connection,
@@ -1299,6 +1308,9 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert free_text_guardrails["change_risk"]["level"] == "high"
         assert free_text_guardrails["pre_edit_checks"][0].get("path") is None
         assert "canonical moodle service pattern" in free_text_guardrails["pre_edit_checks"][0]["reason"].lower()
+        assert any("/classes/external/" in str(item.get("path") or "") for item in free_text_guardrails["pre_edit_checks"])
+        assert any(path.endswith("/db/services.php") for path in [str(item.get("path") or "") for item in free_text_guardrails["pre_edit_checks"] + free_text_guardrails["post_edit_checks"]])
+        assert any(path.endswith("_test.php") for path in [str(item.get("path") or "") for item in free_text_guardrails["pre_edit_checks"] + free_text_guardrails["post_edit_checks"]])
         assert any("service registration" in item["reason"].lower() or "api" in item["reason"].lower() for item in free_text_guardrails["watch_points"] + free_text_guardrails["do_not_assume"] + free_text_guardrails["pre_edit_checks"])
         assert len(service_test_impact["direct_tests"]) <= 4
         assert len(service_guardrails["pre_edit_checks"]) <= 5
