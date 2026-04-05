@@ -1,4 +1,4 @@
-"""Repository scanning for files relevant to the Phase 1 index.
+"""Repository scanning for files relevant to the Moodle index.
 
 The scanner intentionally indexes a broad set of Moodle-friendly file types
 while skipping common cache and VCS directories to keep rebuilds predictable.

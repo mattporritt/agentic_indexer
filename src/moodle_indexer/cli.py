@@ -2,6 +2,14 @@
 
 The CLI is intentionally compact and JSON-oriented for machine consumers while
 still providing progress logging for humans during index builds.
+
+It exposes the project's public surface in one place:
+
+- structural lookup
+- bounded navigation
+- semantic retrieval
+- planning and safety
+- compact context-bundle packaging
 """
 
 from __future__ import annotations
@@ -39,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="moodle-indexer",
-        description="Build and query a Phase 1 SQLite index for a local Moodle checkout.",
+        description="Build and query a bounded Moodle code-intelligence index for a local checkout.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

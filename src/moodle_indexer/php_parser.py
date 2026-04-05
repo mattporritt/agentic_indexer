@@ -1,8 +1,7 @@
 """PHP parsing and fallback extraction helpers.
 
-Phase 1 uses ``phply`` for parser-based symbol extraction where practical and
-adds light regex fallback logic for resilience when a file contains syntax the
-library does not understand.
+The parser uses ``phply`` where practical and adds light regex fallback logic
+for resilience when a file contains syntax the library does not understand.
 """
 
 from __future__ import annotations

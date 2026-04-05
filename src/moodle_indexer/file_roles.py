@@ -1,7 +1,7 @@
 """Path-based Moodle file-role classification.
 
-Phase 1 intentionally uses deterministic rules because Moodle has strong file
-layout conventions and those conventions are valuable retrieval signals.
+The classifier uses deterministic rules because Moodle has strong file-layout
+conventions and those conventions are valuable retrieval signals.
 """
 
 from __future__ import annotations

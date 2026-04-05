@@ -1,7 +1,8 @@
 """Moodle-specific extraction functions.
 
-This module contains pragmatic Phase 1 extractors for PHP symbols, capability
-definitions and checks, language strings and usages, and test artifacts.
+This module contains pragmatic Moodle-specific extractors for PHP symbols,
+capability definitions and checks, language strings and usages, service
+definitions, test artifacts, and AMD JavaScript module metadata.
 """
 
 from __future__ import annotations
@@ -184,7 +185,7 @@ def extract_js_module_artifacts(
 ) -> tuple[JsModuleRecord | None, list[JsImportRecord], list[RelationshipRecord]]:
     """Extract Moodle AMD source metadata from a JavaScript source file.
 
-    Phase 1 intentionally keeps this parser small and Moodle-specific:
+    The parser intentionally stays small and Moodle-specific:
     - modern ES module imports
     - legacy ``define([...], function(...))`` dependencies
     - default export / exported class detection

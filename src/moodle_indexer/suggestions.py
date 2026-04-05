@@ -1,7 +1,7 @@
 """Deterministic related-file suggestion heuristics.
 
 The suggestion engine is intentionally simple and explainable so agentic tools
-can understand why a file was recommended during Phase 1.
+can understand why a file was recommended.
 """
 
 from __future__ import annotations

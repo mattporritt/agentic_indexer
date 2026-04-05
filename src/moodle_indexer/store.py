@@ -1,7 +1,7 @@
-"""SQLite persistence for the Phase 1 Moodle index.
+"""SQLite persistence for the Moodle index.
 
 The schema is intentionally normalized and modest in scope so that it remains
-easy to evolve as later phases add deeper analysis.
+easy to evolve as later work adds deeper analysis.
 """
 
 from __future__ import annotations

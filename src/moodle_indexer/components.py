@@ -147,9 +147,10 @@ def resolve_classname_to_file_path(classname: str) -> str | None:
 def resolve_framework_class_to_file_path(classname: str) -> str | None:
     """Resolve well-known legacy Moodle framework classes to core files.
 
-    Moodle still uses a few important non-namespaced framework classes. Phase 1
-    only needs a small explicit mapping so related-file suggestions can surface
-    the core implementation files developers commonly need beside plugin code.
+    Moodle still uses a few important non-namespaced framework classes. The
+    index only needs a small explicit mapping so related-file suggestions can
+    surface the core implementation files developers commonly need beside
+    plugin code.
     """
 
     normalized = classname.lstrip("\\").lower()

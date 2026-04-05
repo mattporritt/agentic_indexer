@@ -1,184 +1,117 @@
 # Moodle AI Indexer
 
-Moodle AI Indexer is a SQLite-backed code indexer for a local Moodle LMS checkout. It is aimed at agentic coding systems and engineers who need Moodle-aware navigation, retrieval, change planning, and bounded safety guidance, not a speculative universal code graph.
+Moodle AI Indexer is a local, SQLite-backed code-intelligence layer for Moodle LMS.
 
-The project focuses on practical structure that matters in Moodle work:
+It is built for two audiences:
 
-- infer Moodle components and plugin ownership from paths
-- classify important Moodle file roles
-- extract PHP symbols and useful structural relationships
-- index capabilities, language strings, and test artifacts
-- suggest likely companion files for common Moodle change patterns
-- expose the indexed data through a small deterministic JSON CLI
+- human developers who need Moodle-aware navigation and change context
+- agentic coding systems that need bounded, structured, explainable context before editing
+
+The project is intentionally not a generic code search engine and not an autonomous coding agent. Its job is to make Moodle structure explicit, queryable, and safe to consume.
+
+## Project Status
+
+This repository is at a natural **v1 complete** point for its current scope.
+
+v1 includes:
+
+- structural code navigation
+- related-definition traversal
+- edit-surface suggestions
+- bounded dependency neighborhoods
+- hybrid semantic context retrieval
+- bounded change planning
+- test-impact estimation
+- execution guardrails
+- compact context-bundle packaging for agents
+
+v1 intentionally stops before:
+
+- autonomous code modification
+- autonomous patch planning
+- execution orchestration
+- CI orchestration
+- repository-wide graph expansion
+
+That boundary is deliberate. This project provides the context layer that an agent can trust; the agent layer decides what to do with that context.
 
 ## Why This Exists
 
-Moodle development depends heavily on repository conventions. Relevant context for a change is often spread across:
+Moodle development is highly convention-driven. Real implementation context is often spread across:
 
-- plugin/component boundaries
-- `db/access.php`, `db/services.php`, and `db/tasks.php`
-- `lang/en/*.php`
-- renderers, output classes, and templates
+- plugin and subsystem boundaries
+- `db/services.php`, `db/access.php`, `settings.php`, and `lib.php`
+- renderers, output classes, and Mustache templates
+- forms and framework bases
+- AMD JavaScript source modules and build artifacts
 - PHPUnit and Behat coverage
 
-Plain text search can find files, but it does not reliably answer:
+Plain text search can find files, but it does not reliably answer questions like:
 
-- which component owns this file?
-- where is this symbol defined?
-- what does this class extend or implement?
-- where are the capability definitions and checks?
-- which language strings and tests are likely relevant?
+- where is this symbol actually defined?
+- what else matters around this method or file?
+- what is the likely edit surface?
+- what tests are most likely affected?
+- what should an agent read first?
 
-This tool builds a compact local index so those questions become cheap and machine-friendly to answer.
+This project turns those Moodle-specific structures into bounded, machine-friendly JSON outputs.
 
-## Current Capability Surface
+## What The Project Is
+
+Today the project is best understood as a:
+
+- **code intelligence layer** for Moodle
+- **structural + semantic context provider**
+- **bounded planning and safety layer**
+- **context-bundle packager** for agent workflows
+
+It is designed to help with serious Moodle development tasks while staying explicit and explainable.
+
+## What The Project Is Not
+
+The project is **not** currently:
+
+- an autonomous coding agent
+- a code modification engine
+- an execution orchestrator
+- a test runner
+- a CI system
+- a full static call-graph engine
+- a semantic memory system for the whole repository
+
+Those responsibilities belong in higher-level tooling. This project provides the trusted substrate those tools can consume.
+
+## Current Scope
+
+The current capability surface includes:
 
 - full rebuild indexing into SQLite
-- explicit Moodle component inference for common plugin families and core subsystems
-- subplugin-aware component inference via `db/subplugins.json`
-- deterministic file-role classification
-- parser-first PHP extraction with resilient fallback logic
-- Moodle-aware AMD JavaScript extraction for `amd/src/` source files
-- symbol indexing for classes, interfaces, traits, functions, and methods
-- structural relationship indexing for `extends`, `implements`, and method-to-class ownership
-- output/rendering-aware suggestions for `classes/output/` and `templates/` when production PHP references Moodle output classes
-- framework-aware suggestions for `settings.php`, `lib/adminlib.php`, Moodle form classes, and `lib/formslib.php`
-- capability extraction from `db/access.php`
-- web service extraction from `db/services.php`
-- capability attribution to the owning component of the defining file
-- language string extraction from `lang/en/*.php`
-- detection of obvious `require_capability`, `has_capability`, and `get_string` usage
-- `db/services.php` extraction with support for both deprecated `classpath` implementations and modern `classname`-based external classes
-- JavaScript import/dependency extraction for both modern ES module syntax and older Moodle `define([...])` AMD modules
-- source/build awareness for `amd/src/*.js` and `amd/build/*.min.js`
-- service-aware suggestions that link `db/services.php` to implementation files and likely PHPUnit coverage
-- coherent linked-artifact navigation across service definitions, rendering artifacts, and Moodle AMD source modules
-- PHPUnit and Behat discovery
-- related-file suggestions with explanation strings
-- IDE-like definition lookup for PHP symbols and Moodle JS modules, with signatures, modifiers, docblocks, inheritance hints, and bounded usage examples
-- JSON CLI commands for indexing, querying, semantic retrieval, bounded planning, and safety guidance
+- Moodle component inference and file-role classification
+- PHP symbol extraction and structural relationship indexing
+- AMD JavaScript source/import/superclass/build extraction
+- capability, language string, and test discovery
+- service-definition extraction from `db/services.php`
+- `find-definition` for PHP symbols and Moodle JS modules
+- `find-related-definitions`
+- `suggest-edit-surface`
+- `dependency-neighborhood`
+- `semantic-context`
+- `propose-change-plan`
+- `assess-test-impact`
+- `execution-guardrails`
+- `build-context-bundle`
 
-## Deliberate Non-Goals
+The design stays intentionally bounded:
 
-- embeddings or vector search
-- incremental indexing
-- a web UI
-- live IDE integration
-- deep JavaScript analysis
-- a precise call graph
-- runtime tracing
-- background workers
-
-The project intentionally stays bounded and explainable:
-
-- structural navigation remains the spine
+- structural navigation is the spine
 - semantic retrieval is constrained by structural anchors
-- planning outputs are conservative and confidence-aware
-- safety outputs prefer concrete tests and local risks over broad generic advice
-- the tool does not claim a complete call graph, execution planner, or repository-wide test-impact engine
+- planning is conservative rather than exhaustive
+- safety outputs prefer concrete local evidence over generic advice
+- bundles are compact enough for real agent context windows
 
-## High-Level Design
-
-The package lives under `src/moodle_indexer/` and keeps responsibilities separated:
-
-- `cli.py`: CLI entrypoint and argument handling
-- `indexer.py`: full rebuild orchestration
-- `scanner.py`: repository scanning
-- `components.py`: Moodle component inference rules
-- `file_roles.py`: path-based file-role classification
-- `php_parser.py`: parser-first PHP symbol extraction with fallback logic
-- `extractors.py`: Moodle-specific extraction for PHP, JS modules, relationships, capabilities, strings, and tests
-- `store.py`: SQLite schema and persistence helpers
-- `queries.py`: current query/planning/safety services used by the CLI
-- `suggestions.py`: deterministic related-file heuristics
-
-Today the architecture is best understood as layered synthesis:
-
-1. indexing and extraction
-   - parse Moodle-aware structural facts into SQLite
-2. structural navigation
-   - `find-definition`, `file-context`, `suggest-related`, `find-related-definitions`
-3. bounded neighborhood and retrieval
-   - `suggest-edit-surface`, `dependency-neighborhood`, `semantic-context`
-4. planning and safety
-   - `propose-change-plan`, `assess-test-impact`, `execution-guardrails`
-5. context packaging
-   - `build-context-bundle`
-
-Those higher layers reuse the same trusted structural anchors rather than
-inventing disconnected ranking systems for each endpoint.
-
-The SQLite schema stays intentionally small and extensible:
-
-- `repositories`
-- `components`
-- `files`
-- `symbols`
-- `relationships`
-- `capabilities`
-- `capability_usages`
-- `language_strings`
-- `language_string_usages`
-- `tests`
-- `js_modules`
-- `js_imports`
-
-## Moodle-Aware Suggestions
-
-Phase 1 intentionally mixes a few different sources of truth:
-
-- explicitly extracted relationships:
-  - PHP `extends` / `implements`
-  - web service definitions from `db/services.php`
-  - capability definitions from `db/access.php`
-  - Moodle AMD source module imports, exports, inheritance, and source/build pairings
-- deterministic Moodle heuristics:
-  - `settings.php` suggests `lib/adminlib.php`
-  - `classes/output/*.php` suggests paired Mustache templates when present
-  - `db/services.php` suggests resolved `classpath` and `classname` implementation files
-  - resolved service implementations suggest likely PHPUnit files such as `tests/external/*_test.php` or `tests/externallib_test.php`
-  - PHP class references and instantiations can resolve companion files for Moodle output classes and plugin form classes
-  - form classes extending `moodleform` suggest the core base implementation in `lib/formslib.php`
-  - `amd/src/*.js` files surface resolved imported module source files and related `amd/build/*.min.js` artifacts
-  - file-context and suggest-related now group service, rendering, JavaScript, and entrypoint links into explicit `linked_artifacts` sections
-
-Current JavaScript support is intentionally Moodle-specific rather than a
-generic JS graph. Phase 1 supports:
-
-- modern ES module imports such as `import Foo from 'core_admin/foo'`
-- named imports such as `import {call as fetchMany} from 'core/ajax'`
-- older Moodle AMD dependencies declared with `define([...], function(...) {})`
-- default export / exported class detection where practical
-- superclass detection for exported classes that extend imported modules
-- deterministic source/build linking between `amd/src/*.js` and `amd/build/*.min.js`
-
-JavaScript module resolution follows a fixed precedence order:
-
-1. exact hit in the indexed `js_modules` registry
-2. explicit external runtime dependency classification for modules such as `jquery`
-3. indexed component-root lookup plus deterministic Moodle path mapping
-4. static component-root fallback rules
-5. explicit unresolved result
-
-The current resolver understands:
-
-- `core/<module>` -> `lib/amd/src/<module>.js`
-- `core_<subsystem>/<module>` -> `<core subsystem root>/amd/src/<module>.js`
-- frankenstyle plugin modules such as `mod_assign/foo` or `tool_analytics/bar` -> `<component root>/amd/src/<module>.js`
-
-For agentic work, the canonical editable implementation is always the source
-file in `amd/src/`. Matching `amd/build/*.min.js` files are treated as related
-artifacts, not as the primary implementation target.
-
-The suggestion engine is still heuristic in places. It is designed to be
-explainable and useful for local navigation, not to claim perfect semantic
-coverage of Moodle's runtime behavior.
-
-## Setup
+## Installation
 
 Python 3.12+ is assumed.
-
-Install dependencies and the package:
 
 ```bash
 python3 -m venv .venv
@@ -187,49 +120,15 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-`requirements.txt` is the baseline dependency file. `pyproject.toml` adds package metadata and the `moodle-indexer` CLI entrypoint.
-
-After `pip install -e .`, the canonical way to run the tool is:
+After installation, the canonical entrypoint is:
 
 ```bash
 moodle-indexer --help
 ```
 
-Normal development usage should not require `PYTHONPATH=src python -m ...`.
+## Quick Start
 
-## CLI Usage
-
-The tool does not assume it lives beside the Moodle checkout. Always pass the Moodle repository path explicitly.
-
-The path you pass with `--moodle-path` is always treated as the repository root.
-
-The indexer separately detects an application root:
-
-- classic Moodle 5.0-style layout:
-  repository root and application root are the same directory
-- split Moodle 5.1-style layout:
-  repository root is the checkout path you passed, while application root is typically `<repository_root>/public`
-
-This means the index stores two path views for each file:
-
-- `repository_relative_path`: the real on-disk path relative to the repository root
-- `moodle_path`: the Moodle-native path relative to the application root when the file lives under it
-
-Examples:
-
-- classic layout:
-  - repository-relative `mod/forum/lib.php`
-  - moodle path `mod/forum/lib.php`
-- split layout:
-  - repository-relative `public/mod/forum/lib.php`
-  - moodle path `mod/forum/lib.php`
-- repository-level file outside `public/`:
-  - repository-relative `admin/cli/install_database.php`
-  - moodle path `admin/cli/install_database.php`
-
-User-facing lookups such as `file-context` prefer the Moodle-native path where that is the most natural interface, so `mod/forum/lib.php` continues to work in both classic and split layouts.
-
-Build a fresh index:
+Build an index:
 
 ```bash
 moodle-indexer index \
@@ -238,605 +137,371 @@ moodle-indexer index \
   --workers 8
 ```
 
-Find a symbol:
+Look up a definition:
 
 ```bash
-moodle-indexer find-symbol \
+moodle-indexer find-definition \
   --db-path /path/to/moodle-index.sqlite \
-  --symbol discussion_exporter
+  --symbol 'mod_assign\external\start_submission::execute'
 ```
 
-Inspect a file:
-
-```bash
-moodle-indexer file-context \
-  --db-path /path/to/moodle-index.sqlite \
-  --file mod/forum/renderer.php
-```
-
-Files outside the application root can also be queried directly:
-
-```bash
-moodle-indexer file-context \
-  --db-path /path/to/moodle-index.sqlite \
-  --file admin/cli/install_database.php
-```
-
-Summarize a component:
-
-```bash
-moodle-indexer component-summary \
-  --db-path /path/to/moodle-index.sqlite \
-  --component mod_forum
-```
-
-Suggest related files:
-
-```bash
-moodle-indexer suggest-related \
-  --db-path /path/to/moodle-index.sqlite \
-  --file admin/tool/demo/settings.php
-```
-
-Find related definitions around a symbol or file:
-
-```bash
-moodle-indexer find-related-definitions \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-
-moodle-indexer find-related-definitions \
-  --db-path /path/to/moodle-index.sqlite \
-  --file mod/assign/locallib.php
-```
-
-Suggest the likely edit surface around a symbol or file:
-
-```bash
-moodle-indexer suggest-edit-surface \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol aiprovider_openai\\provider::get_action_settings
-
-moodle-indexer suggest-edit-surface \
-  --db-path /path/to/moodle-index.sqlite \
-  --file mod/assign/db/services.php
-```
-
-Inspect the bounded dependency neighborhood around a symbol or file:
+Get the immediate structural neighborhood:
 
 ```bash
 moodle-indexer dependency-neighborhood \
   --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-
-moodle-indexer dependency-neighborhood \
-  --db-path /path/to/moodle-index.sqlite \
-  --file mod/assign/locallib.php
+  --symbol 'assign::view'
 ```
 
-Retrieve bounded semantic context around a structural anchor or free-text query:
+Package a compact agent-ready working set:
 
 ```bash
-moodle-indexer semantic-context \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-
-moodle-indexer semantic-context \
-  --db-path /path/to/moodle-index.sqlite \
-  --file mod/assign/db/services.php
-
-moodle-indexer semantic-context \
-  --db-path /path/to/moodle-index.sqlite \
-  --query 'examples of Moodle external API methods with PHPUnit coverage'
-```
-
-Synthesize a bounded change plan around a symbol, file, or free-text change goal:
-
-```bash
-moodle-indexer propose-change-plan \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-
-moodle-indexer propose-change-plan \
-  --db-path /path/to/moodle-index.sqlite \
-  --file mod/assign/db/services.php
-
-moodle-indexer propose-change-plan \
-  --db-path /path/to/moodle-index.sqlite \
-  --query 'add a parameter to a Moodle external API method and update its tests'
-```
-
-Assess likely test impact and validation surfaces around a symbol, file, or free-text change goal:
-
-```bash
-moodle-indexer assess-test-impact \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-
-moodle-indexer assess-test-impact \
-  --db-path /path/to/moodle-index.sqlite \
-  --query 'add a parameter to a Moodle external API method and update its tests'
-```
-
-Return bounded risk and execution guardrails before finalizing edits:
-
-```bash
-moodle-indexer execution-guardrails \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol assign::view
-
-moodle-indexer execution-guardrails \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol core_ai/aiprovider_action_management_table
-```
-
-Package a compact agent-ready working set around a symbol, file, or free-text goal:
-
-```bash
-moodle-indexer build-context-bundle \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-
 moodle-indexer build-context-bundle \
   --db-path /path/to/moodle-index.sqlite \
   --query 'add a parameter to a Moodle external API method and update its tests'
 ```
 
-Find a definition:
+## Core Commands
 
-```bash
-moodle-indexer find-definition \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol get_string
-```
+The commands below are the main public surface for v1.
 
-JavaScript module lookups use the same command:
+### `find-definition`
 
-```bash
-moodle-indexer find-definition \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol core/ajax \
-  --type js_module
-```
+Use when you need the canonical definition of a PHP symbol or Moodle JS module.
 
-Method lookups support both short and fully qualified forms:
+Accepts:
 
-```bash
-moodle-indexer find-definition \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol assign::view
+- `--symbol`
+- optional `--type`
 
-moodle-indexer find-definition \
-  --db-path /path/to/moodle-index.sqlite \
-  --symbol mod_assign\\external\\start_submission::execute
-```
+Returns:
 
-The package can still be run directly for debugging:
+- definition records
+- signatures and docblock summaries where available
+- bounded usage examples
+- inheritance and related structural metadata
 
-```bash
-python -m moodle_indexer --help
-```
+Call this first when you need a trustworthy anchor.
 
-## Testing And Validation
+### `find-related-definitions`
 
-The project uses two complementary safety nets:
+Use when you want the most relevant definitions and artifacts around a symbol or file.
 
-- automated tests under [tests/](/Users/mattp/projects/agentic_indexer/tests)
-- human-review validation bundles under [validation_runs/](/Users/mattp/projects/agentic_indexer/validation_runs)
+Accepts:
 
-The automated suite now covers:
+- `--symbol`
+- `--file`
 
-- component inference and file-role classification
-- extractor behavior for PHP, services, JavaScript, capabilities, and strings
-- end-to-end query behavior on a realistic Moodle-style fixture tree
-- CLI JSON contracts for structural, semantic, planning, and safety endpoints
-- focused helper coverage for representative free-text service patterns and
-  agent-oriented safety synthesis
+Returns:
 
-Run the full suite with:
+- bounded primary and secondary related definitions
+- direct companions such as services, tests, renderers, templates, forms, and JS neighbors
+
+Call this after `find-definition` when you need nearby context but not yet a change plan.
+
+### `suggest-edit-surface`
+
+Use when you want to know which files are most likely to be edited next.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+
+Returns:
+
+- `primary_edit_surface`
+- `secondary_edit_surface`
+
+Call this when moving from “what is this?” to “what is the likely edit set?”
+
+### `dependency-neighborhood`
+
+Use when you need a bounded dependency view around a symbol or file.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+
+Returns sections such as:
+
+- `likely_callers`
+- `likely_callees`
+- `linked_tests`
+- `linked_services`
+- `linked_rendering_artifacts`
+- `linked_forms`
+- `linked_javascript`
+
+Call this when you want execution-adjacent context without pretending you have a full call graph.
+
+### `semantic-context`
+
+Use when structural context alone is not enough and you need bounded similar examples or semantically relevant nearby context.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+- `--query`
+
+Returns:
+
+- `primary_semantic_context`
+- `secondary_semantic_context`
+
+Structural anchors remain primary. Semantic results broaden recall without replacing trusted structure.
+
+### `propose-change-plan`
+
+Use when you want a conservative edit-set proposal around a symbol, file, or free-text change goal.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+- `--query`
+
+Returns:
+
+- `required_edits`
+- `likely_edits`
+- `optional_edits`
+- `validation_impact`
+- `recommended_sequence`
+
+Call this when you are moving from navigation into change planning.
+
+### `assess-test-impact`
+
+Use when you want a bounded view of likely validation impact.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+- `--query`
+
+Returns:
+
+- `direct_tests`
+- `likely_tests`
+- `environment_steps`
+- `contract_checks`
+- `manual_review_points`
+
+Call this after or alongside change planning to understand what needs to be checked.
+
+### `execution-guardrails`
+
+Use when you want bounded risk and safety guidance before editing.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+- `--query`
+
+Returns:
+
+- `change_risk`
+- `pre_edit_checks`
+- `post_edit_checks`
+- `do_not_assume`
+- `watch_points`
+
+Call this before making or finalizing changes when you need a practical safety layer.
+
+### `build-context-bundle`
+
+Use when you want one compact working set instead of calling several endpoints and merging them yourself.
+
+Accepts:
+
+- `--symbol`
+- `--file`
+- `--query`
+
+Returns:
+
+- `anchor`
+- `primary_context`
+- `supporting_context`
+- `optional_context`
+- `tests_to_consider`
+- `guardrails`
+- `example_patterns`
+- `recommended_reading_order`
+- `recommended_next_actions`
+- `bundle_stats`
+
+Call this when an agent is about to start a task and needs a bounded context package that is safe to load into a working context window.
+
+## Architecture And Mental Model
+
+The system is layered. Each layer builds on the previous one.
+
+1. **Indexing and extraction**
+   - scan the repository
+   - infer components and file roles
+   - extract structural Moodle-aware facts into SQLite
+
+2. **Structural navigation**
+   - `find-symbol`
+   - `find-definition`
+   - `file-context`
+   - `suggest-related`
+
+3. **Bounded navigation**
+   - `find-related-definitions`
+   - `suggest-edit-surface`
+   - `dependency-neighborhood`
+
+4. **Hybrid retrieval**
+   - `semantic-context`
+
+5. **Planning and safety**
+   - `propose-change-plan`
+   - `assess-test-impact`
+   - `execution-guardrails`
+
+6. **Context packaging**
+   - `build-context-bundle`
+
+The important design rule is:
+
+**Later layers do not replace earlier ones.**
+
+They package, prioritize, and synthesize the same trusted structural anchors rather than inventing disconnected logic.
+
+## How Agents Should Use This Project
+
+Recommended usage flow for an agent:
+
+1. **Resolve the anchor**
+   - use `find-definition` for a symbol
+   - use `file-context` for a file
+
+2. **Expand to direct structural context**
+   - use `find-related-definitions` or `dependency-neighborhood`
+
+3. **Estimate likely edit scope**
+   - use `suggest-edit-surface`
+   - or go directly to `propose-change-plan`
+
+4. **Pull in similar examples only if needed**
+   - use `semantic-context`
+
+5. **Add safety guidance**
+   - use `assess-test-impact`
+   - use `execution-guardrails`
+
+6. **Package a working set**
+   - use `build-context-bundle`
+
+For most agent workflows, `build-context-bundle` should be the final project-level call before the agent switches into its own reasoning and editing logic.
+
+This project stops at:
+
+- context selection
+- change-surface synthesis
+- safety guidance
+- bounded packaging
+
+Planning beyond that point belongs to the agent layer, not this project.
+
+More explicit agent guidance lives in [docs/agent_usage.md](/Users/mattp/projects/agentic_indexer/docs/agent_usage.md).
+
+## Validation And Quality
+
+The project has been validated iteratively against real Moodle-oriented slices, especially:
+
+- service flows
+- rendering flows
+- provider/form flows
+- JS module flows
+- free-text service-pattern workflows
+
+Canonical validation artifacts live in [validation_runs/](/Users/mattp/projects/agentic_indexer/validation_runs).
+
+Those runs are useful because they show what “good” output looks like against the local index and local Moodle checkout, not just the synthetic test fixtures.
+
+### Automated Verification
+
+The main automated suite lives under [tests/](/Users/mattp/projects/agentic_indexer/tests).
+
+Typical verification commands:
 
 ```bash
 python3 -m pytest -q
+python3 -m pytest -q tests/test_indexer.py tests/test_cli.py
+python3 -m pytest -q tests/test_agent_workflows.py tests/test_cli_agent_workflows.py
 ```
 
-The `validation_runs/` directory is intentionally kept as review evidence
-rather than as executable tests. Those bundles capture real-command outputs for
-high-value Moodle slices such as:
-
-- service definition -> implementation -> PHPUnit coverage
-- legacy rendering entrypoints -> output/renderers/templates
-- provider -> form -> framework chains
-- AMD source -> imports -> superclass -> build artifacts
-- free-text change-goal planning and safety patterns
-
-When changing ranking, planning, or safety behavior, the safest workflow is:
-
-1. extend regression tests first
-2. update docs for any behavior or contract changes
-3. refactor behind that test net
-4. rerun both the automated suite and any focused validation bundle relevant
-   to the changed slice
-
-## Example Output
-
-`find-symbol` returns a compact summary of symbol definitions plus structural context:
-
-```json
-{
-  "command": "find-symbol",
-  "status": "ok",
-  "data": {
-    "query": "discussion_exporter",
-    "matches": [
-      {
-        "component": "mod_forum",
-        "container_name": null,
-        "file": "mod/forum/classes/external/discussion_exporter.php",
-        "file_role": "external_api_class",
-        "fqname": "mod_forum\\external\\discussion_exporter",
-        "line": 5,
-        "name": "discussion_exporter",
-        "namespace": "mod_forum\\external",
-        "referenced_by": [],
-        "relationships": [
-          {
-            "line": 5,
-            "target": "\\external_api",
-            "type": "extends"
-          }
-        ],
-        "symbol_type": "class"
-      }
-    ]
-  }
-}
-```
-
-`find-definition` is designed to feel more like an IDE “go to definition” view.
-For supported PHP functions, classes, methods, and Moodle AMD source modules it returns:
-
-- file, line, component, namespace, and owning class
-- signature, parameters, defaults, and return type where available
-- docblock summary and selected tags
-- method modifiers such as visibility, `static`, `final`, and `abstract`
-- inheritance/navigation context such as `inheritance_role`,
-  `parent_definition`, `overrides_definition`, `implements_definitions`, and a
-  bounded `child_overrides` list where available
-- for JS modules: canonical source file, build artifact, import metadata,
-  superclass module/file, and reverse import examples where available
-- bounded `linked_artifacts` chains so a definition can still navigate into
-  service -> implementation -> test flows, output -> renderer -> template
-  flows, form -> intermediate base -> framework base flows, and JS
-  source/import/build flows
-- bounded follow-on hops on those linked artifacts so a direct hit can still
-  expose one or two trusted next steps without turning into an open-ended graph
-- a small number of ranked usage examples plus a compact `usage_summary`
-
-Agent-oriented navigation builds on those same relationships:
-
-- `find-related-definitions`: bounded related symbols and artifacts around a
-  symbol or file
-- `suggest-edit-surface`: the likely primary and secondary files/definitions an
-  agent would inspect or edit next
-
-Bounded graph-like navigation adds:
-
-- `dependency-neighborhood`: a small confidence-aware neighborhood around a
-  symbol or file, split into ranked sections such as likely callers, likely
-  callees, linked tests, and linked artifact companion sections where the
-  current index has strong local evidence
-
-Hybrid retrieval adds:
-
-- `semantic-context`: hybrid lexical + hashed-vector retrieval constrained by a
-  resolved symbol/file anchor when available
-
-Conservative planning adds:
-
-- `propose-change-plan`: a bounded edit-set synthesis that separates
-  `required_edits`, `likely_edits`, and `optional_edits`, adds a compact
-  `validation_impact` view, and suggests a short `recommended_sequence`
-  without modifying code automatically
-
-The bounded safety layer adds:
-
-- `assess-test-impact`: a compact validation view that separates
-  `direct_tests`, `likely_tests`, `environment_steps`, `contract_checks`, and
-  `manual_review_points`
-- `execution-guardrails`: a bounded safety summary that adds a conservative
-  `change_risk`, concise `pre_edit_checks`, `post_edit_checks`, `do_not_assume`
-  reminders, and `watch_points`
-
-The context-packaging layer adds:
-
-- `build-context-bundle`: a compact agent working set that packages
-  `primary_context`, `supporting_context`, `optional_context`,
-  `tests_to_consider`, `guardrails`, `example_patterns`,
-  `recommended_reading_order`, and `recommended_next_actions`
-
-These agent-oriented navigation endpoints are intentionally confidence-aware:
-
-- primary items are usually high-confidence, directly connected artifacts such
-  as service definitions, implementation files, concrete tests, output classes,
-  renderers, templates, concrete forms, framework bases, JS imports, and JS
-  superclass/build links
-- primary items are path-deduplicated so the same file does not normally appear
-  multiple times under slightly different labels; when multiple relationships
-  converge on one file, the strongest label wins and related relationships are
-  folded into the same item
-- secondary items are usually supporting context or weaker fallbacks
-- low-confidence suggestions are intentionally rare; the tool prefers a smaller
-  bounded surface over a noisy graph
-- JS-oriented outputs keep JS-specific relationship wording such as imports,
-  superclass modules, and build artifacts rather than reusing PHP-style
-  inheritance wording in Phase 4A navigation responses
-
-For `dependency-neighborhood`, "likely callers" and "likely callees" are
-bounded local edges, not a full call graph:
-
-- likely callers come from strong direct evidence such as service
-  registrations, direct usage examples, and direct JS importers
-- likely callees come from direct linked artifacts such as service
-  implementations, concrete forms, JS imports, and JS superclass modules
-- linked tests are returned as a first-class section when concrete PHPUnit
-  files can be tied directly to the symbol or file
-- structural companions such as rendering artifacts, templates, form bases, and
-  framework files stay in `linked_*` sections rather than leaking into
-  `likely_callers` or `likely_callees`
-- each section is bounded and confidence-aware so the output stays small enough
-  for an agent to inspect immediately
-- each dependency-neighborhood section now carries:
-  - a short `summary`
-  - ranked `items`
-  - a deterministic `score` per item based on relationship strength,
-    confidence, proximity, and reinforced multi-signal evidence
-- the payload also exposes a small `primary_focus` list so an agent can start
-  with the most actionable files first instead of scanning every section
-- item `explanation` values are decision-oriented and try to answer both why a
-  file matters and when it would need to change
-
-For `semantic-context`, structural navigation still stays in control:
-
-- symbol and file queries resolve a structural anchor first, then seed retrieval
-  from the existing bounded dependency neighborhood
-- semantic chunks are deterministic structural units such as symbol
-  definitions, JS modules, service registrations, test artifacts, and bounded
-  file-level fallback chunks
-- candidate generation is hybrid:
-  - structural anchor neighbors for precise local context
-  - lexical token filtering for bounded candidate recall
-  - hashed-vector similarity over chunk text for broader but still local
-    example finding
-- reranking keeps direct structural context competitive with semantically
-  similar examples instead of letting distant matches outrank the anchor
-
-For `build-context-bundle`, the system packages existing trusted outputs rather
-than introducing a new planner:
-
-- `primary_context` is intentionally small and usually contains the defining
-  implementation, the closest entrypoint or registration companion, and the
-  most direct automated validation target
-- `supporting_context` contains direct companions such as renderers, templates,
-  concrete forms, framework bases, or imported/superclass JS modules when they
-  are needed to understand the local edit surface
-- `optional_context` stays reserved for lower-priority references and semantic
-  examples so the main working set remains compact
-- `tests_to_consider` is derived from the bounded safety layer and prefers
-  concrete PHPUnit coverage over generic test folders
-- `guardrails` packages the bounded risk classification and short pre/post-edit
-  checks into the same payload instead of forcing the agent to merge another
-  endpoint
-- `bundle_stats` gives a small compactness signal so callers can budget context
-  intentionally instead of dumping the whole neighborhood into a model
-- the response separates:
-  - `primary_semantic_context` for anchor-local context and trusted linked
-    artifacts
-  - `secondary_semantic_context` for semantically similar examples and broader
-    supporting context
-- each item records:
-  - `chunk_id`
-  - `score`
-  - `retrieval_sources`
-  - `explanation`
-  - `why_relevant_to_anchor`
-
-This is still bounded retrieval for coding workflows, not a general-purpose
-semantic memory or repository-wide autonomous retriever.
-
-Phase 2 usage examples intentionally prefer precision over recall. The indexer
-will rank direct static calls, simple `new ClassName(...)` to `$var->method()`
-patterns, service-definition references, and a few other high-confidence
-linkages above weaker matches, and it may return zero examples when it cannot
-do so without becoming misleading.
-
-Usage examples also include a `usage_kind` and `confidence` field so callers can
-distinguish between, for example, a `service_definition`, `test_usage`,
-`renderer_usage`, `static_method_call`, `instance_method_call`, or
-`js_import_usage`.
-
-Ambiguity is explicit. If a short query such as `execute` matches multiple
-methods, the command returns multiple distinguishable matches instead of
-pretending there is only one.
-
-`file-context` surfaces the indexed data already known for a file without becoming a dump of the whole database. In addition to raw extracted records, it now includes bounded `linked_artifacts` chains for:
-
-- services: `db/services.php` -> implementation -> likely tests
-- rendering: output class <-> renderer <-> Mustache template links
-- JavaScript: source module -> imports -> superclass -> build artifact
-- entrypoints: high-value Moodle workflow files such as `settings.php`, `locallib.php`, `externallib.php`, and `amd/src/*.js`
-
-Those chains remain intentionally small. The query layer prefers explicit,
-trusted follow-on hops that are already derivable from indexed relationships,
-for example:
-
-- provider -> concrete form -> intermediate form base -> `lib/formslib.php`
-- output class -> template + renderer
-- service definition -> implementation -> concrete PHPUnit file
-
-This keeps navigation coherent without turning the indexer into a generic
-recursive scoring engine.
-
-`find-definition` now reuses that same linked-artifact model for the defining
-file where practical, so moving from a PHP method/class or JS module
-definition into the surrounding Moodle feature slice does not require a second
-manual lookup.
-
-Example:
-
-```json
-{
-  "command": "file-context",
-  "status": "ok",
-  "data": {
-    "application_root": "/path/to/moodle/public",
-    "repository_root": "/path/to/moodle",
-    "component": "mod_forum",
-    "file": "mod/forum/lib.php",
-    "absolute_path": "/path/to/moodle/public/mod/forum/lib.php",
-    "file_role": "lib_file",
-    "moodle_path": "mod/forum/lib.php",
-    "path_scope": "application",
-    "repository_relative_path": "public/mod/forum/lib.php",
-    "capability_checks": [
-      {
-        "capability_name": "mod/forum:viewdiscussion",
-        "function_name": "require_capability",
-        "line": 7
-      }
-    ],
-    "related_suggestions": [
-      {
-        "path": "mod/forum/db/access.php",
-        "reason": "Capability-related work usually needs the component capability definition file."
-      }
-    ],
-    "symbols": [
-      {
-        "fqname": "forum_user_can_view_discussion",
-        "line": 6,
-        "name": "forum_user_can_view_discussion",
-        "namespace": null,
-        "symbol_type": "function"
-      }
-    ]
-  }
-}
-```
-
-JSON output is deterministic:
-
-- stable top-level success/error envelopes
-- sorted object keys
-- predictable list ordering in query responses
-
-`index` reports the paths it detected so you can see exactly what was indexed:
-
-- `input_path`: the raw CLI value passed to `--moodle-path`
-- `repository_root`: the normalized checkout root used for scanning
-- `application_root`: the detected Moodle application root used for Moodle-native paths
-- `layout_type`: `classic` or `split_public`
-
-During indexing, human-readable diagnostics are written to stderr while the final JSON result stays on stdout. The logs distinguish:
-
-- repository scan and discovery
-- parsing/extraction progress
-- serial SQLite persistence progress
-- final counts for discovered, processed, persisted, skipped, and failed files
-- worker configuration and lightweight timing information
-
-The final `index` JSON also includes:
-
-- `discovered_files`
-- `processed_files`
-- `persisted_files`
-- `skipped_files`
-- `failed_files`
-- `ignored_files`
-- `worker_usage`
-- `timings`
-
-`file-context` uses the repository metadata stored in the SQLite index. After indexing, it only needs `--db-path` and a `--file` value that is either:
-
-- a Moodle-native path such as `mod/forum/lib.php`
-- a repository-relative path such as `public/mod/forum/lib.php`
-- an absolute path inside the indexed repository
-
-During `index`, the CLI emits phase-based progress on stderr so long-running rebuilds are easier to monitor. The `--workers` option controls parallel extraction threads; SQLite persistence still happens serially in the main process, so the worker count is only one part of overall throughput.
-
-## Moodle Component Coverage
-
-Phase 1 handles common Moodle conventions more carefully than a generic path prefix check. The inference rules cover, among others:
-
-- `mod/*`
-- `blocks/*`
-- `local/*`
-- `admin/tool/*`
-- `admin/report/*`
-- `auth/*`
-- `enrol/*`
-- `repository/*`
-- `question/type/*`
-- `question/behaviour/*`
-- `question/format/*`
-- `availability/condition/*`
-- `course/format/*`
-- `grade/report/*`
-- `grade/export/*`
-- `grade/import/*`
-- `editor/*`
-- `media/player/*`
-- `plagiarism/*`
-- `theme/*`
-- `payment/gateway/*`
-- `contentbank/contenttype/*`
-
-For non-plugin paths, the indexer falls back to sensible core subsystem mapping such as `core_admin`, `core_course`, and `core_question`.
-
-When a plugin declares subplugins in `db/subplugins.json`, files under those declared roots are attributed to the child component rather than the parent plugin. For example, `mod/forum/report/summary/...` is indexed as `forumreport_summary`, so `component-summary --component mod_forum` does not mix in `forumreport_summary` capability definitions.
-
-Service definitions in `db/services.php` are also indexed as first-class records. Older services that point at `externallib.php` through `classpath` are resolved directly to that file, while modern `classname` definitions are resolved through Moodle autoloading conventions to files such as `classes/external/start_submission.php`.
-
-## Testing
-
-The test suite uses synthetic Moodle-like fixture trees for both classic and split layouts under `tests/fixtures/`. It does not require a full Moodle checkout.
-
-Run tests with:
-
-```bash
-pytest
-```
-
-The current suite validates:
-
-- component inference across a broader set of Moodle path conventions
-- file-role classification
-- PHP symbol and relationship extraction
-- capability extraction
-- language string extraction
-- file-context output
-- repository-root vs application-root path semantics
-- component-summary output
-- related-file suggestion explanations
-- CLI JSON output
-
-The repository also includes a root `_smoke_test/` directory reserved for generated smoke artifacts.
-
-## Current Limitations
-
-- PHP parsing is pragmatic rather than fully semantic. The project prefers parser-based extraction when available and falls back to resilient text-based extraction when needed.
-- Relationship extraction is structural, not a full call graph.
-- Component inference covers common Moodle layouts, split `public/` application roots, and core subsystem mappings, but it is not yet a complete model of every Moodle convention.
-- Related-file suggestions are deterministic heuristics, not ranked by usage data.
-- Indexing is rebuild-only in Phase 1.
-
-## Future Directions
-
-- stronger PHP parsing support for more modern syntax patterns
-- broader extraction from additional Moodle `db/*.php` conventions
-- richer symbol reference resolution
-- better result ranking for retrieval workflows
-- optional hybrid retrieval layers on top of the structured index
-
-## Development Notes
-
-This project is intentionally a maintainable Phase 1 foundation. The goal is to make Moodle structure explicit in a form an agent or engineer can trust today, while keeping the codebase simple enough to extend in later phases.
+### Validation Principles
+
+Good output should be:
+
+- bounded
+- concrete
+- confidence-aware
+- slice-pure
+- useful to inspect or act on immediately
+
+Good outputs should generally prefer:
+
+- direct implementation files
+- direct registration or entrypoint files
+- direct tests
+- direct rendering/form/JS companions
+
+They should generally avoid:
+
+- weak generic spillover
+- giant flattened neighborhoods
+- speculative graph edges
+
+More detailed validation guidance lives in [docs/validation.md](/Users/mattp/projects/agentic_indexer/docs/validation.md).
+
+## Repository Layout
+
+The main code lives in [src/moodle_indexer/](/Users/mattp/projects/agentic_indexer/src/moodle_indexer).
+
+Key modules:
+
+- [cli.py](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/cli.py): command surface and JSON CLI entrypoints
+- [indexer.py](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/indexer.py): full rebuild indexing pipeline
+- [extractors.py](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/extractors.py): PHP, JS, service, test, capability, and string extraction
+- [queries.py](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/queries.py): structural navigation, semantic retrieval, planning, and context packaging
+- [agent_safety.py](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/agent_safety.py): bounded test-impact and guardrail synthesis
+- [store.py](/Users/mattp/projects/agentic_indexer/src/moodle_indexer/store.py): SQLite schema and persistence helpers
+
+Supporting docs:
+
+- [docs/architecture.md](/Users/mattp/projects/agentic_indexer/docs/architecture.md)
+- [docs/agent_usage.md](/Users/mattp/projects/agentic_indexer/docs/agent_usage.md)
+- [docs/validation.md](/Users/mattp/projects/agentic_indexer/docs/validation.md)
+
+## Extending The Project Later
+
+Future work should stay grounded in the same design constraints:
+
+- structural truth first
+- bounded retrieval
+- conservative planning
+- explicit safety guidance
+- compact packaging for real agent contexts
+
+The easiest safe way to extend the project is usually:
+
+1. add or improve extraction
+2. expose it through structural navigation
+3. feed it into bounded planning/safety layers
+4. package it only after it is already trustworthy
+
+## Supporting Docs
+
+- [Architecture](/Users/mattp/projects/agentic_indexer/docs/architecture.md)
+- [Agent Usage Guide](/Users/mattp/projects/agentic_indexer/docs/agent_usage.md)
+- [Validation Guide](/Users/mattp/projects/agentic_indexer/docs/validation.md)

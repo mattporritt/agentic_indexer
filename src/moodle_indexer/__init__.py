@@ -1,8 +1,9 @@
 """Moodle AI Indexer package.
 
-This package provides a Phase 1 SQLite-backed indexer and CLI for analysing a
-local Moodle checkout. The implementation focuses on practical retrieval for
-agentic coding systems rather than exhaustive program analysis.
+This package provides a SQLite-backed Moodle code-intelligence layer for a
+local Moodle checkout. The implementation focuses on practical structural
+navigation, bounded retrieval, planning, safety guidance, and compact context
+packaging for human developers and agentic coding systems.
 """
 
 __all__ = ["__version__"]

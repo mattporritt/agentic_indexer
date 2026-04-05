@@ -1,6 +1,6 @@
 """Moodle JavaScript module resolution helpers.
 
-This module defines the Phase 1 resolution model for Moodle AMD source
+This module defines the current deterministic resolution model for Moodle AMD source
 modules. Query-time resolution prefers the indexed JS module registry and falls
 back to deterministic Moodle path rules only when the registry has no exact
 match.

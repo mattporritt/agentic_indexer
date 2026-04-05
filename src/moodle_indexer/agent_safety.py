@@ -4,6 +4,15 @@ This module holds the safety-specific planning logic that used to live inside
 ``queries.py``. Keeping it separate makes the agent-oriented safety layer
 easier to reason about, test, and refactor without touching the rest of the
 structural query code.
+
+The helpers here intentionally stay conservative. They synthesize existing
+planning and structural signals into:
+
+- likely validation surfaces
+- pre/post-edit checks
+- bounded risk summaries
+
+They do not execute tests, modify code, or orchestrate workflows.
 """
 
 from __future__ import annotations

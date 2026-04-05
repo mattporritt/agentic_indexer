@@ -1,7 +1,7 @@
 """Full-rebuild indexing pipeline.
 
 This module orchestrates repository scanning, Moodle-specific inference,
-extraction, and SQLite persistence for the Phase 1 MVP.
+extraction, and SQLite persistence for the current v1 code-intelligence layer.
 """
 
 from __future__ import annotations

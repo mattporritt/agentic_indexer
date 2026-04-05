@@ -21,6 +21,8 @@ The major layers in this file are:
   - ``propose_change_plan``
   - ``assess_test_impact``
   - ``execution_guardrails``
+- context packaging:
+  - ``build_context_bundle``
 
 The implementation intentionally favors bounded, explainable heuristics over
 deep global analysis. Structural anchors remain the primary source of truth;
@@ -86,7 +88,13 @@ class JsDefinitionCandidate:
 
 @dataclass(slots=True)
 class SemanticChunk:
-    """A deterministic structural chunk used by the Phase 4D hybrid retriever."""
+    """A deterministic structural chunk used by the hybrid semantic retriever.
+
+    Chunks are structural rather than arbitrary text windows. They keep path,
+    symbol, component, file-role, and language metadata attached so later
+    retrieval, planning, and bundle packaging layers can stay grounded in the
+    same trusted anchor model.
+    """
 
     chunk_id: str
     path: str
@@ -770,10 +778,10 @@ def find_related_definitions(
 ) -> dict[str, object]:
     """Return bounded, high-confidence related definitions around a symbol or file.
 
-    Phase 4A keeps this intentionally practical:
-    - resolve the user's anchor symbol or file using existing query endpoints
-    - reuse the already indexed inheritance/service/rendering/form/JS links
-    - translate them into bounded primary/secondary definition-oriented items
+    This is the first navigation layer above raw definition lookup. It resolves
+    a symbol or file anchor, then repackages already-indexed relationships into
+    small primary/secondary sets that answer “what else should I inspect?”
+    without expanding into a generic graph walk.
     """
 
     if bool(symbol_query) == bool(file_path):
@@ -856,21 +864,17 @@ def dependency_neighborhood(
 ) -> dict[str, object]:
     """Return a bounded dependency neighborhood around a symbol or file.
 
-    Phase 4B stays intentionally local and high-confidence:
+    The neighborhood stays intentionally local and high-confidence:
+
     - likely callers come from direct usage examples, service registrations, and
       direct JS importers where the index already has concrete evidence
     - likely callees come from direct service/rendering/form/JS links already
       extracted during indexing
-    - linked tests and linked artifact companions are exposed as first-class
-      sections so agents can inspect a small, practical implementation surface
+    - tests and companion artifacts stay in dedicated linked sections so the
+      output reads like a usable working neighborhood rather than a mixed bag
 
-    Phase 4C keeps the same relationships and depth, but upgrades the payload
-    into a ranked, decision-ready view:
-    - each section is summarized and its items are scored deterministically
-    - the output surfaces a small cross-section ``primary_focus`` list so an
-      agent can start with the most actionable files first
-    - explanations and suggested actions are presentation-layer refinements on
-      top of the existing trusted relationships rather than new analysis
+    The payload is ranked and summarized so an agent can start from the most
+    actionable entries without reconstructing the priorities itself.
     """
 
     if bool(symbol_query) == bool(file_path):
@@ -909,10 +913,11 @@ def semantic_context(
 ) -> dict[str, object]:
     """Return bounded hybrid semantic context around a symbol, file, or query.
 
-    Phase 4D keeps structural navigation as the spine:
-    - resolve the user's structural anchor first when a symbol or file is given
+    Structural navigation stays in control:
+
+    - resolve the structural anchor first when a symbol or file is given
     - seed retrieval with the existing bounded dependency neighborhood
-    - expand with lexical + hashed-vector similarity over deterministic chunks
+    - expand with lexical and hashed-vector similarity over deterministic chunks
     - rerank so direct structural context stays ahead of distant similar examples
     """
 
@@ -938,11 +943,10 @@ def propose_change_plan(
 ) -> dict[str, object]:
     """Return a bounded, agent-usable change plan around a symbol, file, or goal.
 
-    Phase 4E keeps planning intentionally conservative:
-    - reuse the existing structural and semantic endpoints as the substrate
-    - classify the strongest local artifacts into required/likely/optional edits
-    - derive a compact validation impact view from concrete tests/build surfaces
-    - suggest a short recommended inspection/update sequence without executing it
+    The planner is intentionally conservative. It reuses existing structural and
+    semantic outputs, classifies the strongest artifacts into
+    required/likely/optional edits, and suggests a short sequence without
+    pretending to be an execution engine.
     """
 
     targets = [bool(symbol_query), bool(file_path), bool(query_text)]
@@ -967,10 +971,11 @@ def assess_test_impact(
 ) -> dict[str, object]:
     """Return a bounded validation view around a symbol, file, or change goal.
 
-    Phase 5B keeps test-impact estimation intentionally conservative:
-    - prefer concrete PHPUnit-linked files over generic test hints
-    - surface contract and environment checks only when structurally justified
-    - keep output short enough that an agent can use it as a practical checklist
+    Test-impact synthesis prefers concrete local evidence:
+
+    - concrete PHPUnit-linked files over generic test hints
+    - contract and environment checks only when structurally justified
+    - short bounded sections that can serve as a practical checklist
     """
 
     targets = [bool(symbol_query), bool(file_path), bool(query_text)]
@@ -1022,7 +1027,7 @@ def build_context_bundle(
 ) -> dict[str, object]:
     """Return a compact, agent-usable working bundle around a symbol, file, or goal.
 
-    Phase 5C is a packaging layer rather than a new inference layer:
+    This is a packaging layer rather than a new inference layer:
     - reuse the existing change plan, semantic context, test-impact, and
       execution-guardrail endpoints as the trusted substrate
     - compress those signals into small primary/supporting/optional tiers
@@ -1623,7 +1628,18 @@ def _synthesize_context_bundle(
     guardrails: dict[str, object],
     limit: int,
 ) -> dict[str, object]:
-    """Package trusted planning and safety outputs into one compact working set."""
+    """Package trusted planning and safety outputs into one compact working set.
+
+    The bundle is designed for real context windows, so it deliberately
+    separates:
+
+    - essential implementation context
+    - direct companions and validation context
+    - lower-priority examples
+
+    This keeps the endpoint useful as a final packaging step before an external
+    agent begins its own reasoning or editing workflow.
+    """
 
     semantic_lookup = _bundle_semantic_lookup(semantic)
     seen_paths: set[str] = set()
@@ -4430,7 +4446,7 @@ def _build_definition_linked_artifacts(connection: sqlite3.Connection, row: sqli
 
 
 def _compact_match_summary(match: dict[str, object]) -> dict[str, object]:
-    """Return a compact anchor summary for Phase 4A navigation responses."""
+    """Return a compact anchor summary for navigation-oriented responses."""
 
     summary = {
         "symbol_type": match.get("symbol_type"),
@@ -5682,7 +5698,7 @@ def _merge_dependency_section_items(
 
 
 def _present_dependency_section_item(section_name: str, item: dict[str, object]) -> dict[str, object]:
-    """Return the public Phase 4C item shape for one dependency item."""
+    """Return the public dependency-neighborhood item shape."""
 
     presented = {
         "path": item["path"],
@@ -5819,7 +5835,7 @@ def _dependency_section_summary(section_name: str) -> str:
 
 
 def _dependency_item_score(section_name: str, item: dict[str, object]) -> float:
-    """Return a normalized Phase 4C score in the range 0.0..1.0."""
+    """Return a normalized dependency score in the range 0.0..1.0."""
 
     base_score = (
         _dependency_relationship_weight(section_name, item)
@@ -5870,7 +5886,7 @@ def _dependency_confidence_weight(confidence: str) -> float:
 
 
 def _dependency_confidence_multiplier(confidence: str) -> float:
-    """Return the Phase 4C.1 confidence multiplier."""
+    """Return the confidence multiplier used by dependency ranking."""
 
     return {"high": 1.0, "medium": 0.85, "low": 0.6}.get(confidence, 0.85)
 
@@ -5896,7 +5912,7 @@ def _dependency_reinforcement_weight(item: dict[str, object]) -> float:
 
 
 def _dependency_relationship_multiplier(section_name: str, item: dict[str, object]) -> float:
-    """Return the Phase 4C.1 relationship penalty multiplier."""
+    """Return the relationship penalty multiplier used by dependency ranking."""
 
     relationship = str(item["relationship"])
     item_type = str(item["type"])
@@ -6008,7 +6024,7 @@ def _calibrate_dependency_section_scores(
     section_name: str,
     items: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Apply small Phase 4C.1 score calibration for clearer separation."""
+    """Apply small score calibration for clearer dependency-section separation."""
 
     if len(items) >= 3:
         top_scores = [float(item["score"]) for item in items[:3]]
@@ -6151,7 +6167,7 @@ def _artifact_navigation_items(
     include_entrypoints: bool = True,
     include_js_reverse: bool = True,
 ) -> list[dict[str, object]]:
-    """Flatten existing linked artifacts into Phase 4A navigation items."""
+    """Flatten existing linked artifacts into normalized navigation items."""
 
     items: list[dict[str, object]] = []
 
@@ -6303,7 +6319,7 @@ def _navigation_item(
     symbol: str | None,
     anchor: str | None,
 ) -> dict[str, object]:
-    """Build a normalized Phase 4A navigation item."""
+    """Build a normalized navigation item."""
 
     return {
         "type": item_type,
@@ -6397,7 +6413,7 @@ def _split_navigation_items(
 
 
 def _artifact_item_type(path: str, artifact_type: str | None) -> str:
-    """Return a stable Phase 4A item type."""
+    """Return a stable navigation item type."""
 
     if artifact_type:
         return artifact_type
@@ -6459,7 +6475,7 @@ def _confidence_rank(confidence: str) -> int:
 
 
 def _edit_surface_priority(item_type: str, relationship: str, path: str) -> int:
-    """Return a lightweight priority for Phase 4A related/edit-surface items."""
+    """Return a lightweight priority for related-definition/edit-surface items."""
 
     if relationship in {"definition_file", "anchor_file"}:
         return 0
@@ -7275,7 +7291,7 @@ def _linked_class_artifacts(
 ) -> list[dict[str, object]]:
     """Return resolved class/file artifacts for one file.
 
-    This helper keeps Phase 1 resolution deterministic:
+    This helper keeps resolution deterministic:
     - Moodle autoloaded namespaced classes resolve via frankenstyle component
       namespaces.
     - a short explicit map handles important legacy framework classes such as
