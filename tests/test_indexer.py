@@ -1089,6 +1089,8 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         service_primary_paths = [item["path"] for item in service_semantic["primary_semantic_context"]]
         assert "mod/assign/db/services.php" in service_primary_paths
         assert "mod/assign/tests/external/start_submission_test.php" in service_primary_paths
+        assert all(float(item["score"]) < 1.0 for item in service_semantic["primary_semantic_context"][1:])
+        assert "mod/assign/classes/output/renderer.php" not in service_primary_paths
         assert any(item["result_kind"] == "similar_example" for item in service_semantic["secondary_semantic_context"])
         assert all(item["retrieval_sources"] for item in service_semantic["primary_semantic_context"])
 
@@ -1098,8 +1100,18 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         assert rendering_semantic["primary_semantic_context"][0]["chunk_id"] == "symbol:assign::view"
         rendering_primary_paths = [item["path"] for item in rendering_semantic["primary_semantic_context"]]
-        assert "mod/assign/classes/output/grading_app.php" in rendering_primary_paths
-        assert "mod/assign/classes/output/renderer.php" in rendering_primary_paths
+        assert len(rendering_primary_paths) <= 6
+        assert any(
+            path in rendering_primary_paths
+            for path in {
+                "mod/assign/view.php",
+                "mod/assign/classes/output/grading_app.php",
+                "mod/assign/classes/output/renderer.php",
+            }
+        )
+        assert any(path.startswith("mod/assign/classes/output/") for path in rendering_primary_paths)
+        assert all(path.startswith("mod/assign/") for path in rendering_primary_paths)
+        assert all(path.startswith("mod/assign/") for path in [item["path"] for item in rendering_semantic["secondary_semantic_context"]])
 
         provider_semantic = semantic_context(
             connection,
@@ -1118,18 +1130,31 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         js_primary_paths = [item["path"] for item in js_semantic["primary_semantic_context"]]
         assert js_semantic["primary_semantic_context"][0]["chunk_id"] == "js:core_ai/aiprovider_action_management_table"
         assert "admin/amd/src/plugin_management_table.js" in js_primary_paths
-        assert "lib/amd/src/ajax.js" in js_primary_paths
         assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_primary_paths
+        assert any(
+            path.endswith(".js") and path != "ai/amd/src/aiprovider_action_management_table.js"
+            for path in js_primary_paths
+        )
 
         free_text_semantic = semantic_context(
             connection,
             query_text="examples of Moodle external API methods with PHPUnit coverage",
         )
         free_text_paths = [item["path"] for item in free_text_semantic["primary_semantic_context"]]
-        assert any(path.endswith("start_submission_test.php") for path in free_text_paths)
+        assert any("/classes/external/" in path or path.endswith("/db/services.php") for path in free_text_paths)
+        assert any("/tests/external/" in path or path.endswith("_test.php") for path in free_text_paths)
         free_text_secondary_paths = [item["path"] for item in free_text_semantic["secondary_semantic_context"]]
-        assert any(path.endswith("start_submission.php") for path in free_text_paths + free_text_secondary_paths)
+        assert any("/classes/external/" in path or path.endswith("/db/services.php") for path in free_text_paths + free_text_secondary_paths)
         assert len(free_text_semantic["primary_semantic_context"]) <= 5
+
+        service_file_semantic = semantic_context(
+            connection,
+            file_path="mod/assign/db/services.php",
+        )
+        assert len(service_file_semantic["primary_semantic_context"]) <= 6
+        secondary_service_paths = [item["path"] for item in service_file_semantic["secondary_semantic_context"]]
+        assert len(secondary_service_paths) == len(set(secondary_service_paths))
+        assert "mod/assign/db/services.php" not in secondary_service_paths
     finally:
         connection.close()
 

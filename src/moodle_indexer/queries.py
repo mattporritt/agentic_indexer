@@ -14,7 +14,7 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from moodle_indexer.components import resolve_classname_to_file_path, resolve_framework_class_to_file_path
 from moodle_indexer.errors import ValidationError
@@ -975,9 +975,10 @@ def _semantic_context_for_query(
     """Return bounded semantic context for a free-text query."""
 
     query_tokens = _semantic_focus_tokens(query_text)
+    query_intent = _semantic_query_intent(query_tokens)
     candidates = _collect_matching_semantic_chunks(connection, query_tokens, language=None, limit=80)
     ranked = _semantic_rank_query_candidates(query_text, query_tokens, candidates, limit=limit * 2)
-    primary = ranked[: min(limit, 5)]
+    primary = _semantic_query_primary_items(ranked, query_intent, limit=min(limit, 5))
     secondary = ranked[min(limit, 5) : min(len(ranked), limit * 2)]
     return {
         "query": query_text,
@@ -988,6 +989,49 @@ def _semantic_context_for_query(
         "primary_semantic_context": primary,
         "secondary_semantic_context": secondary,
     }
+
+
+def _semantic_query_primary_items(
+    ranked: list[dict[str, object]],
+    query_intent: dict[str, bool],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return the highest-signal free-text primary set.
+
+    When a query explicitly asks for external API examples plus PHPUnit
+    coverage, agents benefit from seeing both sides of the pattern quickly:
+    an implementation and a concrete test. This keeps the primary set
+    representative without changing the endpoint shape or broadening coverage.
+    """
+
+    if not (query_intent["external_api"] and query_intent["tests"]):
+        return ranked[:limit]
+
+    primary: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+
+    def take_first(predicate: Callable[[dict[str, object]], bool]) -> None:
+        for item in ranked:
+            path = str(item["path"])
+            if path in seen_paths or not predicate(item):
+                continue
+            seen_paths.add(path)
+            primary.append(item)
+            return
+
+    take_first(lambda item: str(item.get("summary") or "").startswith("external_api_class"))
+    take_first(lambda item: "/tests/external/" in str(item["path"]))
+
+    for item in ranked:
+        path = str(item["path"])
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        primary.append(item)
+        if len(primary) >= limit:
+            break
+    return primary[:limit]
 
 
 def _semantic_primary_items_from_sections(
@@ -1004,7 +1048,8 @@ def _semantic_primary_items_from_sections(
         _semantic_anchor_item(anchor_chunk),
     ]
     for section_name, payload in sections.items():
-        for raw_item in list(payload.get("items", []))[:4]:
+        section_candidates: list[dict[str, object]] = []
+        for raw_item in list(payload.get("items", []))[:6]:
             chunk = _semantic_chunk_from_reference(
                 connection,
                 path=str(raw_item["path"]),
@@ -1014,21 +1059,21 @@ def _semantic_primary_items_from_sections(
                 continue
             lexical = _semantic_overlap_score(anchor_query, chunk.text)
             semantic = _semantic_similarity(anchor_chunk.text, chunk.text)
-            score = min(
-                1.0,
+            raw_score = (
                 _semantic_structural_base(section_name, str(raw_item.get("confidence") or "medium"))
                 + _semantic_anchor_section_bonus(anchor_chunk, section_name, raw_item)
-                + lexical * 0.12
-                + semantic * 0.14
-                + (0.06 if _same_component_root(anchor_chunk.path, chunk.path) else 0.0),
+                + lexical * 0.08
+                + semantic * 0.1
+                + (0.03 if _same_component_root(anchor_chunk.path, chunk.path) else 0.0)
             )
+            score = _semantic_soft_score(raw_score, cap=0.94)
             retrieval_sources = ["structural"]
             if lexical >= 0.12:
                 retrieval_sources.append("lexical")
             if semantic >= 0.18:
                 retrieval_sources.append("semantic")
             retrieval_sources.append("rerank")
-            items.append(
+            section_candidates.append(
                 {
                     "path": chunk.path,
                     "symbol": chunk.symbol,
@@ -1041,8 +1086,27 @@ def _semantic_primary_items_from_sections(
                     "summary": chunk.summary,
                     "confidence": raw_item.get("confidence", "medium"),
                     "result_kind": "local_context",
+                    "_section_priority": _semantic_section_item_priority(
+                        anchor_chunk,
+                        section_name,
+                        raw_item,
+                        chunk,
+                    ),
                 }
             )
+        section_candidates.sort(
+            key=lambda item: (
+                int(item.get("_section_priority", 99)),
+                -float(item["score"]),
+                str(item["path"]),
+                str(item.get("symbol") or ""),
+            )
+        )
+        for item in section_candidates:
+            item.pop("_section_priority", None)
+        items.extend(
+            section_candidates[: _semantic_primary_section_limit(anchor_chunk, section_name)]
+        )
     return _merge_semantic_results(items)[: min(limit, 8)]
 
 
@@ -1058,6 +1122,7 @@ def _semantic_secondary_items_for_anchor(
 
     excluded = {str(item["chunk_id"]) for item in structural_items}
     query_tokens = _semantic_focus_tokens(anchor_query + " " + anchor_chunk.text)
+    component_only = anchor_chunk.file_role in {"locallib_file", "lib_file"} and anchor_chunk.symbol_type == "method"
     candidates = _collect_component_semantic_chunks(
         connection,
         component_name=anchor_chunk.component,
@@ -1076,6 +1141,12 @@ def _semantic_secondary_items_for_anchor(
     for chunk in _deduplicate_semantic_chunks(candidates):
         if chunk.chunk_id in excluded or chunk.chunk_id == anchor_chunk.chunk_id:
             continue
+        if chunk.path == anchor_chunk.path:
+            continue
+        if component_only and chunk.component != anchor_chunk.component:
+            continue
+        if anchor_chunk.file_role == "services_definition" and chunk.source_kind == "service":
+            continue
         lexical = _semantic_overlap_score(anchor_query + " " + anchor_chunk.title, chunk.text)
         semantic = _semantic_similarity(anchor_chunk.text, chunk.text)
         if lexical <= 0.0 and semantic < 0.24:
@@ -1084,8 +1155,11 @@ def _semantic_secondary_items_for_anchor(
         language_bonus = 0.1 if chunk.language == anchor_chunk.language else 0.0
         symbol_bonus = 0.08 if chunk.symbol_type and chunk.symbol_type == anchor_chunk.symbol_type else 0.0
         component_bonus = 0.08 if chunk.component == anchor_chunk.component else 0.0
-        score = min(1.0, lexical * 0.22 + semantic * 0.38 + role_bonus + language_bonus + symbol_bonus + component_bonus)
-        if score < 0.36:
+        score = _semantic_soft_score(
+            lexical * 0.18 + semantic * 0.28 + role_bonus + language_bonus + symbol_bonus + component_bonus,
+            cap=0.84,
+        )
+        if score < (0.42 if component_only else 0.36):
             continue
         ranked.append(
             {
@@ -1102,8 +1176,8 @@ def _semantic_secondary_items_for_anchor(
                 "result_kind": "similar_example",
             }
         )
-    ranked.sort(key=lambda item: (-float(item["score"]), str(item["path"]), str(item.get("symbol") or "")))
-    return ranked[: min(limit, 6)]
+    merged = _merge_semantic_results(ranked)
+    return merged[: min(limit, 4 if component_only else 6)]
 
 
 def _semantic_rank_query_candidates(
@@ -1115,25 +1189,30 @@ def _semantic_rank_query_candidates(
 ) -> list[dict[str, object]]:
     """Return bounded free-text semantic matches."""
 
+    query_intent = _semantic_query_intent(query_tokens)
     ranked: list[dict[str, object]] = []
     for chunk in _deduplicate_semantic_chunks(candidates):
         lexical = _semantic_overlap_score(query_text, chunk.text)
         semantic = _semantic_similarity(query_text, chunk.text)
         if lexical <= 0.0 and semantic < 0.2:
             continue
-        score = min(
-            1.0,
+        raw_score = (
             lexical * 0.35
-            + semantic * 0.45
+            + semantic * 0.32
             + (0.1 if any(token in chunk.text.lower() for token in query_tokens[:2]) else 0.0)
-            + _semantic_query_kind_bonus(query_tokens, chunk),
+            + _semantic_query_kind_bonus(query_tokens, chunk)
         )
+        score = _semantic_soft_score(raw_score, cap=0.9)
+        score *= _semantic_query_intent_multiplier(query_intent, chunk)
+        score = round(min(0.9, score), 3)
+        if score < 0.35:
+            continue
         ranked.append(
             {
                 "path": chunk.path,
                 "symbol": chunk.symbol,
                 "chunk_id": chunk.chunk_id,
-                "score": round(score, 3),
+                "score": score,
                 "retrieval_sources": _semantic_sources(lexical, semantic),
                 "explanation": _semantic_query_explanation(query_text, chunk),
                 "why_relevant_to_anchor": _semantic_query_relevance(query_tokens, chunk),
@@ -1165,6 +1244,99 @@ def _semantic_anchor_item(anchor_chunk: SemanticChunk) -> dict[str, object]:
     }
 
 
+def _semantic_primary_section_limit(anchor_chunk: SemanticChunk, section_name: str) -> int:
+    """Return a small section cap tuned to the current anchor shape.
+
+    The semantic layer should feel like “inspect these next”, not a flattened
+    dump of the whole dependency neighborhood. These caps stay intentionally
+    conservative for broad locallib methods and service-definition files.
+    """
+
+    if anchor_chunk.file_role == "services_definition":
+        return {
+            "likely_callers": 1,
+            "likely_callees": 3,
+            "linked_services": 2,
+            "linked_tests": 2,
+            "linked_framework": 1,
+        }.get(section_name, 2)
+    if anchor_chunk.file_role == "external_api_class":
+        return {
+            "likely_callers": 2,
+            "linked_tests": 2,
+            "linked_services": 2,
+            "linked_rendering_artifacts": 0,
+            "linked_framework": 0,
+        }.get(section_name, 2)
+    if anchor_chunk.file_role in {"locallib_file", "lib_file"} and anchor_chunk.symbol_type == "method":
+        return {
+            "likely_callers": 2,
+            "linked_rendering_artifacts": 2,
+            "linked_tests": 1,
+            "linked_framework": 1,
+        }.get(section_name, 2)
+    if "provider" in anchor_chunk.path:
+        return {
+            "linked_forms": 3,
+            "linked_framework": 2,
+            "likely_callees": 2,
+        }.get(section_name, 2)
+    if anchor_chunk.language == "js":
+        return {
+            "likely_callers": 2,
+            "likely_callees": 3,
+            "linked_javascript": 3,
+            "linked_build_artifacts": 1,
+        }.get(section_name, 2)
+    return 3
+
+
+def _semantic_section_item_priority(
+    anchor_chunk: SemanticChunk,
+    section_name: str,
+    raw_item: dict[str, object],
+    chunk: SemanticChunk,
+) -> int:
+    """Return a small priority bias inside one semantic primary section."""
+
+    item_type = str(raw_item.get("type") or "")
+    relationship = str(raw_item.get("relationship") or "")
+
+    if section_name == "linked_rendering_artifacts":
+        if item_type == "output_class":
+            return 0
+        if item_type == "renderer_file":
+            return 1
+        if item_type == "template_file":
+            return 2
+        return 5
+    if section_name == "linked_forms":
+        if item_type == "form_class" and str(raw_item.get("chain_role") or "direct") == "direct":
+            return 0
+        if item_type == "form_class":
+            return 1
+        if item_type == "framework_base":
+            return 2
+        return 5
+    if section_name == "linked_tests":
+        if "/tests/external/" in chunk.path:
+            return 0
+        return 2
+    if section_name == "likely_callers":
+        if relationship == "service_definition":
+            return 0
+        if relationship in {"instance_method_call", "static_method_call", "function_call"}:
+            return 1
+        return 5
+    if anchor_chunk.file_role == "services_definition" and section_name in {"linked_services", "likely_callees"}:
+        if chunk.file_role == "external_api_class":
+            return 0
+        if chunk.path.endswith("/externallib.php"):
+            return 1
+        return 4
+    return 3
+
+
 def _semantic_anchor_summary(anchor_chunk: SemanticChunk) -> dict[str, object]:
     """Return compact anchor metadata for semantic-context responses."""
 
@@ -1184,17 +1356,17 @@ def _semantic_structural_base(section_name: str, confidence: str) -> float:
     """Return the structural score floor for one dependency-neighborhood section."""
 
     section_weights = {
-        "likely_callers": 0.72,
-        "likely_callees": 0.7,
-        "linked_tests": 0.71,
-        "linked_services": 0.69,
-        "linked_rendering_artifacts": 0.64,
-        "linked_forms": 0.65,
-        "linked_framework": 0.58,
-        "linked_javascript": 0.66,
-        "linked_build_artifacts": 0.6,
+        "likely_callers": 0.5,
+        "likely_callees": 0.48,
+        "linked_tests": 0.49,
+        "linked_services": 0.47,
+        "linked_rendering_artifacts": 0.43,
+        "linked_forms": 0.44,
+        "linked_framework": 0.36,
+        "linked_javascript": 0.45,
+        "linked_build_artifacts": 0.39,
     }
-    confidence_bonus = {"high": 0.12, "medium": 0.06, "low": 0.0}.get(confidence, 0.0)
+    confidence_bonus = {"high": 0.08, "medium": 0.04, "low": 0.0}.get(confidence, 0.0)
     return section_weights.get(section_name, 0.56) + confidence_bonus
 
 
@@ -1260,8 +1432,8 @@ def _semantic_similar_explanation(anchor_chunk: SemanticChunk, chunk: SemanticCh
 
     kind = _semantic_human_kind(chunk)
     if chunk.file_role == anchor_chunk.file_role:
-        return f"Semantically similar {kind} with the same Moodle role ({chunk.file_role}); inspect it for an analogous implementation pattern."
-    return f"Semantically similar {kind} retrieved from the same codebase; inspect it for a comparable implementation pattern or test shape."
+        return f"Semantically similar {kind} with the same Moodle role ({chunk.file_role}); inspect it if you need a comparable implementation pattern, test shape, or review point for this anchor."
+    return f"Semantically similar {kind} retrieved from the same codebase; inspect it if you need a comparable implementation pattern or fallback example for this anchor."
 
 
 def _semantic_similar_relevance(
@@ -1294,6 +1466,12 @@ def _semantic_query_explanation(query_text: str, chunk: SemanticChunk) -> str:
     """Return a decision-ready explanation for one free-text retrieval result."""
 
     kind = _semantic_human_kind(chunk)
+    if chunk.file_role == "services_definition":
+        return f"Service registration matched the free-text query '{query_text}'; inspect it when you need a concrete web-service entrypoint example or service wiring reference."
+    if chunk.file_role == "external_api_class":
+        return f"External API implementation matched the free-text query '{query_text}'; inspect it when you need a concrete web-service method example or API contract pattern."
+    if chunk.source_kind == "test":
+        return f"Concrete test matched the free-text query '{query_text}'; inspect it when you need PHPUnit-backed examples or expected behavior for a similar workflow."
     return f"{kind.capitalize()} matched the free-text query '{query_text}'; inspect it if you need a concrete code example or local implementation context."
 
 
@@ -1316,6 +1494,19 @@ def _semantic_sources(lexical: float, semantic: float) -> list[str]:
         sources.append("semantic")
     sources.append("rerank")
     return sources
+
+
+def _semantic_soft_score(raw_score: float, *, cap: float) -> float:
+    """Return a bounded semantic score with softer saturation.
+
+    This keeps anchor-local items strong without collapsing too many companions
+    onto the same 1.0 ceiling.
+    """
+
+    if raw_score <= 0.0:
+        return 0.0
+    scaled = raw_score / (1.0 + 0.35 * max(raw_score - 0.45, 0.0))
+    return min(cap, scaled)
 
 
 def _merge_semantic_results(items: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -2325,15 +2516,68 @@ def _semantic_query_kind_bonus(query_tokens: list[str], chunk: SemanticChunk) ->
     token_set = set(query_tokens)
     bonus = 0.0
     if {"method", "methods", "api", "external"} & token_set:
-        if chunk.source_kind == "symbol" or chunk.file_role in {"external_api_class", "services_definition"}:
-            bonus += 0.08
-    if {"test", "tests", "phpunit", "coverage"} & token_set and chunk.source_kind == "test":
-        bonus += 0.08
+        if chunk.file_role == "external_api_class":
+            bonus += 0.14
+        elif chunk.file_role == "services_definition" or chunk.source_kind == "service":
+            bonus += 0.12
+        elif chunk.source_kind == "symbol":
+            bonus += 0.06
+    if {"test", "tests", "phpunit", "coverage"} & token_set:
+        if chunk.source_kind == "test" and "/tests/external/" in chunk.path:
+            bonus += 0.16
+        elif chunk.source_kind == "test":
+            bonus += 0.06
     if {"template", "renderer", "rendering"} & token_set and chunk.file_role in {"template_file", "renderer_file", "output_class"}:
         bonus += 0.06
     if {"form", "forms", "validation"} & token_set and chunk.file_role in {"unknown", "phpunit_test"} and "\\form\\" in (chunk.symbol or ""):
         bonus += 0.04
     return bonus
+
+
+def _semantic_query_intent(query_tokens: list[str]) -> dict[str, bool]:
+    """Return a small intent profile for bounded free-text ranking."""
+
+    token_set = set(query_tokens)
+    return {
+        "external_api": bool({"external", "api", "service", "services", "webservice", "webservices"} & token_set),
+        "tests": bool({"test", "tests", "phpunit", "coverage"} & token_set),
+        "examples": bool({"examples", "example", "similar", "pattern"} & token_set),
+        "rendering": bool({"rendering", "renderer", "template", "output"} & token_set),
+        "forms": bool({"form", "forms", "validation"} & token_set),
+    }
+
+
+def _semantic_query_intent_multiplier(
+    intent: dict[str, bool],
+    chunk: SemanticChunk,
+) -> float:
+    """Return a small intent-aware multiplier for free-text retrieval.
+
+    This keeps free-text queries grounded in trusted structural priors instead
+    of letting broad lexical overlap dominate the ranking.
+    """
+
+    multiplier = 1.0
+    if intent["external_api"] and intent["tests"]:
+        if chunk.file_role == "external_api_class":
+            multiplier *= 1.5
+        elif chunk.file_role == "services_definition" or chunk.source_kind == "service":
+            multiplier *= 1.35
+        elif chunk.source_kind == "test" and "/tests/external/" in chunk.path:
+            multiplier *= 1.18
+        elif chunk.source_kind == "test":
+            multiplier *= 0.7
+        elif chunk.path.startswith("admin/tool/componentlibrary/"):
+            multiplier *= 0.7
+        elif chunk.file_role not in {"external_api_class", "services_definition"}:
+            multiplier *= 0.9
+    if intent["rendering"] and chunk.file_role in {"output_class", "renderer_file", "template_file"}:
+        multiplier *= 1.15
+    if intent["forms"] and chunk.file_role in {"form_class", "phpunit_test"} and "\\form\\" in (chunk.symbol or ""):
+        multiplier *= 1.12
+    if intent["examples"] and chunk.source_kind in {"symbol", "service", "test"}:
+        multiplier *= 1.05
+    return multiplier
 
 
 def _language_for_path(path: str) -> str:
