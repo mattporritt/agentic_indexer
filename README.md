@@ -102,6 +102,8 @@ Today the architecture is best understood as layered synthesis:
    - `suggest-edit-surface`, `dependency-neighborhood`, `semantic-context`
 4. planning and safety
    - `propose-change-plan`, `assess-test-impact`, `execution-guardrails`
+5. context packaging
+   - `build-context-bundle`
 
 Those higher layers reuse the same trusted structural anchors rather than
 inventing disconnected ranking systems for each endpoint.
@@ -368,6 +370,18 @@ moodle-indexer execution-guardrails \
   --symbol core_ai/aiprovider_action_management_table
 ```
 
+Package a compact agent-ready working set around a symbol, file, or free-text goal:
+
+```bash
+moodle-indexer build-context-bundle \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+
+moodle-indexer build-context-bundle \
+  --db-path /path/to/moodle-index.sqlite \
+  --query 'add a parameter to a Moodle external API method and update its tests'
+```
+
 Find a definition:
 
 ```bash
@@ -533,6 +547,13 @@ The bounded safety layer adds:
   `change_risk`, concise `pre_edit_checks`, `post_edit_checks`, `do_not_assume`
   reminders, and `watch_points`
 
+The context-packaging layer adds:
+
+- `build-context-bundle`: a compact agent working set that packages
+  `primary_context`, `supporting_context`, `optional_context`,
+  `tests_to_consider`, `guardrails`, `example_patterns`,
+  `recommended_reading_order`, and `recommended_next_actions`
+
 These agent-oriented navigation endpoints are intentionally confidence-aware:
 
 - primary items are usually high-confidence, directly connected artifacts such
@@ -588,6 +609,25 @@ For `semantic-context`, structural navigation still stays in control:
     example finding
 - reranking keeps direct structural context competitive with semantically
   similar examples instead of letting distant matches outrank the anchor
+
+For `build-context-bundle`, the system packages existing trusted outputs rather
+than introducing a new planner:
+
+- `primary_context` is intentionally small and usually contains the defining
+  implementation, the closest entrypoint or registration companion, and the
+  most direct automated validation target
+- `supporting_context` contains direct companions such as renderers, templates,
+  concrete forms, framework bases, or imported/superclass JS modules when they
+  are needed to understand the local edit surface
+- `optional_context` stays reserved for lower-priority references and semantic
+  examples so the main working set remains compact
+- `tests_to_consider` is derived from the bounded safety layer and prefers
+  concrete PHPUnit coverage over generic test folders
+- `guardrails` packages the bounded risk classification and short pre/post-edit
+  checks into the same payload instead of forcing the agent to merge another
+  endpoint
+- `bundle_stats` gives a small compactness signal so callers can budget context
+  intentionally instead of dumping the whole neighborhood into a model
 - the response separates:
   - `primary_semantic_context` for anchor-local context and trusted linked
     artifacts

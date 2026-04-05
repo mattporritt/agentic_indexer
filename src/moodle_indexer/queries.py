@@ -1012,6 +1012,36 @@ def execution_guardrails(
     return _execution_guardrails_for_query(connection, query_text or "", bounded_limit)
 
 
+def build_context_bundle(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    query_text: str | None = None,
+    limit: int = 8,
+) -> dict[str, object]:
+    """Return a compact, agent-usable working bundle around a symbol, file, or goal.
+
+    Phase 5C is a packaging layer rather than a new inference layer:
+    - reuse the existing change plan, semantic context, test-impact, and
+      execution-guardrail endpoints as the trusted substrate
+    - compress those signals into small primary/supporting/optional tiers
+    - include tests, guardrails, examples, and a reading order so an agent can
+      start work without merging multiple endpoint payloads itself
+    """
+
+    targets = [bool(symbol_query), bool(file_path), bool(query_text)]
+    if sum(targets) != 1:
+        raise ValidationError("Provide exactly one of --symbol, --file, or --query.")
+
+    bounded_limit = max(1, min(limit, 8))
+    if symbol_query:
+        return _context_bundle_for_symbol(connection, symbol_query, bounded_limit)
+    if file_path:
+        return _context_bundle_for_file(connection, file_path, bounded_limit)
+    return _context_bundle_for_query(connection, query_text or "", bounded_limit)
+
+
 def _change_plan_for_symbol(
     connection: sqlite3.Connection,
     symbol_query: str,
@@ -1042,6 +1072,87 @@ def _change_plan_for_symbol(
         limit=limit,
     )
     return plan
+
+
+def _context_bundle_for_symbol(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return a compact context bundle anchored on one resolved symbol."""
+
+    definition_data = find_definition(connection, symbol_query, limit=1, include_usages=True)
+    matches = definition_data["matches"]
+    if not matches:
+        return _empty_context_bundle(symbol_query, "symbol")
+
+    anchor_match = matches[0]
+    plan = propose_change_plan(connection, symbol_query=symbol_query, limit=limit)
+    semantic = semantic_context(connection, symbol_query=symbol_query, limit=min(6, limit))
+    test_impact = assess_test_impact(connection, symbol_query=symbol_query, limit=min(6, limit))
+    guardrails = execution_guardrails(connection, symbol_query=symbol_query, limit=min(6, limit))
+    return _synthesize_context_bundle(
+        query=symbol_query,
+        query_kind="symbol",
+        anchor=_compact_match_summary(anchor_match),
+        plan=plan,
+        semantic=semantic,
+        test_impact=test_impact,
+        guardrails=guardrails,
+        limit=limit,
+    )
+
+
+def _context_bundle_for_file(
+    connection: sqlite3.Connection,
+    file_path: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return a compact context bundle anchored on one indexed file."""
+
+    context = file_context(connection, file_path)
+    anchor = {
+        "path": context["moodle_path"],
+        "file_role": context["file_role"],
+        "component": context["component"],
+    }
+    plan = propose_change_plan(connection, file_path=file_path, limit=limit)
+    semantic = semantic_context(connection, file_path=file_path, limit=min(6, limit))
+    test_impact = assess_test_impact(connection, file_path=file_path, limit=min(6, limit))
+    guardrails = execution_guardrails(connection, file_path=file_path, limit=min(6, limit))
+    return _synthesize_context_bundle(
+        query=context["moodle_path"],
+        query_kind="file",
+        anchor=anchor,
+        plan=plan,
+        semantic=semantic,
+        test_impact=test_impact,
+        guardrails=guardrails,
+        limit=limit,
+    )
+
+
+def _context_bundle_for_query(
+    connection: sqlite3.Connection,
+    query_text: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return a compact context bundle for a free-text change goal."""
+
+    plan = propose_change_plan(connection, query_text=query_text, limit=limit)
+    semantic = semantic_context(connection, query_text=query_text, limit=min(6, limit))
+    test_impact = assess_test_impact(connection, query_text=query_text, limit=min(6, limit))
+    guardrails = execution_guardrails(connection, query_text=query_text, limit=min(6, limit))
+    return _synthesize_context_bundle(
+        query=query_text,
+        query_kind="query",
+        anchor=None,
+        plan=plan,
+        semantic=semantic,
+        test_impact=test_impact,
+        guardrails=guardrails,
+        limit=limit,
+    )
 
 
 def _change_plan_for_file(
@@ -1329,6 +1440,44 @@ def _empty_execution_guardrails(query: str, query_kind: str) -> dict[str, object
     }
 
 
+def _empty_context_bundle(query: str, query_kind: str) -> dict[str, object]:
+    """Return an empty context-bundle payload."""
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": None,
+        "primary_context": [],
+        "supporting_context": [],
+        "optional_context": [],
+        "tests_to_consider": [],
+        "guardrails": {
+            "change_risk": {
+                "level": "medium",
+                "reason": "No matching anchor was found, so the system could not package a trusted working set.",
+            },
+            "pre_edit_checks": [],
+            "post_edit_checks": [],
+            "do_not_assume": [],
+            "watch_points": [],
+        },
+        "example_patterns": [],
+        "recommended_reading_order": [],
+        "recommended_next_actions": [],
+        "bundle_stats": {
+            "primary_count": 0,
+            "supporting_count": 0,
+            "optional_count": 0,
+            "tests_count": 0,
+            "example_count": 0,
+            "rough_token_estimate": 0,
+        },
+        "notes": [
+            "No matching anchor was found, so the bundle could not be synthesized from trusted structural context.",
+        ],
+    }
+
+
 def _synthesize_change_plan(
     *,
     query: str,
@@ -1460,6 +1609,571 @@ def _synthesize_change_plan(
         "notes": [
             "This plan is bounded and confidence-aware. It prioritizes direct structural companions over distant semantic examples.",
         ],
+    }
+
+
+def _synthesize_context_bundle(
+    *,
+    query: str,
+    query_kind: str,
+    anchor: dict[str, object] | None,
+    plan: dict[str, object],
+    semantic: dict[str, object],
+    test_impact: dict[str, object],
+    guardrails: dict[str, object],
+    limit: int,
+) -> dict[str, object]:
+    """Package trusted planning and safety outputs into one compact working set."""
+
+    semantic_lookup = _bundle_semantic_lookup(semantic)
+    seen_paths: set[str] = set()
+
+    if query_kind == "query":
+        primary_context = _bundle_seed_query_pattern(
+            [],
+            semantic_lookup,
+            test_impact=test_impact,
+            guardrails=guardrails,
+            seen_paths=seen_paths,
+            limit=min(4, limit),
+        )
+        primary_context.extend(
+            _bundle_context_from_plan_items(
+                list(plan.get("required_edits", [])),
+                semantic_lookup,
+                seen_paths=seen_paths,
+                limit=max(0, min(4, limit) - len(primary_context)),
+            )
+        )
+    else:
+        primary_context = _bundle_context_from_plan_items(
+            list(plan.get("required_edits", [])),
+            semantic_lookup,
+            seen_paths=seen_paths,
+            limit=min(4, limit),
+        )
+
+    supporting_context = _bundle_context_from_plan_items(
+        list(plan.get("likely_edits", [])),
+        semantic_lookup,
+        seen_paths=seen_paths,
+        limit=min(5, limit),
+    )
+    if query_kind == "query":
+        supporting_context = _bundle_seed_query_pattern(
+            supporting_context,
+            semantic_lookup,
+            test_impact=test_impact,
+            guardrails=guardrails,
+            seen_paths=seen_paths,
+            limit=min(5, limit),
+        )
+
+    optional_context = _bundle_context_from_plan_items(
+        list(plan.get("optional_edits", [])),
+        semantic_lookup,
+        seen_paths=seen_paths,
+        limit=min(4, limit),
+    )
+    optional_context.extend(
+        _bundle_context_from_semantic_examples(
+            semantic,
+            semantic_lookup,
+            seen_paths=seen_paths,
+            limit=max(0, min(4, limit) - len(optional_context)),
+        )
+    )
+    supporting_context, optional_context = _rebalance_rendering_bundle_contexts(
+        primary_context,
+        supporting_context,
+        optional_context,
+        supporting_limit=min(5, limit),
+        optional_limit=min(4, limit),
+    )
+
+    tests_to_consider = _bundle_tests_to_consider(test_impact, semantic_lookup, limit=min(4, limit))
+    example_patterns = _bundle_example_patterns(
+        query_kind=query_kind,
+        semantic=semantic,
+        test_impact=test_impact,
+        guardrails=guardrails,
+        semantic_lookup=semantic_lookup,
+        limit=min(3, limit),
+    )
+    recommended_reading_order = _bundle_recommended_reading_order(plan, limit=min(5, limit))
+    recommended_next_actions = _bundle_recommended_next_actions(plan, guardrails, test_impact, limit=min(5, limit))
+    guardrail_payload = _bundle_guardrails_payload(guardrails, limit=min(4, limit))
+    bundle_stats = _bundle_stats(
+        primary_context=primary_context,
+        supporting_context=supporting_context,
+        optional_context=optional_context,
+        tests_to_consider=tests_to_consider,
+        example_patterns=example_patterns,
+        guardrails=guardrail_payload,
+        recommended_reading_order=recommended_reading_order,
+        recommended_next_actions=recommended_next_actions,
+    )
+
+    notes = [
+        "This bundle is intentionally compact. It prioritizes direct implementation and validation context before broader examples.",
+    ]
+    if query_kind == "query":
+        notes.append(
+            "Free-text bundles materialize a representative structural pattern instead of pretending to identify one exact target file."
+        )
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": anchor or plan.get("anchor") or semantic.get("anchor"),
+        "primary_context": primary_context,
+        "supporting_context": supporting_context,
+        "optional_context": optional_context,
+        "tests_to_consider": tests_to_consider,
+        "guardrails": guardrail_payload,
+        "example_patterns": example_patterns,
+        "recommended_reading_order": recommended_reading_order,
+        "recommended_next_actions": recommended_next_actions,
+        "bundle_stats": bundle_stats,
+        "notes": notes,
+    }
+
+
+def _bundle_semantic_lookup(semantic: dict[str, object]) -> dict[tuple[str, str], dict[str, object]]:
+    """Return a small semantic lookup keyed by path/symbol and path-only fallbacks."""
+
+    lookup: dict[tuple[str, str], dict[str, object]] = {}
+    for key in ("primary_semantic_context", "secondary_semantic_context"):
+        for item in list(semantic.get(key, [])):
+            path = str(item.get("path") or "")
+            symbol = str(item.get("symbol") or "")
+            if not path:
+                continue
+            lookup[(path, symbol)] = dict(item)
+            lookup.setdefault((path, ""), dict(item))
+    return lookup
+
+
+def _bundle_context_from_plan_items(
+    items: list[dict[str, object]],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    *,
+    seen_paths: set[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded bundle context items from one plan bucket."""
+
+    bundled: list[dict[str, object]] = []
+    for item in items:
+        path = str(item.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        bundled.append(_bundle_context_item(item, semantic_lookup))
+        if len(bundled) >= limit:
+            break
+    return bundled
+
+
+def _bundle_seed_query_pattern(
+    items: list[dict[str, object]],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    *,
+    test_impact: dict[str, object],
+    guardrails: dict[str, object],
+    seen_paths: set[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Insert the canonical service pattern into free-text bundles when available."""
+
+    seeded = list(items)
+    for candidate in _bundle_canonical_query_pattern(test_impact, guardrails):
+        path = str(candidate.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        seeded.append(_bundle_context_item(candidate, semantic_lookup))
+        if len(seeded) >= limit:
+            break
+    return seeded[:limit]
+
+
+def _rebalance_rendering_bundle_contexts(
+    primary_context: list[dict[str, object]],
+    supporting_context: list[dict[str, object]],
+    optional_context: list[dict[str, object]],
+    *,
+    supporting_limit: int,
+    optional_limit: int,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Promote the strongest rendering companions into supporting context.
+
+    Rendering slices are most useful when the first non-anchor companions are
+    the direct output class, component-local renderer, and tied template. A
+    small rebalance here keeps those artifacts above lower-value spillover such
+    as root-level fallback renderers or generic base classes.
+    """
+
+    if not any(item.get("role") == "rendering_companion" for item in primary_context + supporting_context):
+        return supporting_context[:supporting_limit], optional_context[:optional_limit]
+
+    template_index = next(
+        (index for index, item in enumerate(optional_context) if str(item.get("path") or "").endswith(".mustache")),
+        None,
+    )
+    if template_index is None:
+        return supporting_context[:supporting_limit], optional_context[:optional_limit]
+
+    template_item = optional_context.pop(template_index)
+    demote_index = next(
+        (
+            index
+            for index, item in enumerate(supporting_context)
+            if (
+                str(item.get("path") or "").endswith("/renderer.php")
+                and "/classes/output/" not in str(item.get("path") or "")
+            )
+            or "assign_base.php" in str(item.get("path") or "")
+        ),
+        None,
+    )
+    if demote_index is not None:
+        demoted = supporting_context.pop(demote_index)
+        optional_context.insert(0, demoted)
+    supporting_context.append(template_item)
+    return supporting_context[:supporting_limit], optional_context[:optional_limit]
+
+
+def _bundle_canonical_query_pattern(
+    test_impact: dict[str, object],
+    guardrails: dict[str, object],
+) -> list[dict[str, object]]:
+    """Return one canonical implementation/registration/test pattern for free-text bundles."""
+
+    implementation = next(
+        (
+            item
+            for item in list(guardrails.get("pre_edit_checks", []))
+            if str(item.get("path") or "").endswith(".php")
+            and "/db/services.php" not in str(item.get("path") or "")
+            and not _test_file_path(str(item.get("path") or ""))
+        ),
+        None,
+    )
+    registration = next(
+        (
+            item
+            for item in list(test_impact.get("contract_checks", [])) + list(guardrails.get("pre_edit_checks", []))
+            if str(item.get("path") or "").endswith("/db/services.php")
+        ),
+        None,
+    )
+    test_item = next(
+        (
+            item
+            for item in list(test_impact.get("direct_tests", [])) + list(guardrails.get("post_edit_checks", []))
+            if _test_file_path(str(item.get("path") or ""))
+        ),
+        None,
+    )
+
+    pattern: list[dict[str, object]] = []
+    if implementation is not None:
+        pattern.append(
+            {
+                "path": implementation.get("path"),
+                "symbol": implementation.get("symbol"),
+                "change_role": "implementation",
+                "confidence": implementation.get("confidence", "high"),
+                "reason": "Representative external API implementation for this change pattern; inspect it first when applying a parameter or signature update.",
+            }
+        )
+    if registration is not None:
+        pattern.append(
+            {
+                "path": registration.get("path"),
+                "symbol": registration.get("symbol"),
+                "change_role": "entrypoint",
+                "confidence": registration.get("confidence", "high"),
+                "reason": "Representative service registration companion for this change pattern; compare it against the implementation when parameters or service wiring change.",
+            }
+        )
+    if test_item is not None:
+        pattern.append(
+            {
+                "path": test_item.get("path"),
+                "symbol": test_item.get("symbol"),
+                "change_role": "validation",
+                "confidence": test_item.get("confidence", "high"),
+                "reason": "Representative PHPUnit coverage for this change pattern; update and rerun it after changing service parameters or behavior.",
+            }
+        )
+    return pattern
+
+
+def _bundle_context_from_semantic_examples(
+    semantic: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    *,
+    seen_paths: set[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded optional example-oriented bundle context."""
+
+    bundled: list[dict[str, object]] = []
+    if limit <= 0:
+        return bundled
+    for item in list(semantic.get("secondary_semantic_context", [])):
+        path = str(item.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        bundled.append(
+            _bundle_context_item(
+                {
+                    "path": path,
+                    "symbol": item.get("symbol"),
+                    "change_role": "example_reference",
+                    "confidence": item.get("confidence", "medium"),
+                    "reason": str(item.get("explanation") or "Representative semantic example for this feature slice."),
+                },
+                semantic_lookup,
+            )
+        )
+        if len(bundled) >= limit:
+            break
+    return bundled
+
+
+def _bundle_context_item(
+    item: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+) -> dict[str, object]:
+    """Return one public bundle context item with compact summary/snippet metadata."""
+
+    path = str(item.get("path") or "")
+    symbol = str(item.get("symbol") or "")
+    semantic_item = semantic_lookup.get((path, symbol)) or semantic_lookup.get((path, ""))
+    role = str(item.get("change_role") or item.get("role") or "context")
+    public_item: dict[str, object] = {
+        "path": path,
+        "role": role,
+        "confidence": str(item.get("confidence") or "medium"),
+        "reason": str(item.get("reason") or ""),
+        "summary": _bundle_summary_for_item(item, semantic_item),
+    }
+    if symbol:
+        public_item["symbol"] = symbol
+    snippet = ""
+    if semantic_item is not None:
+        snippet = str(semantic_item.get("snippet") or semantic_item.get("summary") or "")
+    if snippet:
+        public_item["snippet"] = snippet
+    return public_item
+
+
+def _bundle_summary_for_item(
+    item: dict[str, object],
+    semantic_item: dict[str, object] | None,
+) -> str:
+    """Return a short bundle summary for one context item."""
+
+    if semantic_item is not None and str(semantic_item.get("summary") or "").strip():
+        return str(semantic_item["summary"])
+
+    role = str(item.get("change_role") or item.get("role") or "context")
+    path = str(item.get("path") or "")
+    summaries = {
+        "implementation": "Core implementation target in the bounded change surface.",
+        "entrypoint": "Registration or entrypoint companion that wires the implementation into Moodle.",
+        "validation": "Concrete automated coverage tied to this change surface.",
+        "rendering_companion": "Direct rendering companion in the same feature slice.",
+        "form_companion": "Direct form companion in the same feature slice.",
+        "framework_context": "Shared framework or base context that may constrain edits.",
+        "build_artifact": "Generated build artifact to verify or regenerate after source edits.",
+        "example_reference": "Representative example/reference for a similar implementation pattern.",
+    }
+    return summaries.get(role, f"Bounded supporting context from {path}.")
+
+
+def _bundle_tests_to_consider(
+    test_impact: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return compact direct and likely tests for one bundle."""
+
+    items: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    for source in ("direct_tests", "likely_tests"):
+        for item in list(test_impact.get(source, [])):
+            path = str(item.get("path") or "")
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            items.append(
+                _bundle_context_item(
+                    {
+                        "path": path,
+                        "symbol": item.get("symbol"),
+                        "change_role": "validation",
+                        "confidence": item.get("confidence", "medium"),
+                        "reason": item.get("reason", ""),
+                    },
+                    semantic_lookup,
+                )
+            )
+            if len(items) >= limit:
+                return items
+    return items
+
+
+def _bundle_example_patterns(
+    *,
+    query_kind: str,
+    semantic: dict[str, object],
+    test_impact: dict[str, object],
+    guardrails: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded example/reference items for a context bundle."""
+
+    examples: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    if query_kind == "query":
+        for item in _bundle_canonical_query_pattern(test_impact, guardrails):
+            path = str(item.get("path") or "")
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            examples.append(_bundle_context_item(item, semantic_lookup))
+            if len(examples) >= limit:
+                return examples
+    for item in list(semantic.get("secondary_semantic_context", [])):
+        path = str(item.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        examples.append(
+            _bundle_context_item(
+                {
+                    "path": path,
+                    "symbol": item.get("symbol"),
+                    "change_role": "example_reference",
+                    "confidence": item.get("confidence", "medium"),
+                    "reason": item.get("explanation", ""),
+                },
+                semantic_lookup,
+            )
+        )
+        if len(examples) >= limit:
+            break
+    return examples
+
+
+def _bundle_recommended_reading_order(plan: dict[str, object], *, limit: int) -> list[dict[str, object]]:
+    """Return a compact reading order derived from the existing change plan."""
+
+    order: list[dict[str, object]] = []
+    for item in list(plan.get("recommended_sequence", []))[:limit]:
+        order.append(
+            {
+                "step": item.get("step"),
+                "target": item.get("target"),
+                "why": item.get("why"),
+            }
+        )
+    return order
+
+
+def _bundle_recommended_next_actions(
+    plan: dict[str, object],
+    guardrails: dict[str, object],
+    test_impact: dict[str, object],
+    *,
+    limit: int,
+) -> list[str]:
+    """Return a short list of concrete next actions for an agent."""
+
+    actions: list[str] = []
+    seen: set[str] = set()
+    action_templates = {
+        "inspect_and_update": "Inspect the core implementation first and confirm the exact change surface before editing.",
+        "update_entrypoint": "Compare the implementation against the entrypoint or registration and update them together if the contract changes.",
+        "inspect_companion": "Inspect the nearest companion artifact before changing shared output, form, or framework assumptions.",
+        "validate_change": "Review the first validation target immediately after editing instead of waiting until the end.",
+        "review_reference_example": "Use the bundled example pattern only if the local slice still feels ambiguous after reading the primary context.",
+    }
+    for item in list(plan.get("recommended_sequence", [])):
+        template = action_templates.get(str(item.get("action") or ""))
+        if template and template not in seen:
+            seen.add(template)
+            actions.append(template)
+        if len(actions) >= limit:
+            return actions
+
+    for item in list(guardrails.get("pre_edit_checks", [])):
+        reason = str(item.get("reason") or "").strip()
+        if reason and reason not in seen:
+            seen.add(reason)
+            actions.append(reason)
+        if len(actions) >= limit:
+            return actions
+
+    for item in list(test_impact.get("contract_checks", [])):
+        reason = str(item.get("reason") or "").strip()
+        if reason and reason not in seen:
+            seen.add(reason)
+            actions.append(reason)
+        if len(actions) >= limit:
+            break
+    return actions[:limit]
+
+
+def _bundle_guardrails_payload(guardrails: dict[str, object], *, limit: int) -> dict[str, object]:
+    """Return the compact guardrail section for one bundle."""
+
+    return {
+        "change_risk": dict(guardrails.get("change_risk") or {}),
+        "pre_edit_checks": list(guardrails.get("pre_edit_checks", []))[:limit],
+        "post_edit_checks": list(guardrails.get("post_edit_checks", []))[:limit],
+        "do_not_assume": list(guardrails.get("do_not_assume", []))[: min(3, limit)],
+        "watch_points": list(guardrails.get("watch_points", []))[: min(3, limit)],
+    }
+
+
+def _bundle_stats(
+    *,
+    primary_context: list[dict[str, object]],
+    supporting_context: list[dict[str, object]],
+    optional_context: list[dict[str, object]],
+    tests_to_consider: list[dict[str, object]],
+    example_patterns: list[dict[str, object]],
+    guardrails: dict[str, object],
+    recommended_reading_order: list[dict[str, object]],
+    recommended_next_actions: list[str],
+) -> dict[str, int]:
+    """Return compactness metadata for one bundled working set."""
+
+    tokenish_source = {
+        "primary_context": primary_context,
+        "supporting_context": supporting_context,
+        "optional_context": optional_context,
+        "tests_to_consider": tests_to_consider,
+        "example_patterns": example_patterns,
+        "guardrails": guardrails,
+        "recommended_reading_order": recommended_reading_order,
+        "recommended_next_actions": recommended_next_actions,
+    }
+    return {
+        "primary_count": len(primary_context),
+        "supporting_count": len(supporting_context),
+        "optional_count": len(optional_context),
+        "tests_count": len(tests_to_consider),
+        "example_count": len(example_patterns),
+        "rough_token_estimate": max(1, int(len(json.dumps(tokenish_source, sort_keys=True)) / 4)),
     }
 
 def _semantic_context_for_symbol(

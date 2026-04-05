@@ -86,6 +86,24 @@ def test_cli_agent_endpoints_cover_service_js_and_free_text_workflows(
                 )
             ),
         ),
+        (
+            [
+                "build-context-bundle",
+                "--db-path",
+                str(classic_db_path),
+                "--query",
+                "add a parameter to a Moodle external API method and update its tests",
+            ],
+            lambda payload: (
+                payload["data"]["primary_context"][0]["path"] == "mod/assign/classes/external/remove_submission.php"
+                and payload["data"]["primary_context"][1]["path"] == "mod/assign/db/services.php"
+                and any(
+                    item["path"] == "mod/assign/tests/external/remove_submission_test.php"
+                    for item in payload["data"]["tests_to_consider"]
+                )
+                and payload["data"]["bundle_stats"]["primary_count"] <= 4
+            ),
+        ),
     ]
 
     for argv, predicate in commands:

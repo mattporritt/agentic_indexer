@@ -18,6 +18,7 @@ from moodle_indexer.indexer import build_index
 from moodle_indexer.json_output import dumps_json, error_payload, success_payload
 from moodle_indexer.queries import (
     assess_test_impact,
+    build_context_bundle,
     component_summary,
     dependency_neighborhood,
     execution_guardrails,
@@ -223,6 +224,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of guardrail items to return per section.",
     )
 
+    bundle_parser = subparsers.add_parser(
+        "build-context-bundle",
+        help="Return a compact, agent-usable context bundle around a symbol, file, or change goal.",
+    )
+    bundle_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    bundle_target = bundle_parser.add_mutually_exclusive_group(required=True)
+    bundle_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    bundle_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    bundle_target.add_argument(
+        "--query",
+        help="Free-text change goal such as add a parameter to a Moodle external API method and update its tests.",
+    )
+    bundle_parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="Maximum number of supporting or optional bundle items to return.",
+    )
+
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     file_parser.add_argument(
@@ -280,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_assess_test_impact(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "execution-guardrails":
             payload = run_execution_guardrails(args.db_path, args.symbol, args.file, args.query, args.limit)
+        elif args.command == "build-context-bundle":
+            payload = run_build_context_bundle(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -462,6 +487,31 @@ def run_execution_guardrails(
         return success_payload(
             "execution-guardrails",
             execution_guardrails(
+                connection,
+                symbol_query=symbol,
+                file_path=file_path,
+                query_text=query_text,
+                limit=limit,
+            ),
+        )
+    finally:
+        connection.close()
+
+
+def run_build_context_bundle(
+    db_path: str,
+    symbol: str | None,
+    file_path: str | None,
+    query_text: str | None,
+    limit: int,
+) -> dict:
+    """Return a compact agent-ready context bundle around a symbol, file, or goal."""
+
+    connection = open_database(Path(db_path))
+    try:
+        return success_payload(
+            "build-context-bundle",
+            build_context_bundle(
                 connection,
                 symbol_query=symbol,
                 file_path=file_path,

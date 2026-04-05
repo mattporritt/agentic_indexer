@@ -12,6 +12,7 @@ from moodle_indexer.queries import (
     _plan_profile_for_query,
     _representative_service_pattern,
     assess_test_impact,
+    build_context_bundle,
     execution_guardrails,
     propose_change_plan,
     semantic_context,
@@ -106,3 +107,106 @@ def test_execution_guardrails_free_text_materializes_service_pattern(classic_con
     ]
     assert "mod/assign/tests/external/start_submission_test.php" in post_paths
     assert any("canonical moodle service pattern" in item["reason"].lower() for item in payload["pre_edit_checks"])
+
+
+def test_build_context_bundle_service_slice_packages_core_working_set(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        symbol_query="mod_assign\\external\\start_submission::execute",
+    )
+
+    primary_paths = [item["path"] for item in bundle["primary_context"]]
+    test_paths = [item["path"] for item in bundle["tests_to_consider"]]
+
+    assert bundle["anchor"]["file"] == "mod/assign/classes/external/start_submission.php"
+    assert primary_paths[:3] == [
+        "mod/assign/classes/external/start_submission.php",
+        "mod/assign/db/services.php",
+        "mod/assign/tests/external/start_submission_test.php",
+    ]
+    assert "mod/assign/tests/external/start_submission_test.php" in test_paths
+    assert bundle["guardrails"]["change_risk"]["level"] == "medium"
+    assert bundle["recommended_reading_order"][0]["target"] == "mod/assign/classes/external/start_submission.php"
+    assert bundle["bundle_stats"]["primary_count"] <= 4
+
+
+def test_build_context_bundle_rendering_slice_stays_local_and_high_risk(classic_connection) -> None:
+    bundle = build_context_bundle(classic_connection, symbol_query="assign::view")
+
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+
+    assert bundle["guardrails"]["change_risk"]["level"] == "high"
+    assert bundle["recommended_reading_order"][0]["target"] == "mod/assign/locallib.php"
+    assert supporting_paths[:2] == [
+        "mod/assign/classes/output/grading_app.php",
+        "mod/assign/classes/output/renderer.php",
+    ]
+    assert "mod/assign/templates/grading_app.mustache" in supporting_paths
+    assert bundle["bundle_stats"]["supporting_count"] <= 5
+
+
+def test_build_context_bundle_provider_form_slice_packages_form_chain(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        symbol_query="aiprovider_openai\\provider::get_action_settings",
+    )
+
+    primary_paths = [item["path"] for item in bundle["primary_context"]]
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+
+    assert primary_paths[:2] == [
+        "ai/provider/openai/classes/provider.php",
+        "ai/provider/openai/classes/form/action_generate_image_form.php",
+    ]
+    assert supporting_paths[:3] == [
+        "ai/classes/form/action_settings_form.php",
+        "ai/provider/openai/classes/form/action_form.php",
+        "ai/classes/provider.php",
+    ]
+    assert "lib/formslib.php" in supporting_paths
+    assert bundle["guardrails"]["change_risk"]["level"] == "medium"
+
+
+def test_build_context_bundle_js_slice_packages_source_neighbors_and_build_artifact(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        symbol_query="core_ai/aiprovider_action_management_table",
+    )
+
+    primary_paths = [item["path"] for item in bundle["primary_context"]]
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+    optional_paths = [item["path"] for item in bundle["optional_context"]]
+
+    assert primary_paths == ["ai/amd/src/aiprovider_action_management_table.js"]
+    assert supporting_paths[:3] == [
+        "admin/amd/src/plugin_management_table.js",
+        "ai/amd/src/local_actions.js",
+        "lib/amd/src/ajax.js",
+    ]
+    assert "ai/amd/build/aiprovider_action_management_table.min.js" in optional_paths
+    assert bundle["guardrails"]["change_risk"]["level"] == "medium"
+
+
+def test_build_context_bundle_free_text_materializes_canonical_service_pattern(classic_connection) -> None:
+    bundle = build_context_bundle(classic_connection, query_text=FREE_TEXT_EXTERNAL_API_QUERY)
+
+    primary_paths = [item["path"] for item in bundle["primary_context"]]
+    example_paths = [item["path"] for item in bundle["example_patterns"]]
+    test_paths = [item["path"] for item in bundle["tests_to_consider"]]
+
+    assert primary_paths[:3] == [
+        "mod/assign/classes/external/remove_submission.php",
+        "mod/assign/db/services.php",
+        "mod/assign/tests/external/remove_submission_test.php",
+    ]
+    assert "mod/assign/tests/external/remove_submission_test.php" in test_paths
+    assert example_paths[:3] == [
+        "mod/assign/classes/external/remove_submission.php",
+        "mod/assign/db/services.php",
+        "mod/assign/tests/external/remove_submission_test.php",
+    ]
+    assert any(
+        "signature" in item["reason"].lower()
+        for item in bundle["guardrails"]["pre_edit_checks"] + bundle["guardrails"]["post_edit_checks"]
+    )
+    assert bundle["bundle_stats"]["primary_count"] <= 4
