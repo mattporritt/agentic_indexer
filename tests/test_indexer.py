@@ -1009,6 +1009,9 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         )
         assert service_neighborhood["primary_focus"]
         assert service_neighborhood["primary_focus"][0]["path"] == "mod/assign/db/services.php"
+        assert "mod/assign/classes/output/renderer.php" not in {
+            item["path"] for item in service_neighborhood["primary_focus"]
+        }
         caller_items = service_neighborhood["sections"]["likely_callers"]["items"]
         caller_paths = [item["path"] for item in caller_items]
         assert "mod/assign/db/services.php" in caller_paths
@@ -1020,6 +1023,7 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert "mod/assign/db/services.php" in {
             item["path"] for item in service_neighborhood["sections"]["linked_services"]["items"]
         }
+        assert "linked_framework" not in service_neighborhood["sections"]
         assert service_neighborhood["sections"]["likely_callers"]["summary"]
         assert all("confidence" in item and "explanation" in item and "score" in item for item in caller_items)
 

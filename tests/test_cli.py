@@ -434,6 +434,9 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     dependency_payload = json.loads(capsys.readouterr().out)
     assert dependency_payload["status"] == "ok"
     assert dependency_payload["data"]["primary_focus"]
+    assert "mod/assign/classes/output/renderer.php" not in {
+        item["path"] for item in dependency_payload["data"]["primary_focus"]
+    }
     assert dependency_payload["data"]["sections"]["likely_callers"]["summary"]
     caller_items = dependency_payload["data"]["sections"]["likely_callers"]["items"]
     assert caller_items[0]["path"] == "mod/assign/db/services.php"

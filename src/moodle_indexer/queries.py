@@ -1780,7 +1780,7 @@ def _finalize_dependency_sections(
         if merged:
             decorated = [_present_dependency_section_item(section_name, item) for item in merged]
             decorated = _calibrate_dependency_section_scores(section_name, decorated)
-            decorated = _prune_dependency_section_items(decorated, limit=section_limit)
+            decorated = _prune_dependency_section_items(section_name, decorated, limit=section_limit)
             if not decorated:
                 continue
             finalized_sections[section_name] = {
@@ -1790,10 +1790,39 @@ def _finalize_dependency_sections(
             focus_candidates.extend(
                 [{**item, "_section": section_name} for item in decorated]
             )
+    _prune_generic_service_framework_sections(finalized_sections)
     return {
         "primary_focus": _dependency_primary_focus(focus_candidates),
         "sections": finalized_sections,
     }
+
+
+def _prune_generic_service_framework_sections(
+    finalized_sections: dict[str, dict[str, object]],
+) -> None:
+    """Drop generic framework residue from service slices.
+
+    Service neighborhoods are most useful when they stay anchored on the
+    concrete API flow: registration, implementation, and tests. A generic
+    inherited base such as ``external_api`` can still be structurally correct,
+    but if that is the only remaining framework companion it adds more noise
+    than guidance. Keep richer framework sections for form-driven slices.
+    """
+
+    if "linked_services" not in finalized_sections or "linked_framework" not in finalized_sections:
+        return
+
+    framework_items = list(finalized_sections["linked_framework"].get("items", []))
+    if not framework_items:
+        finalized_sections.pop("linked_framework", None)
+        return
+
+    only_generic_class_files = all(
+        str(item.get("type")) == "class_file" and str(item.get("path")) == "lib/externallib.php"
+        for item in framework_items
+    )
+    if only_generic_class_files:
+        finalized_sections.pop("linked_framework", None)
 
 
 def _merge_dependency_section_items(
@@ -1882,6 +1911,12 @@ def _dependency_primary_focus(items: list[dict[str, object]]) -> list[dict[str, 
         and float(item["score"]) >= 0.6
         and not _dependency_primary_focus_excluded(item)
     ]
+    if any(str(item["relationship"]) == "service_definition" for item in eligible):
+        eligible = [
+            item
+            for item in eligible
+            if str(item["_section"]) not in {"linked_rendering_artifacts", "linked_framework"}
+        ]
     if not eligible:
         return []
 
@@ -2195,6 +2230,7 @@ def _calibrate_dependency_section_scores(
 
 
 def _prune_dependency_section_items(
+    section_name: str,
     items: list[dict[str, object]],
     *,
     limit: int,
@@ -2208,6 +2244,9 @@ def _prune_dependency_section_items(
             continue
         if float(item["score"]) < 0.35 and str(item["confidence"]) == "low":
             continue
+        if section_name == "linked_framework" and len(items) > 2:
+            if str(item["type"]) == "class_file" and float(item["score"]) <= 0.5:
+                continue
         pruned.append(item)
     return pruned[: min(limit, 8)]
 
