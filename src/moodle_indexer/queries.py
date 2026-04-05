@@ -977,17 +977,28 @@ def _semantic_context_for_query(
     query_tokens = _semantic_focus_tokens(query_text)
     query_intent = _semantic_query_intent(query_tokens)
     candidates = _collect_matching_semantic_chunks(connection, query_tokens, language=None, limit=80)
-    ranked = _semantic_rank_query_candidates(query_text, query_tokens, candidates, limit=limit * 2)
+    ranked = _semantic_rank_query_candidates(
+        connection,
+        query_text,
+        query_tokens,
+        candidates,
+        limit=limit * 2,
+    )
     primary = _semantic_query_primary_items(ranked, query_intent, limit=min(limit, 5))
-    secondary = ranked[min(limit, 5) : min(len(ranked), limit * 2)]
+    secondary = _semantic_query_secondary_items(
+        ranked,
+        primary,
+        query_intent,
+        limit=min(len(ranked), limit * 2),
+    )
     return {
         "query": query_text,
         "query_kind": "query",
         "anchor": None,
         "matched_definitions": [],
         "total_matches": len(ranked),
-        "primary_semantic_context": primary,
-        "secondary_semantic_context": secondary,
+        "primary_semantic_context": _semantic_public_query_items(primary),
+        "secondary_semantic_context": _semantic_public_query_items(secondary),
     }
 
 
@@ -1010,28 +1021,63 @@ def _semantic_query_primary_items(
 
     primary: list[dict[str, object]] = []
     seen_paths: set[str] = set()
+    seen_pairs: set[str] = set()
 
-    def take_first(predicate: Callable[[dict[str, object]], bool]) -> None:
-        for item in ranked:
+    pair_groups = _semantic_query_pair_groups(ranked)
+    for pair_id, items in pair_groups:
+        if len(primary) >= limit:
+            break
+        seen_pairs.add(pair_id)
+        for item in items:
             path = str(item["path"])
-            if path in seen_paths or not predicate(item):
+            if path in seen_paths:
                 continue
             seen_paths.add(path)
             primary.append(item)
-            return
-
-    take_first(lambda item: str(item.get("summary") or "").startswith("external_api_class"))
-    take_first(lambda item: "/tests/external/" in str(item["path"]))
+            if len(primary) >= limit:
+                break
 
     for item in ranked:
         path = str(item["path"])
         if path in seen_paths:
+            continue
+        pair_id = str(item.get("_pair_id") or "")
+        if pair_id and pair_id in seen_pairs:
             continue
         seen_paths.add(path)
         primary.append(item)
         if len(primary) >= limit:
             break
     return primary[:limit]
+
+
+def _semantic_query_secondary_items(
+    ranked: list[dict[str, object]],
+    primary: list[dict[str, object]],
+    query_intent: dict[str, bool],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return free-text secondary items with primary overlap removed."""
+
+    primary_paths = {str(item["path"]) for item in primary}
+    primary_pairs = {str(item.get("_pair_id") or "") for item in primary if item.get("_pair_id")}
+
+    secondary: list[dict[str, object]] = []
+    for item in ranked:
+        path = str(item["path"])
+        pair_id = str(item.get("_pair_id") or "")
+        if path in primary_paths:
+            continue
+        if pair_id and pair_id in primary_pairs:
+            continue
+        secondary.append(item)
+        if len(secondary) >= limit:
+            break
+
+    if query_intent["external_api"] and query_intent["tests"]:
+        return secondary[: min(limit, 10)]
+    return secondary[:limit]
 
 
 def _semantic_primary_items_from_sections(
@@ -1181,6 +1227,7 @@ def _semantic_secondary_items_for_anchor(
 
 
 def _semantic_rank_query_candidates(
+    connection: sqlite3.Connection,
     query_text: str,
     query_tokens: list[str],
     candidates: list[SemanticChunk],
@@ -1190,7 +1237,8 @@ def _semantic_rank_query_candidates(
     """Return bounded free-text semantic matches."""
 
     query_intent = _semantic_query_intent(query_tokens)
-    ranked: list[dict[str, object]] = []
+    prepared: list[tuple[SemanticChunk, float, float, dict[str, object]]] = []
+    candidate_paths = {chunk.path for chunk in _deduplicate_semantic_chunks(candidates)}
     for chunk in _deduplicate_semantic_chunks(candidates):
         lexical = _semantic_overlap_score(query_text, chunk.text)
         semantic = _semantic_similarity(query_text, chunk.text)
@@ -1204,26 +1252,66 @@ def _semantic_rank_query_candidates(
         )
         score = _semantic_soft_score(raw_score, cap=0.9)
         score *= _semantic_query_intent_multiplier(query_intent, chunk)
+        pair_meta = _semantic_query_pair_metadata(connection, chunk, candidate_paths)
+        score += _semantic_query_pair_bonus(query_intent, chunk, pair_meta)
         score = round(min(0.9, score), 3)
-        if score < 0.35:
+        minimum_score = 0.33 if pair_meta["has_pair"] else 0.35
+        if score < minimum_score:
+            continue
+        prepared.append(
+            (
+                chunk,
+                lexical,
+                semantic,
+                {
+                    "score": score,
+                    "pair_id": pair_meta["pair_id"],
+                    "paired_path": pair_meta["paired_path"],
+                    "_pair_id": pair_meta["pair_id"],
+                    "_paired_path": pair_meta["paired_path"],
+                    "has_pair": pair_meta["has_pair"],
+                },
+            )
+        )
+    ranked: list[dict[str, object]] = []
+    for chunk, lexical, semantic, pair_meta in prepared:
+        explanation = _semantic_query_explanation(query_text, chunk, pair_meta)
+        if not explanation:
             continue
         ranked.append(
             {
                 "path": chunk.path,
                 "symbol": chunk.symbol,
                 "chunk_id": chunk.chunk_id,
-                "score": score,
+                "score": pair_meta["score"],
                 "retrieval_sources": _semantic_sources(lexical, semantic),
-                "explanation": _semantic_query_explanation(query_text, chunk),
-                "why_relevant_to_anchor": _semantic_query_relevance(query_tokens, chunk),
+                "explanation": explanation,
+                "why_relevant_to_anchor": _semantic_query_relevance(query_tokens, chunk, pair_meta),
                 "snippet": chunk.snippet or chunk.summary,
                 "summary": chunk.summary,
-                "confidence": "medium" if score < 0.62 else "high",
+                "confidence": "medium" if pair_meta["score"] < 0.62 else "high",
                 "result_kind": "query_match",
+                "_pair_id": pair_meta["_pair_id"],
+                "_paired_path": pair_meta["_paired_path"],
             }
         )
     ranked.sort(key=lambda item: (-float(item["score"]), str(item["path"]), str(item.get("symbol") or "")))
     return _merge_semantic_results(ranked)[:limit]
+
+
+def _semantic_public_query_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Strip free-text pairing internals before returning results."""
+
+    public_items: list[dict[str, object]] = []
+    for item in items:
+        public_items.append(
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"pair_id", "paired_path", "_pair_id", "_paired_path"}
+            }
+        )
+    return public_items
 
 
 def _semantic_anchor_item(anchor_chunk: SemanticChunk) -> dict[str, object]:
@@ -1462,26 +1550,50 @@ def _semantic_similar_relevance(
     return f"Retrieved because it {', '.join(reasons)}."
 
 
-def _semantic_query_explanation(query_text: str, chunk: SemanticChunk) -> str:
+def _semantic_query_explanation(
+    query_text: str,
+    chunk: SemanticChunk,
+    pair_meta: dict[str, object],
+) -> str:
     """Return a decision-ready explanation for one free-text retrieval result."""
 
     kind = _semantic_human_kind(chunk)
+    paired_path = str(pair_meta.get("paired_path") or "")
     if chunk.file_role == "services_definition":
         return f"Service registration matched the free-text query '{query_text}'; inspect it when you need a concrete web-service entrypoint example or service wiring reference."
     if chunk.file_role == "external_api_class":
+        if paired_path:
+            return (
+                f"External API implementation matched the free-text query '{query_text}' and has a concrete paired PHPUnit file "
+                f"({paired_path}); inspect it when you need a canonical implementation example plus coverage."
+            )
         return f"External API implementation matched the free-text query '{query_text}'; inspect it when you need a concrete web-service method example or API contract pattern."
     if chunk.source_kind == "test":
+        if paired_path:
+            return (
+                f"Concrete test matched the free-text query '{query_text}' and pairs with implementation "
+                f"{paired_path}; inspect it when you need PHPUnit-backed examples for the same API pattern."
+            )
         return f"Concrete test matched the free-text query '{query_text}'; inspect it when you need PHPUnit-backed examples or expected behavior for a similar workflow."
     return f"{kind.capitalize()} matched the free-text query '{query_text}'; inspect it if you need a concrete code example or local implementation context."
 
 
-def _semantic_query_relevance(query_tokens: list[str], chunk: SemanticChunk) -> str:
+def _semantic_query_relevance(
+    query_tokens: list[str],
+    chunk: SemanticChunk,
+    pair_meta: dict[str, object],
+) -> str:
     """Return a concise relevance explanation for free-text retrieval."""
 
     shared = [token for token in query_tokens if token in chunk.text.lower()][:4]
+    paired_path = str(pair_meta.get("paired_path") or "")
+    if paired_path:
+        pair_note = f" Paired with {paired_path}."
+    else:
+        pair_note = ""
     if shared:
-        return f"Matched the query through shared terms: {', '.join(shared)}."
-    return "Matched the query through bounded lexical and hashed-vector similarity."
+        return f"Matched the query through shared terms: {', '.join(shared)}.{pair_note}"
+    return f"Matched the query through bounded lexical and hashed-vector similarity.{pair_note}"
 
 
 def _semantic_sources(lexical: float, semantic: float) -> list[str]:
@@ -1494,6 +1606,116 @@ def _semantic_sources(lexical: float, semantic: float) -> list[str]:
         sources.append("semantic")
     sources.append("rerank")
     return sources
+
+
+def _semantic_query_pair_groups(
+    ranked: list[dict[str, object]],
+) -> list[tuple[str, list[dict[str, object]]]]:
+    """Return strong implementation/test groups for free-text ranking."""
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for item in ranked:
+        pair_id = str(item.get("_pair_id") or "")
+        if not pair_id:
+            continue
+        grouped.setdefault(pair_id, []).append(item)
+
+    complete_groups: list[tuple[str, list[dict[str, object]]]] = []
+    for pair_id, items in grouped.items():
+        has_test = any(_is_concrete_test_path(str(item["path"])) for item in items)
+        has_impl = any(_is_service_implementation_path(str(item["path"])) for item in items)
+        if not (has_test and has_impl):
+            continue
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                0 if _is_service_implementation_path(str(item["path"])) else 1,
+                -float(item["score"]),
+                str(item["path"]),
+            ),
+        )
+        complete_groups.append((pair_id, ordered[:2]))
+
+    complete_groups.sort(
+        key=lambda group: (
+            -max(float(item["score"]) for item in group[1]),
+            group[0],
+        )
+    )
+    return complete_groups
+
+
+def _semantic_query_pair_metadata(
+    connection: sqlite3.Connection,
+    chunk: SemanticChunk,
+    candidate_paths: set[str],
+) -> dict[str, object]:
+    """Return implementation/test pairing metadata for free-text results."""
+
+    path = chunk.path
+    pair_id = ""
+    paired_path = ""
+
+    if _is_service_implementation_path(path):
+        pair_id = path
+        for candidate in _semantic_query_test_candidates_for_path(connection, path):
+            if candidate in candidate_paths:
+                paired_path = candidate
+                break
+    elif _is_concrete_test_path(path):
+        implementation_path = _semantic_query_implementation_for_test_path(path)
+        if implementation_path:
+            pair_id = implementation_path
+            if implementation_path in candidate_paths:
+                paired_path = implementation_path
+    return {
+        "pair_id": pair_id,
+        "paired_path": paired_path,
+        "has_pair": bool(pair_id and paired_path),
+    }
+
+
+def _semantic_query_pair_bonus(
+    query_intent: dict[str, bool],
+    chunk: SemanticChunk,
+    pair_meta: dict[str, object],
+) -> float:
+    """Return a small bonus or penalty for paired free-text examples."""
+
+    if not (query_intent["external_api"] and query_intent["tests"]):
+        return 0.0
+    path = chunk.path
+    has_pair = bool(pair_meta["has_pair"])
+    if _is_service_implementation_path(path):
+        return 0.12 if has_pair else -0.02
+    if _is_concrete_test_path(path):
+        return 0.08 if has_pair else -0.08
+    return 0.0
+
+
+def _semantic_query_test_candidates_for_path(
+    connection: sqlite3.Connection,
+    implementation_path: str,
+) -> list[str]:
+    """Return likely concrete tests for one implementation path."""
+
+    webservice_stub = {"resolved_target_file": implementation_path, "classname": None}
+    return [item["file"] for item in _service_tests_for_definition(connection, webservice_stub)]
+
+
+def _semantic_query_implementation_for_test_path(path: str) -> str | None:
+    """Return the most likely implementation paired with one concrete test path."""
+
+    if path.endswith("/tests/externallib_test.php") or path.endswith("/tests/externallib_advanced_testcase.php"):
+        return path.replace("/tests/externallib_test.php", "/externallib.php").replace(
+            "/tests/externallib_advanced_testcase.php",
+            "/externallib.php",
+        )
+    if "/tests/external/" in path and path.endswith("_test.php"):
+        component_root, class_suffix = path.split("/tests/external/", 1)
+        class_name = class_suffix.removesuffix("_test.php")
+        return f"{component_root}/classes/external/{class_name}.php"
+    return None
 
 
 def _semantic_soft_score(raw_score: float, *, cap: float) -> float:

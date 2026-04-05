@@ -1141,11 +1141,15 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
             query_text="examples of Moodle external API methods with PHPUnit coverage",
         )
         free_text_paths = [item["path"] for item in free_text_semantic["primary_semantic_context"]]
-        assert any("/classes/external/" in path or path.endswith("/db/services.php") for path in free_text_paths)
+        assert any("/classes/external/" in path or path.endswith("/db/services.php") or path.endswith("/externallib.php") for path in free_text_paths)
         assert any("/tests/external/" in path or path.endswith("_test.php") for path in free_text_paths)
+        first_two = free_text_paths[:2]
+        assert any("/classes/external/" in path or path.endswith("/externallib.php") for path in first_two)
+        assert any("/tests/external/" in path or path.endswith("_test.php") for path in first_two)
         free_text_secondary_paths = [item["path"] for item in free_text_semantic["secondary_semantic_context"]]
         assert any("/classes/external/" in path or path.endswith("/db/services.php") for path in free_text_paths + free_text_secondary_paths)
         assert len(free_text_semantic["primary_semantic_context"]) <= 5
+        assert not (set(free_text_paths) & set(free_text_secondary_paths))
 
         service_file_semantic = semantic_context(
             connection,
