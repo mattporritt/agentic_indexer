@@ -24,6 +24,7 @@ from moodle_indexer.queries import (
     find_definition,
     find_related_definitions,
     find_symbol,
+    semantic_context,
     suggest_edit_surface,
     suggest_related,
 )
@@ -1078,6 +1079,57 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         }
         assert "linked_rendering_artifacts" not in js_neighborhood["sections"]
         assert all("confidence" in item and "explanation" in item and "score" in item for item in js_neighborhood["sections"]["likely_callees"]["items"])
+
+        service_semantic = semantic_context(
+            connection,
+            symbol_query="mod_assign\\external\\start_submission::execute",
+        )
+        assert service_semantic["anchor"]["symbol"] == "mod_assign\\external\\start_submission::execute"
+        assert service_semantic["primary_semantic_context"][0]["chunk_id"] == "symbol:mod_assign\\external\\start_submission::execute"
+        service_primary_paths = [item["path"] for item in service_semantic["primary_semantic_context"]]
+        assert "mod/assign/db/services.php" in service_primary_paths
+        assert "mod/assign/tests/external/start_submission_test.php" in service_primary_paths
+        assert any(item["result_kind"] == "similar_example" for item in service_semantic["secondary_semantic_context"])
+        assert all(item["retrieval_sources"] for item in service_semantic["primary_semantic_context"])
+
+        rendering_semantic = semantic_context(
+            connection,
+            symbol_query="assign::view",
+        )
+        assert rendering_semantic["primary_semantic_context"][0]["chunk_id"] == "symbol:assign::view"
+        rendering_primary_paths = [item["path"] for item in rendering_semantic["primary_semantic_context"]]
+        assert "mod/assign/classes/output/grading_app.php" in rendering_primary_paths
+        assert "mod/assign/classes/output/renderer.php" in rendering_primary_paths
+
+        provider_semantic = semantic_context(
+            connection,
+            symbol_query="aiprovider_openai\\provider::get_action_settings",
+        )
+        provider_primary_paths = [item["path"] for item in provider_semantic["primary_semantic_context"]]
+        assert provider_semantic["primary_semantic_context"][0]["chunk_id"] == "symbol:aiprovider_openai\\provider::get_action_settings"
+        assert "ai/provider/openai/classes/form/action_form.php" in provider_primary_paths
+        assert "ai/classes/form/action_settings_form.php" in provider_primary_paths
+        assert "lib/formslib.php" in provider_primary_paths
+
+        js_semantic = semantic_context(
+            connection,
+            symbol_query="core_ai/aiprovider_action_management_table",
+        )
+        js_primary_paths = [item["path"] for item in js_semantic["primary_semantic_context"]]
+        assert js_semantic["primary_semantic_context"][0]["chunk_id"] == "js:core_ai/aiprovider_action_management_table"
+        assert "admin/amd/src/plugin_management_table.js" in js_primary_paths
+        assert "lib/amd/src/ajax.js" in js_primary_paths
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_primary_paths
+
+        free_text_semantic = semantic_context(
+            connection,
+            query_text="examples of Moodle external API methods with PHPUnit coverage",
+        )
+        free_text_paths = [item["path"] for item in free_text_semantic["primary_semantic_context"]]
+        assert any(path.endswith("start_submission_test.php") for path in free_text_paths)
+        free_text_secondary_paths = [item["path"] for item in free_text_semantic["secondary_semantic_context"]]
+        assert any(path.endswith("start_submission.php") for path in free_text_paths + free_text_secondary_paths)
+        assert len(free_text_semantic["primary_semantic_context"]) <= 5
     finally:
         connection.close()
 

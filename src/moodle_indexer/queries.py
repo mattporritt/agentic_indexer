@@ -6,9 +6,12 @@ out of the command-line interface layer.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -35,6 +38,25 @@ class JsDefinitionCandidate:
 
     row: sqlite3.Row
     matched_via: str = "direct_definition"
+
+
+@dataclass(slots=True)
+class SemanticChunk:
+    """A deterministic structural chunk used by the Phase 4D hybrid retriever."""
+
+    chunk_id: str
+    path: str
+    symbol: str | None
+    component: str
+    file_role: str
+    language: str
+    symbol_type: str | None
+    line: int | None
+    source_kind: str
+    title: str
+    summary: str
+    text: str
+    snippet: str | None = None
 
 
 def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
@@ -831,6 +853,1511 @@ def dependency_neighborhood(
     }
     payload.update(_dependency_sections_for_file_context(context, limit=limit))
     return payload
+
+
+def semantic_context(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    query_text: str | None = None,
+    limit: int = 10,
+) -> dict[str, object]:
+    """Return bounded hybrid semantic context around a symbol, file, or query.
+
+    Phase 4D keeps structural navigation as the spine:
+    - resolve the user's structural anchor first when a symbol or file is given
+    - seed retrieval with the existing bounded dependency neighborhood
+    - expand with lexical + hashed-vector similarity over deterministic chunks
+    - rerank so direct structural context stays ahead of distant similar examples
+    """
+
+    targets = [bool(symbol_query), bool(file_path), bool(query_text)]
+    if sum(targets) != 1:
+        raise ValidationError("Provide exactly one of --symbol, --file, or --query.")
+
+    bounded_limit = max(1, min(limit, 10))
+    if symbol_query:
+        return _semantic_context_for_symbol(connection, symbol_query, bounded_limit)
+    if file_path:
+        return _semantic_context_for_file(connection, file_path, bounded_limit)
+    return _semantic_context_for_query(connection, query_text or "", bounded_limit)
+
+
+def _semantic_context_for_symbol(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return semantic context anchored on one resolved symbol."""
+
+    definition_data = find_definition(connection, symbol_query, limit=max(1, min(limit, 4)), include_usages=False)
+    matches = definition_data["matches"]
+    if not matches:
+        return {
+            "query": symbol_query,
+            "query_kind": "symbol",
+            "anchor": None,
+            "matched_definitions": [],
+            "total_matches": 0,
+            "primary_semantic_context": [],
+            "secondary_semantic_context": [],
+        }
+
+    anchor_match = matches[0]
+    anchor_chunk = _semantic_chunk_from_definition_match(connection, anchor_match)
+    neighborhood = dependency_neighborhood(connection, symbol_query=symbol_query, limit=min(6, limit))
+    primary_items = _semantic_primary_items_from_sections(
+        connection,
+        neighborhood["sections"],
+        anchor_chunk=anchor_chunk,
+        anchor_query=symbol_query,
+        limit=limit,
+    )
+    secondary_items = _semantic_secondary_items_for_anchor(
+        connection,
+        anchor_chunk=anchor_chunk,
+        anchor_query=symbol_query,
+        structural_items=primary_items,
+        limit=limit,
+    )
+    return {
+        "query": symbol_query,
+        "query_kind": "symbol",
+        "anchor": _semantic_anchor_summary(anchor_chunk),
+        "matched_definitions": [_compact_match_summary(item) for item in matches],
+        "total_matches": definition_data["total_matches"],
+        "primary_semantic_context": primary_items[:limit],
+        "secondary_semantic_context": secondary_items[:limit],
+    }
+
+
+def _semantic_context_for_file(
+    connection: sqlite3.Connection,
+    file_path: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return semantic context anchored on one indexed file."""
+
+    context = file_context(connection, file_path)
+    anchor_chunk = _semantic_chunk_from_file_context(connection, context)
+    neighborhood = dependency_neighborhood(connection, file_path=file_path, limit=min(6, limit))
+    primary_items = _semantic_primary_items_from_sections(
+        connection,
+        neighborhood["sections"],
+        anchor_chunk=anchor_chunk,
+        anchor_query=context["moodle_path"],
+        limit=limit,
+    )
+    secondary_items = _semantic_secondary_items_for_anchor(
+        connection,
+        anchor_chunk=anchor_chunk,
+        anchor_query=context["moodle_path"],
+        structural_items=primary_items,
+        limit=limit,
+    )
+    return {
+        "query": context["moodle_path"],
+        "query_kind": "file",
+        "anchor": _semantic_anchor_summary(anchor_chunk),
+        "matched_definitions": [],
+        "total_matches": 1,
+        "primary_semantic_context": primary_items[:limit],
+        "secondary_semantic_context": secondary_items[:limit],
+    }
+
+
+def _semantic_context_for_query(
+    connection: sqlite3.Connection,
+    query_text: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return bounded semantic context for a free-text query."""
+
+    query_tokens = _semantic_focus_tokens(query_text)
+    candidates = _collect_matching_semantic_chunks(connection, query_tokens, language=None, limit=80)
+    ranked = _semantic_rank_query_candidates(query_text, query_tokens, candidates, limit=limit * 2)
+    primary = ranked[: min(limit, 5)]
+    secondary = ranked[min(limit, 5) : min(len(ranked), limit * 2)]
+    return {
+        "query": query_text,
+        "query_kind": "query",
+        "anchor": None,
+        "matched_definitions": [],
+        "total_matches": len(ranked),
+        "primary_semantic_context": primary,
+        "secondary_semantic_context": secondary,
+    }
+
+
+def _semantic_primary_items_from_sections(
+    connection: sqlite3.Connection,
+    sections: dict[str, dict[str, object]],
+    *,
+    anchor_chunk: SemanticChunk,
+    anchor_query: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded anchor-local semantic items from dependency sections."""
+
+    items = [
+        _semantic_anchor_item(anchor_chunk),
+    ]
+    for section_name, payload in sections.items():
+        for raw_item in list(payload.get("items", []))[:4]:
+            chunk = _semantic_chunk_from_reference(
+                connection,
+                path=str(raw_item["path"]),
+                symbol=str(raw_item.get("symbol") or "") or None,
+            )
+            if chunk is None:
+                continue
+            lexical = _semantic_overlap_score(anchor_query, chunk.text)
+            semantic = _semantic_similarity(anchor_chunk.text, chunk.text)
+            score = min(
+                1.0,
+                _semantic_structural_base(section_name, str(raw_item.get("confidence") or "medium"))
+                + _semantic_anchor_section_bonus(anchor_chunk, section_name, raw_item)
+                + lexical * 0.12
+                + semantic * 0.14
+                + (0.06 if _same_component_root(anchor_chunk.path, chunk.path) else 0.0),
+            )
+            retrieval_sources = ["structural"]
+            if lexical >= 0.12:
+                retrieval_sources.append("lexical")
+            if semantic >= 0.18:
+                retrieval_sources.append("semantic")
+            retrieval_sources.append("rerank")
+            items.append(
+                {
+                    "path": chunk.path,
+                    "symbol": chunk.symbol,
+                    "chunk_id": chunk.chunk_id,
+                    "score": round(score, 3),
+                    "retrieval_sources": retrieval_sources,
+                    "explanation": str(raw_item.get("explanation") or ""),
+                    "why_relevant_to_anchor": _semantic_structural_relevance(section_name, raw_item, anchor_chunk),
+                    "snippet": chunk.snippet or chunk.summary,
+                    "summary": chunk.summary,
+                    "confidence": raw_item.get("confidence", "medium"),
+                    "result_kind": "local_context",
+                }
+            )
+    return _merge_semantic_results(items)[: min(limit, 8)]
+
+
+def _semantic_secondary_items_for_anchor(
+    connection: sqlite3.Connection,
+    *,
+    anchor_chunk: SemanticChunk,
+    anchor_query: str,
+    structural_items: list[dict[str, object]],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return semantically similar examples constrained by the anchor."""
+
+    excluded = {str(item["chunk_id"]) for item in structural_items}
+    query_tokens = _semantic_focus_tokens(anchor_query + " " + anchor_chunk.text)
+    candidates = _collect_component_semantic_chunks(
+        connection,
+        component_name=anchor_chunk.component,
+        language=anchor_chunk.language,
+        limit=80,
+    )
+    candidates.extend(
+        _collect_matching_semantic_chunks(
+            connection,
+            query_tokens,
+            language=anchor_chunk.language,
+            limit=80,
+        )
+    )
+    ranked: list[dict[str, object]] = []
+    for chunk in _deduplicate_semantic_chunks(candidates):
+        if chunk.chunk_id in excluded or chunk.chunk_id == anchor_chunk.chunk_id:
+            continue
+        lexical = _semantic_overlap_score(anchor_query + " " + anchor_chunk.title, chunk.text)
+        semantic = _semantic_similarity(anchor_chunk.text, chunk.text)
+        if lexical <= 0.0 and semantic < 0.24:
+            continue
+        role_bonus = 0.12 if chunk.file_role == anchor_chunk.file_role else 0.0
+        language_bonus = 0.1 if chunk.language == anchor_chunk.language else 0.0
+        symbol_bonus = 0.08 if chunk.symbol_type and chunk.symbol_type == anchor_chunk.symbol_type else 0.0
+        component_bonus = 0.08 if chunk.component == anchor_chunk.component else 0.0
+        score = min(1.0, lexical * 0.22 + semantic * 0.38 + role_bonus + language_bonus + symbol_bonus + component_bonus)
+        if score < 0.36:
+            continue
+        ranked.append(
+            {
+                "path": chunk.path,
+                "symbol": chunk.symbol,
+                "chunk_id": chunk.chunk_id,
+                "score": round(score, 3),
+                "retrieval_sources": _semantic_sources(lexical, semantic),
+                "explanation": _semantic_similar_explanation(anchor_chunk, chunk),
+                "why_relevant_to_anchor": _semantic_similar_relevance(anchor_chunk, chunk, lexical, semantic),
+                "snippet": chunk.snippet or chunk.summary,
+                "summary": chunk.summary,
+                "confidence": "medium" if score < 0.62 else "high",
+                "result_kind": "similar_example",
+            }
+        )
+    ranked.sort(key=lambda item: (-float(item["score"]), str(item["path"]), str(item.get("symbol") or "")))
+    return ranked[: min(limit, 6)]
+
+
+def _semantic_rank_query_candidates(
+    query_text: str,
+    query_tokens: list[str],
+    candidates: list[SemanticChunk],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded free-text semantic matches."""
+
+    ranked: list[dict[str, object]] = []
+    for chunk in _deduplicate_semantic_chunks(candidates):
+        lexical = _semantic_overlap_score(query_text, chunk.text)
+        semantic = _semantic_similarity(query_text, chunk.text)
+        if lexical <= 0.0 and semantic < 0.2:
+            continue
+        score = min(
+            1.0,
+            lexical * 0.35
+            + semantic * 0.45
+            + (0.1 if any(token in chunk.text.lower() for token in query_tokens[:2]) else 0.0)
+            + _semantic_query_kind_bonus(query_tokens, chunk),
+        )
+        ranked.append(
+            {
+                "path": chunk.path,
+                "symbol": chunk.symbol,
+                "chunk_id": chunk.chunk_id,
+                "score": round(score, 3),
+                "retrieval_sources": _semantic_sources(lexical, semantic),
+                "explanation": _semantic_query_explanation(query_text, chunk),
+                "why_relevant_to_anchor": _semantic_query_relevance(query_tokens, chunk),
+                "snippet": chunk.snippet or chunk.summary,
+                "summary": chunk.summary,
+                "confidence": "medium" if score < 0.62 else "high",
+                "result_kind": "query_match",
+            }
+        )
+    ranked.sort(key=lambda item: (-float(item["score"]), str(item["path"]), str(item.get("symbol") or "")))
+    return _merge_semantic_results(ranked)[:limit]
+
+
+def _semantic_anchor_item(anchor_chunk: SemanticChunk) -> dict[str, object]:
+    """Return the resolved anchor as the first semantic-context item."""
+
+    return {
+        "path": anchor_chunk.path,
+        "symbol": anchor_chunk.symbol,
+        "chunk_id": anchor_chunk.chunk_id,
+        "score": 1.0,
+        "retrieval_sources": ["structural", "rerank"],
+        "explanation": "Resolved anchor definition/file for this query; start here before broadening into linked context or similar examples.",
+        "why_relevant_to_anchor": "This is the structural anchor the semantic retrieval is centered on.",
+        "snippet": anchor_chunk.snippet or anchor_chunk.summary,
+        "summary": anchor_chunk.summary,
+        "confidence": "high",
+        "result_kind": "anchor",
+    }
+
+
+def _semantic_anchor_summary(anchor_chunk: SemanticChunk) -> dict[str, object]:
+    """Return compact anchor metadata for semantic-context responses."""
+
+    return {
+        "path": anchor_chunk.path,
+        "symbol": anchor_chunk.symbol,
+        "chunk_id": anchor_chunk.chunk_id,
+        "component": anchor_chunk.component,
+        "file_role": anchor_chunk.file_role,
+        "language": anchor_chunk.language,
+        "symbol_type": anchor_chunk.symbol_type,
+        "line": anchor_chunk.line,
+    }
+
+
+def _semantic_structural_base(section_name: str, confidence: str) -> float:
+    """Return the structural score floor for one dependency-neighborhood section."""
+
+    section_weights = {
+        "likely_callers": 0.72,
+        "likely_callees": 0.7,
+        "linked_tests": 0.71,
+        "linked_services": 0.69,
+        "linked_rendering_artifacts": 0.64,
+        "linked_forms": 0.65,
+        "linked_framework": 0.58,
+        "linked_javascript": 0.66,
+        "linked_build_artifacts": 0.6,
+    }
+    confidence_bonus = {"high": 0.12, "medium": 0.06, "low": 0.0}.get(confidence, 0.0)
+    return section_weights.get(section_name, 0.56) + confidence_bonus
+
+
+def _semantic_anchor_section_bonus(
+    anchor_chunk: SemanticChunk,
+    section_name: str,
+    item: dict[str, object],
+) -> float:
+    """Return a small anchor-aware bias for primary semantic context ordering."""
+
+    bonus = 0.0
+    if anchor_chunk.file_role in {"locallib_file", "lib_file"}:
+        if section_name == "linked_rendering_artifacts":
+            bonus += 0.12
+        if section_name == "linked_framework":
+            bonus -= 0.06
+    if anchor_chunk.file_role == "external_api_class" or anchor_chunk.file_role == "services_definition":
+        if section_name in {"linked_services", "linked_tests"}:
+            bonus += 0.08
+        if section_name in {"linked_rendering_artifacts", "linked_framework"}:
+            bonus -= 0.08
+    if "provider" in anchor_chunk.path:
+        if section_name == "linked_forms":
+            bonus += 0.12
+        if section_name == "linked_framework":
+            bonus += 0.04
+    if anchor_chunk.language == "js":
+        if section_name == "linked_javascript":
+            bonus += 0.08
+        if section_name == "linked_build_artifacts":
+            bonus += 0.06
+
+    if str(item.get("type")) == "template_file" and section_name == "linked_rendering_artifacts":
+        bonus += 0.04
+    return bonus
+
+
+def _semantic_structural_relevance(
+    section_name: str,
+    item: dict[str, object],
+    anchor_chunk: SemanticChunk,
+) -> str:
+    """Explain why one structural companion matters to the current anchor."""
+
+    relationship = str(item.get("relationship") or "")
+    if section_name == "likely_callers":
+        return f"Appears in the anchor's bounded dependency neighborhood as a likely caller ({relationship}); inspect it when tracing how {anchor_chunk.symbol or anchor_chunk.path} is entered."
+    if section_name == "likely_callees":
+        return f"Appears in the anchor's bounded dependency neighborhood as a likely callee ({relationship}); inspect it when tracing what {anchor_chunk.symbol or anchor_chunk.path} directly depends on."
+    if section_name == "linked_tests":
+        return f"Provides concrete automated coverage for {anchor_chunk.symbol or anchor_chunk.path}; inspect it when changing behavior or API expectations."
+    if section_name == "linked_rendering_artifacts":
+        return f"Belongs to the anchor's rendering flow; inspect it when changing rendered data, renderer logic, or templates around {anchor_chunk.symbol or anchor_chunk.path}."
+    if section_name == "linked_forms":
+        return f"Belongs to the anchor's form workflow; inspect it when changing fields, defaults, or validation around {anchor_chunk.symbol or anchor_chunk.path}."
+    if section_name == "linked_javascript":
+        return f"Belongs to the anchor's JavaScript module flow; inspect it when changing imported APIs or inherited client-side behavior."
+    return f"Direct structural companion for {anchor_chunk.symbol or anchor_chunk.path}; inspect it if the surrounding feature slice changes."
+
+
+def _semantic_similar_explanation(anchor_chunk: SemanticChunk, chunk: SemanticChunk) -> str:
+    """Return a concise explanation for one semantically similar example."""
+
+    kind = _semantic_human_kind(chunk)
+    if chunk.file_role == anchor_chunk.file_role:
+        return f"Semantically similar {kind} with the same Moodle role ({chunk.file_role}); inspect it for an analogous implementation pattern."
+    return f"Semantically similar {kind} retrieved from the same codebase; inspect it for a comparable implementation pattern or test shape."
+
+
+def _semantic_similar_relevance(
+    anchor_chunk: SemanticChunk,
+    chunk: SemanticChunk,
+    lexical: float,
+    semantic: float,
+) -> str:
+    """Explain the concrete overlap between the anchor and a similar example."""
+
+    reasons: list[str] = []
+    if chunk.file_role == anchor_chunk.file_role:
+        reasons.append(f"shares the same file role ({chunk.file_role})")
+    if chunk.language == anchor_chunk.language:
+        reasons.append(f"uses the same language ({chunk.language})")
+    if chunk.symbol_type and chunk.symbol_type == anchor_chunk.symbol_type:
+        reasons.append(f"matches the same symbol kind ({chunk.symbol_type})")
+    if chunk.component == anchor_chunk.component:
+        reasons.append("stays within the same component")
+    if lexical >= 0.2:
+        reasons.append("shares meaningful vocabulary with the anchor")
+    if semantic >= 0.35:
+        reasons.append("has a close hashed-vector similarity to the anchor chunk")
+    if not reasons:
+        reasons.append("is the closest bounded similar example found for this anchor")
+    return f"Retrieved because it {', '.join(reasons)}."
+
+
+def _semantic_query_explanation(query_text: str, chunk: SemanticChunk) -> str:
+    """Return a decision-ready explanation for one free-text retrieval result."""
+
+    kind = _semantic_human_kind(chunk)
+    return f"{kind.capitalize()} matched the free-text query '{query_text}'; inspect it if you need a concrete code example or local implementation context."
+
+
+def _semantic_query_relevance(query_tokens: list[str], chunk: SemanticChunk) -> str:
+    """Return a concise relevance explanation for free-text retrieval."""
+
+    shared = [token for token in query_tokens if token in chunk.text.lower()][:4]
+    if shared:
+        return f"Matched the query through shared terms: {', '.join(shared)}."
+    return "Matched the query through bounded lexical and hashed-vector similarity."
+
+
+def _semantic_sources(lexical: float, semantic: float) -> list[str]:
+    """Return retrieval-source labels for one semantic result."""
+
+    sources: list[str] = []
+    if lexical > 0.0:
+        sources.append("lexical")
+    if semantic >= 0.18:
+        sources.append("semantic")
+    sources.append("rerank")
+    return sources
+
+
+def _merge_semantic_results(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Deduplicate semantic results by chunk id while preserving stronger signals."""
+
+    merged: dict[str, dict[str, object]] = {}
+    for item in items:
+        key = str(item["path"])
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = dict(item)
+            continue
+        if float(item["score"]) > float(existing["score"]):
+            existing.update(item)
+        sources = sorted(set(existing.get("retrieval_sources", [])) | set(item.get("retrieval_sources", [])))
+        existing["retrieval_sources"] = sources
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            _semantic_result_priority(item),
+            -float(item["score"]),
+            str(item["path"]),
+            str(item.get("symbol") or ""),
+        ),
+    )
+
+
+def _semantic_result_priority(item: dict[str, object]) -> int:
+    """Return a stable ordering priority for semantic results."""
+
+    result_kind = str(item.get("result_kind") or "")
+    priorities = {
+        "anchor": 0,
+        "local_context": 1,
+        "query_match": 1,
+        "similar_example": 2,
+    }
+    return priorities.get(result_kind, 5)
+
+
+def _deduplicate_semantic_chunks(chunks: list[SemanticChunk]) -> list[SemanticChunk]:
+    """Return semantic chunks keyed by deterministic chunk id."""
+
+    merged: dict[str, SemanticChunk] = {}
+    for chunk in chunks:
+        merged.setdefault(chunk.chunk_id, chunk)
+    return list(merged.values())
+
+
+def _collect_component_semantic_chunks(
+    connection: sqlite3.Connection,
+    *,
+    component_name: str,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Collect a bounded structural-chunk pool inside one component."""
+
+    chunks: list[SemanticChunk] = []
+    chunks.extend(_semantic_symbol_chunks_for_component(connection, component_name, language=language, limit=limit))
+    chunks.extend(_semantic_js_chunks_for_component(connection, component_name, limit=max(10, limit // 2)))
+    chunks.extend(_semantic_test_chunks_for_component(connection, component_name, language=language, limit=max(10, limit // 3)))
+    chunks.extend(_semantic_service_chunks_for_component(connection, component_name, limit=max(10, limit // 4)))
+    chunks.extend(_semantic_file_chunks_for_component(connection, component_name, language=language, limit=max(10, limit // 3)))
+    return chunks
+
+
+def _collect_matching_semantic_chunks(
+    connection: sqlite3.Connection,
+    query_tokens: list[str],
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Collect a bounded global chunk pool using lexical token filters first."""
+
+    if not query_tokens:
+        return []
+    chunks: list[SemanticChunk] = []
+    chunks.extend(_semantic_symbol_chunks_for_tokens(connection, query_tokens, language=language, limit=limit))
+    chunks.extend(_semantic_js_chunks_for_tokens(connection, query_tokens, limit=max(10, limit // 2)))
+    chunks.extend(_semantic_test_chunks_for_tokens(connection, query_tokens, language=language, limit=max(10, limit // 3)))
+    chunks.extend(_semantic_service_chunks_for_tokens(connection, query_tokens, limit=max(10, limit // 4)))
+    chunks.extend(_semantic_file_chunks_for_tokens(connection, query_tokens, language=language, limit=max(10, limit // 3)))
+    return chunks
+
+
+def _semantic_chunk_from_definition_match(
+    connection: sqlite3.Connection,
+    match: dict[str, object],
+) -> SemanticChunk:
+    """Build a semantic chunk from one resolved definition payload."""
+
+    if str(match.get("symbol_type")) == "js_module":
+        row = connection.execute(
+            """
+            SELECT
+                jm.module_name,
+                jm.export_kind,
+                jm.export_name,
+                jm.superclass_name,
+                jm.superclass_module,
+                jm.build_file,
+                f.moodle_path,
+                f.file_role,
+                f.absolute_path,
+                c.name AS component_name
+            FROM js_modules jm
+            JOIN files f ON f.id = jm.file_id
+            JOIN components c ON c.id = jm.component_id
+            WHERE jm.module_name = ?
+            LIMIT 1
+            """,
+            (match.get("module_name") or match.get("fqname"),),
+        ).fetchone()
+        if row is None:
+            raise ValidationError(f"JavaScript module not found in index: {match.get('module_name') or match.get('fqname')}")
+        return _semantic_chunk_from_js_row(row)
+
+    row = connection.execute(
+        """
+        SELECT
+            s.name,
+            s.fqname,
+            s.symbol_type,
+            s.signature,
+            s.docblock_summary,
+            s.return_type,
+            s.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE s.fqname = ?
+        LIMIT 1
+        """,
+        (match["fqname"],),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(f"Definition not found in index: {match['fqname']}")
+    return _semantic_chunk_from_symbol_row(row)
+
+
+def _semantic_chunk_from_file_context(
+    connection: sqlite3.Connection,
+    context: dict[str, object],
+) -> SemanticChunk:
+    """Build a semantic chunk from one resolved file-context payload."""
+
+    row = connection.execute(
+        """
+        SELECT
+            f.id,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM files f
+        JOIN components c ON c.id = f.component_id
+        WHERE f.moodle_path = ?
+        LIMIT 1
+        """,
+        (context["moodle_path"],),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(f"File not found in index: {context['moodle_path']}")
+    return _semantic_chunk_from_file_row(connection, row)
+
+
+def _semantic_chunk_from_reference(
+    connection: sqlite3.Connection,
+    *,
+    path: str,
+    symbol: str | None,
+) -> SemanticChunk | None:
+    """Resolve a neighborhood reference into a semantic chunk."""
+
+    if symbol:
+        if "/" in symbol and "\\" not in symbol:
+            row = connection.execute(
+                """
+                SELECT
+                    jm.module_name,
+                    jm.export_kind,
+                    jm.export_name,
+                    jm.superclass_name,
+                    jm.superclass_module,
+                    jm.build_file,
+                    f.moodle_path,
+                    f.file_role,
+                    f.absolute_path,
+                    c.name AS component_name
+                FROM js_modules jm
+                JOIN files f ON f.id = jm.file_id
+                JOIN components c ON c.id = jm.component_id
+                WHERE jm.module_name = ?
+                LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+            if row is not None:
+                return _semantic_chunk_from_js_row(row)
+        else:
+            row = connection.execute(
+                """
+                SELECT
+                    s.name,
+                    s.fqname,
+                    s.symbol_type,
+                    s.signature,
+                    s.docblock_summary,
+                    s.return_type,
+                    s.line,
+                    f.moodle_path,
+                    f.file_role,
+                    f.absolute_path,
+                    c.name AS component_name
+                FROM symbols s
+                JOIN files f ON f.id = s.file_id
+                JOIN components c ON c.id = s.component_id
+                WHERE s.fqname = ?
+                LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+            if row is not None:
+                return _semantic_chunk_from_symbol_row(row)
+
+    repository = _get_indexed_repository_metadata(connection)
+    try:
+        file_row = _resolve_file_row(connection, repository, path)
+    except ValidationError:
+        return None
+    return _semantic_chunk_from_file_row(connection, file_row)
+
+
+def _semantic_symbol_chunks_for_component(
+    connection: sqlite3.Connection,
+    component_name: str,
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return PHP symbol chunks within one component."""
+
+    params: list[object] = [component_name]
+    language_clause = ""
+    if language == "php":
+        language_clause = "AND f.extension = '.php'"
+    rows = connection.execute(
+        f"""
+        SELECT
+            s.name,
+            s.fqname,
+            s.symbol_type,
+            s.signature,
+            s.docblock_summary,
+            s.return_type,
+            s.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE c.name = ?
+        {language_clause}
+        ORDER BY f.moodle_path, s.line
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_symbol_row(row) for row in rows]
+
+
+def _semantic_js_chunks_for_component(
+    connection: sqlite3.Connection,
+    component_name: str,
+    *,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return JS module chunks within one component."""
+
+    rows = connection.execute(
+        """
+        SELECT
+            jm.module_name,
+            jm.export_kind,
+            jm.export_name,
+            jm.superclass_name,
+            jm.superclass_module,
+            jm.build_file,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM js_modules jm
+        JOIN files f ON f.id = jm.file_id
+        JOIN components c ON c.id = jm.component_id
+        WHERE c.name = ?
+        ORDER BY f.moodle_path
+        LIMIT ?
+        """,
+        (component_name, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_js_row(row) for row in rows]
+
+
+def _semantic_test_chunks_for_component(
+    connection: sqlite3.Connection,
+    component_name: str,
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return test chunks within one component."""
+
+    if language not in {None, "php"}:
+        return []
+    rows = connection.execute(
+        """
+        SELECT
+            t.name,
+            t.test_type,
+            t.related_symbol,
+            t.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM tests t
+        JOIN files f ON f.id = t.file_id
+        JOIN components c ON c.id = t.component_id
+        WHERE c.name = ?
+        ORDER BY f.moodle_path, t.line
+        LIMIT ?
+        """,
+        (component_name, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_test_row(row) for row in rows]
+
+
+def _semantic_service_chunks_for_component(
+    connection: sqlite3.Connection,
+    component_name: str,
+    *,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return service-definition chunks within one component."""
+
+    rows = connection.execute(
+        """
+        SELECT
+            ws.service_name,
+            ws.classname,
+            ws.methodname,
+            ws.resolved_target_file,
+            ws.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM webservices ws
+        JOIN files f ON f.id = ws.file_id
+        JOIN components c ON c.id = ws.component_id
+        WHERE c.name = ?
+        ORDER BY f.moodle_path, ws.line
+        LIMIT ?
+        """,
+        (component_name, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_webservice_row(row) for row in rows]
+
+
+def _semantic_file_chunks_for_component(
+    connection: sqlite3.Connection,
+    component_name: str,
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return file-level fallback chunks within one component."""
+
+    extension_clause = ""
+    params: list[object] = [component_name]
+    if language == "js":
+        extension_clause = "AND f.extension = '.js'"
+    elif language == "php":
+        extension_clause = "AND f.extension = '.php'"
+    elif language == "template":
+        extension_clause = "AND f.extension = '.mustache'"
+    params.append(limit)
+    rows = connection.execute(
+        f"""
+        SELECT
+            f.id,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM files f
+        JOIN components c ON c.id = f.component_id
+        WHERE c.name = ?
+          AND f.file_role IN ('template_file', 'renderer_file', 'output_class', 'services_definition', 'amd_build', 'locallib_file', 'settings_file')
+          {extension_clause}
+        ORDER BY f.moodle_path
+        LIMIT ?
+        """,
+        tuple(params),
+    ).fetchall()
+    return [_semantic_chunk_from_file_row(connection, row) for row in rows]
+
+
+def _semantic_symbol_chunks_for_tokens(
+    connection: sqlite3.Connection,
+    query_tokens: list[str],
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return lexically filtered symbol chunks across the repository."""
+
+    clause, params = _semantic_like_clause(
+        ["s.name", "s.fqname", "coalesce(s.docblock_summary, '')", "coalesce(s.signature, '')"],
+        query_tokens,
+    )
+    if not clause:
+        return []
+    language_clause = ""
+    if language == "php":
+        language_clause = "AND f.extension = '.php'"
+    rows = connection.execute(
+        f"""
+        SELECT
+            s.name,
+            s.fqname,
+            s.symbol_type,
+            s.signature,
+            s.docblock_summary,
+            s.return_type,
+            s.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        JOIN components c ON c.id = s.component_id
+        WHERE ({clause})
+        {language_clause}
+        ORDER BY f.moodle_path, s.line
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_symbol_row(row) for row in rows]
+
+
+def _semantic_js_chunks_for_tokens(
+    connection: sqlite3.Connection,
+    query_tokens: list[str],
+    *,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return lexically filtered JS module chunks across the repository."""
+
+    clause, params = _semantic_like_clause(
+        [
+            "jm.module_name",
+            "coalesce(jm.export_name, '')",
+            "coalesce(jm.superclass_name, '')",
+            "coalesce(jm.superclass_module, '')",
+            "f.moodle_path",
+        ],
+        query_tokens,
+    )
+    if not clause:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT
+            jm.module_name,
+            jm.export_kind,
+            jm.export_name,
+            jm.superclass_name,
+            jm.superclass_module,
+            jm.build_file,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM js_modules jm
+        JOIN files f ON f.id = jm.file_id
+        JOIN components c ON c.id = jm.component_id
+        WHERE {clause}
+        ORDER BY f.moodle_path
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_js_row(row) for row in rows]
+
+
+def _semantic_test_chunks_for_tokens(
+    connection: sqlite3.Connection,
+    query_tokens: list[str],
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return lexically filtered test chunks across the repository."""
+
+    if language not in {None, "php"}:
+        return []
+    clause, params = _semantic_like_clause(
+        [
+            "t.name",
+            "coalesce(t.related_symbol, '')",
+            "t.test_type",
+            "f.moodle_path",
+        ],
+        query_tokens,
+    )
+    if not clause:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT
+            t.name,
+            t.test_type,
+            t.related_symbol,
+            t.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM tests t
+        JOIN files f ON f.id = t.file_id
+        JOIN components c ON c.id = t.component_id
+        WHERE {clause}
+        ORDER BY f.moodle_path, t.line
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_test_row(row) for row in rows]
+
+
+def _semantic_service_chunks_for_tokens(
+    connection: sqlite3.Connection,
+    query_tokens: list[str],
+    *,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return lexically filtered service-definition chunks across the repository."""
+
+    clause, params = _semantic_like_clause(
+        [
+            "ws.service_name",
+            "coalesce(ws.classname, '')",
+            "coalesce(ws.methodname, '')",
+            "coalesce(ws.resolved_target_file, '')",
+            "f.moodle_path",
+        ],
+        query_tokens,
+    )
+    if not clause:
+        return []
+    rows = connection.execute(
+        f"""
+        SELECT
+            ws.service_name,
+            ws.classname,
+            ws.methodname,
+            ws.resolved_target_file,
+            ws.line,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM webservices ws
+        JOIN files f ON f.id = ws.file_id
+        JOIN components c ON c.id = ws.component_id
+        WHERE {clause}
+        ORDER BY f.moodle_path, ws.line
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_webservice_row(row) for row in rows]
+
+
+def _semantic_file_chunks_for_tokens(
+    connection: sqlite3.Connection,
+    query_tokens: list[str],
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return lexically filtered file fallback chunks across the repository."""
+
+    clause, params = _semantic_like_clause(
+        ["f.moodle_path", "f.file_role", "c.name"],
+        query_tokens,
+    )
+    if not clause:
+        return []
+    extension_clause = ""
+    if language == "js":
+        extension_clause = "AND f.extension = '.js'"
+    elif language == "php":
+        extension_clause = "AND f.extension = '.php'"
+    elif language == "template":
+        extension_clause = "AND f.extension = '.mustache'"
+    rows = connection.execute(
+        f"""
+        SELECT
+            f.id,
+            f.moodle_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM files f
+        JOIN components c ON c.id = f.component_id
+        WHERE ({clause})
+          AND f.file_role IN ('template_file', 'renderer_file', 'output_class', 'services_definition', 'amd_build', 'amd_source', 'locallib_file', 'settings_file', 'external_api_class')
+          {extension_clause}
+        ORDER BY f.moodle_path
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [_semantic_chunk_from_file_row(connection, row) for row in rows]
+
+
+def _semantic_chunk_from_symbol_row(row: sqlite3.Row) -> SemanticChunk:
+    """Build one PHP symbol chunk from a symbol row."""
+
+    title = str(row["fqname"])
+    summary = " ".join(
+        part
+        for part in [
+            str(row["symbol_type"]),
+            str(row["signature"] or ""),
+            str(row["docblock_summary"] or ""),
+        ]
+        if part and part != "None"
+    ).strip()
+    snippet = _source_snippet(str(row["absolute_path"]), int(row["line"]) if row["line"] is not None else None)
+    text = " ".join(
+        part
+        for part in [
+            row["name"],
+            row["fqname"],
+            row["symbol_type"],
+            row["signature"] or "",
+            row["docblock_summary"] or "",
+            row["return_type"] or "",
+            row["moodle_path"],
+            row["file_role"],
+            row["component_name"],
+            _semantic_role_tags(str(row["file_role"])),
+            snippet or "",
+        ]
+        if part
+    )
+    return SemanticChunk(
+        chunk_id=f"symbol:{row['fqname']}",
+        path=str(row["moodle_path"]),
+        symbol=str(row["fqname"]),
+        component=str(row["component_name"]),
+        file_role=str(row["file_role"]),
+        language="php",
+        symbol_type=str(row["symbol_type"]),
+        line=int(row["line"]) if row["line"] is not None else None,
+        source_kind="symbol",
+        title=title,
+        summary=summary,
+        text=text,
+        snippet=snippet,
+    )
+
+
+def _semantic_chunk_from_js_row(row: sqlite3.Row) -> SemanticChunk:
+    """Build one JS module chunk from a JS module row."""
+
+    title = str(row["module_name"])
+    summary = " ".join(
+        part
+        for part in [
+            str(row["export_kind"] or "js_module"),
+            str(row["export_name"] or ""),
+            str(row["superclass_module"] or row["superclass_name"] or ""),
+        ]
+        if part
+    ).strip()
+    snippet = _source_snippet(str(row["absolute_path"]), None)
+    text = " ".join(
+        part
+        for part in [
+            row["module_name"],
+            row["export_kind"] or "",
+            row["export_name"] or "",
+            row["superclass_name"] or "",
+            row["superclass_module"] or "",
+            row["build_file"] or "",
+            row["moodle_path"],
+            row["file_role"],
+            row["component_name"],
+            _semantic_role_tags(str(row["file_role"])),
+            snippet or "",
+        ]
+        if part
+    )
+    return SemanticChunk(
+        chunk_id=f"js:{row['module_name']}",
+        path=str(row["moodle_path"]),
+        symbol=str(row["module_name"]),
+        component=str(row["component_name"]),
+        file_role=str(row["file_role"]),
+        language="js",
+        symbol_type="js_module",
+        line=None,
+        source_kind="js_module",
+        title=title,
+        summary=summary,
+        text=text,
+        snippet=snippet,
+    )
+
+
+def _semantic_chunk_from_test_row(row: sqlite3.Row) -> SemanticChunk:
+    """Build one test chunk from a test row."""
+
+    snippet = _source_snippet(str(row["absolute_path"]), int(row["line"]) if row["line"] is not None else None)
+    text = " ".join(
+        part
+        for part in [
+            row["name"],
+            row["test_type"],
+            row["related_symbol"] or "",
+            row["moodle_path"],
+            row["file_role"],
+            row["component_name"],
+            "phpunit test coverage assertion fixture",
+            snippet or "",
+        ]
+        if part
+    )
+    return SemanticChunk(
+        chunk_id=f"test:{row['moodle_path']}:{row['name']}",
+        path=str(row["moodle_path"]),
+        symbol=str(row["related_symbol"]) if row["related_symbol"] else None,
+        component=str(row["component_name"]),
+        file_role=str(row["file_role"]),
+        language="php",
+        symbol_type="test",
+        line=int(row["line"]) if row["line"] is not None else None,
+        source_kind="test",
+        title=str(row["name"]),
+        summary=f"{row['test_type']} test",
+        text=text,
+        snippet=snippet,
+    )
+
+
+def _semantic_chunk_from_webservice_row(row: sqlite3.Row) -> SemanticChunk:
+    """Build one service-definition chunk from a webservice row."""
+
+    symbol = None
+    if row["classname"] and row["methodname"]:
+        symbol = f"{row['classname']}::{row['methodname']}"
+    text = " ".join(
+        part
+        for part in [
+            row["service_name"],
+            row["classname"] or "",
+            row["methodname"] or "",
+            row["resolved_target_file"] or "",
+            row["moodle_path"],
+            row["file_role"],
+            row["component_name"],
+            "web service external api registration",
+        ]
+        if part
+    )
+    return SemanticChunk(
+        chunk_id=f"service:{row['moodle_path']}:{row['service_name']}",
+        path=str(row["moodle_path"]),
+        symbol=symbol,
+        component=str(row["component_name"]),
+        file_role=str(row["file_role"]),
+        language="php",
+        symbol_type="service_definition",
+        line=int(row["line"]) if row["line"] is not None else None,
+        source_kind="service",
+        title=str(row["service_name"]),
+        summary="web service registration",
+        text=text,
+        snippet=str(row["service_name"]),
+    )
+
+
+def _semantic_chunk_from_file_row(connection: sqlite3.Connection, row: sqlite3.Row) -> SemanticChunk:
+    """Build one file-level fallback chunk."""
+
+    file_id = row["id"]
+    symbols = connection.execute(
+        """
+        SELECT name
+        FROM symbols
+        WHERE file_id = ?
+        ORDER BY line
+        LIMIT 5
+        """,
+        (file_id,),
+    ).fetchall()
+    js_module = connection.execute(
+        """
+        SELECT module_name
+        FROM js_modules
+        WHERE file_id = ?
+        LIMIT 1
+        """,
+        (file_id,),
+    ).fetchone()
+    services = connection.execute(
+        """
+        SELECT service_name
+        FROM webservices
+        WHERE file_id = ?
+        ORDER BY line
+        LIMIT 5
+        """,
+        (file_id,),
+    ).fetchall()
+    title = str(row["moodle_path"])
+    summary = f"{row['file_role']} file"
+    snippet = _source_snippet(str(row["absolute_path"]), None)
+    text = " ".join(
+        part
+        for part in [
+            row["moodle_path"],
+            row["file_role"],
+            row["component_name"],
+            _semantic_role_tags(str(row["file_role"])),
+            " ".join(str(item["name"]) for item in symbols),
+            str(js_module["module_name"]) if js_module is not None else "",
+            " ".join(str(item["service_name"]) for item in services),
+            snippet or "",
+        ]
+        if part
+    )
+    return SemanticChunk(
+        chunk_id=f"file:{row['moodle_path']}",
+        path=str(row["moodle_path"]),
+        symbol=None,
+        component=str(row["component_name"]),
+        file_role=str(row["file_role"]),
+        language=_language_for_path(str(row["moodle_path"])),
+        symbol_type=None,
+        line=None,
+        source_kind="file",
+        title=title,
+        summary=summary,
+        text=text,
+        snippet=snippet,
+    )
+
+
+def _semantic_like_clause(columns: list[str], query_tokens: list[str]) -> tuple[str, list[object]]:
+    """Return one OR-based LIKE clause for a bounded token set."""
+
+    filtered = query_tokens[:4]
+    if not filtered:
+        return "", []
+    clauses: list[str] = []
+    params: list[object] = []
+    for token in filtered:
+        pattern = f"%{token}%"
+        for column in columns:
+            clauses.append(f"lower({column}) LIKE ?")
+            params.append(pattern)
+    return " OR ".join(clauses), params
+
+
+def _semantic_focus_tokens(text: str) -> list[str]:
+    """Return a bounded list of informative tokens for hybrid retrieval."""
+
+    counts = Counter(_semantic_tokens(text))
+    ranked = sorted(counts, key=lambda token: (-counts[token], -len(token), token))
+    return ranked[:6]
+
+
+def _semantic_tokens(text: str) -> list[str]:
+    """Return normalized tokens with light code-aware splitting."""
+
+    prepared = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    raw = re.split(r"[^A-Za-z0-9_]+", prepared.lower())
+    stopwords = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "this",
+        "that",
+        "from",
+        "into",
+        "file",
+        "path",
+        "class",
+        "function",
+        "method",
+        "return",
+        "public",
+        "protected",
+        "private",
+        "null",
+        "true",
+        "false",
+        "php",
+        "js",
+    }
+    return [token for token in raw if len(token) >= 3 and token not in stopwords]
+
+
+def _semantic_overlap_score(query_text: str, candidate_text: str) -> float:
+    """Return a bounded lexical overlap score."""
+
+    query_tokens = set(_semantic_focus_tokens(query_text))
+    candidate_tokens = set(_semantic_tokens(candidate_text))
+    if not query_tokens or not candidate_tokens:
+        return 0.0
+    return len(query_tokens & candidate_tokens) / len(query_tokens)
+
+
+def _semantic_similarity(left_text: str, right_text: str) -> float:
+    """Return cosine similarity between two hashed token vectors."""
+
+    left = _semantic_vector(_semantic_tokens(left_text))
+    right = _semantic_vector(_semantic_tokens(right_text))
+    if not left or not right:
+        return 0.0
+    dot = sum(left[index] * right.get(index, 0.0) for index in left)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def _semantic_vector(tokens: list[str], dimensions: int = 96) -> dict[int, float]:
+    """Return a deterministic sparse hashed vector for one token list."""
+
+    counts = Counter(tokens)
+    vector: dict[int, float] = {}
+    for token, count in counts.items():
+        digest = hashlib.md5(token.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") % dimensions
+        vector[index] = vector.get(index, 0.0) + float(count)
+    return vector
+
+
+def _source_snippet(absolute_path: str, line: int | None, radius: int = 2) -> str | None:
+    """Return a small source snippet around one anchor line."""
+
+    try:
+        source = Path(absolute_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    if not source:
+        return None
+    if line is None or line <= 0:
+        snippet_lines = [item.strip() for item in source[: min(6, len(source))] if item.strip()]
+        return " ".join(snippet_lines[:3]) or None
+    start = max(0, line - 1 - radius)
+    end = min(len(source), line + radius)
+    snippet_lines = [item.strip() for item in source[start:end] if item.strip()]
+    return " ".join(snippet_lines[:3]) or None
+
+
+def _semantic_role_tags(file_role: str) -> str:
+    """Return stable retrieval tags for one Moodle file role."""
+
+    tags = {
+        "external_api_class": "external api web service execute parameters returns",
+        "services_definition": "db services registration external api entrypoint",
+        "phpunit_test": "phpunit test coverage assertions",
+        "output_class": "renderable output renderer template rendering",
+        "renderer_file": "renderer rendering template output",
+        "template_file": "mustache template rendering output context",
+        "amd_source": "javascript amd source module import export frontend",
+        "amd_build": "javascript built amd artifact generated",
+        "settings_file": "admin settings framework configuration",
+        "locallib_file": "feature entrypoint local business logic rendering",
+    }
+    return tags.get(file_role, file_role.replace("_", " "))
+
+
+def _semantic_query_kind_bonus(query_tokens: list[str], chunk: SemanticChunk) -> float:
+    """Return a small intent-aware bonus for free-text retrieval."""
+
+    token_set = set(query_tokens)
+    bonus = 0.0
+    if {"method", "methods", "api", "external"} & token_set:
+        if chunk.source_kind == "symbol" or chunk.file_role in {"external_api_class", "services_definition"}:
+            bonus += 0.08
+    if {"test", "tests", "phpunit", "coverage"} & token_set and chunk.source_kind == "test":
+        bonus += 0.08
+    if {"template", "renderer", "rendering"} & token_set and chunk.file_role in {"template_file", "renderer_file", "output_class"}:
+        bonus += 0.06
+    if {"form", "forms", "validation"} & token_set and chunk.file_role in {"unknown", "phpunit_test"} and "\\form\\" in (chunk.symbol or ""):
+        bonus += 0.04
+    return bonus
+
+
+def _language_for_path(path: str) -> str:
+    """Return a coarse language bucket for one Moodle path."""
+
+    if path.endswith(".js"):
+        return "js"
+    if path.endswith(".mustache"):
+        return "template"
+    return "php"
+
+
+def _semantic_human_kind(chunk: SemanticChunk) -> str:
+    """Return a small human-readable kind label."""
+
+    if chunk.source_kind == "js_module":
+        return "JavaScript module"
+    if chunk.source_kind == "test":
+        return "test file"
+    if chunk.source_kind == "service":
+        return "service definition"
+    if chunk.source_kind == "symbol":
+        return "definition"
+    return "file"
 
 
 def _find_named_definitions(

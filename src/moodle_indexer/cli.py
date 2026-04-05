@@ -23,6 +23,7 @@ from moodle_indexer.queries import (
     find_definition,
     find_related_definitions,
     find_symbol,
+    semantic_context,
     suggest_edit_surface,
     suggest_related,
 )
@@ -131,6 +132,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of items to return per dependency-neighborhood section.",
     )
 
+    semantic_parser = subparsers.add_parser(
+        "semantic-context",
+        help="Return bounded hybrid semantic context around a symbol, file, or free-text query.",
+    )
+    semantic_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    semantic_target = semantic_parser.add_mutually_exclusive_group(required=True)
+    semantic_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    semantic_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    semantic_target.add_argument(
+        "--query",
+        help="Free-text retrieval query such as examples of Moodle external API methods with PHPUnit coverage.",
+    )
+    semantic_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of primary or secondary semantic-context items to return.",
+    )
+
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     file_parser.add_argument(
@@ -180,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_suggest_edit_surface(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "dependency-neighborhood":
             payload = run_dependency_neighborhood(args.db_path, args.symbol, args.file, args.limit)
+        elif args.command == "semantic-context":
+            payload = run_semantic_context(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -264,6 +289,25 @@ def run_dependency_neighborhood(db_path: str, symbol: str | None, file_path: str
         return success_payload(
             "dependency-neighborhood",
             dependency_neighborhood(connection, symbol_query=symbol, file_path=file_path, limit=limit),
+        )
+    finally:
+        connection.close()
+
+
+def run_semantic_context(
+    db_path: str,
+    symbol: str | None,
+    file_path: str | None,
+    query_text: str | None,
+    limit: int,
+) -> dict:
+    """Execute the ``semantic-context`` command."""
+
+    connection = open_database(Path(db_path).expanduser().resolve())
+    try:
+        return success_payload(
+            "semantic-context",
+            semantic_context(connection, symbol_query=symbol, file_path=file_path, query_text=query_text, limit=limit),
         )
     finally:
         connection.close()

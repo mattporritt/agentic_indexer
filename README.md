@@ -290,6 +290,22 @@ moodle-indexer dependency-neighborhood \
   --file mod/assign/locallib.php
 ```
 
+Retrieve bounded semantic context around a structural anchor or free-text query:
+
+```bash
+moodle-indexer semantic-context \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+
+moodle-indexer semantic-context \
+  --db-path /path/to/moodle-index.sqlite \
+  --file mod/assign/db/services.php
+
+moodle-indexer semantic-context \
+  --db-path /path/to/moodle-index.sqlite \
+  --query 'examples of Moodle external API methods with PHPUnit coverage'
+```
+
 Find a definition:
 
 ```bash
@@ -395,6 +411,12 @@ Phase 4B adds one more bounded, graph-like view:
   callees, linked tests, and linked artifact companion sections where the
   current index has strong local evidence
 
+Phase 4D adds one bounded hybrid retrieval endpoint on top of the same
+structural anchors:
+
+- `semantic-context`: hybrid lexical + hashed-vector retrieval constrained by a
+  resolved symbol/file anchor when available
+
 These agent-oriented navigation endpoints are intentionally confidence-aware:
 
 - primary items are usually high-confidence, directly connected artifacts such
@@ -435,6 +457,35 @@ bounded local edges, not a full call graph:
   with the most actionable files first instead of scanning every section
 - item `explanation` values are decision-oriented and try to answer both why a
   file matters and when it would need to change
+
+For `semantic-context`, structural navigation still stays in control:
+
+- symbol and file queries resolve a structural anchor first, then seed retrieval
+  from the existing bounded dependency neighborhood
+- semantic chunks are deterministic structural units such as symbol
+  definitions, JS modules, service registrations, test artifacts, and bounded
+  file-level fallback chunks
+- candidate generation is hybrid:
+  - structural anchor neighbors for precise local context
+  - lexical token filtering for bounded candidate recall
+  - hashed-vector similarity over chunk text for broader but still local
+    example finding
+- reranking keeps direct structural context competitive with semantically
+  similar examples instead of letting distant matches outrank the anchor
+- the response separates:
+  - `primary_semantic_context` for anchor-local context and trusted linked
+    artifacts
+  - `secondary_semantic_context` for semantically similar examples and broader
+    supporting context
+- each item records:
+  - `chunk_id`
+  - `score`
+  - `retrieval_sources`
+  - `explanation`
+  - `why_relevant_to_anchor`
+
+This is still bounded retrieval for coding workflows, not a general-purpose
+semantic memory or repository-wide autonomous retriever.
 
 Phase 2 usage examples intentionally prefer precision over recall. The indexer
 will rank direct static calls, simple `new ClassName(...)` to `$var->method()`

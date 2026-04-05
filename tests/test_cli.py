@@ -448,3 +448,24 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert "mod/assign/tests/external/start_submission_test.php" in {
         item["path"] for item in dependency_payload["data"]["sections"]["linked_tests"]["items"]
     }
+
+    exit_code = main(
+        [
+            "semantic-context",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    semantic_payload = json.loads(capsys.readouterr().out)
+    assert semantic_payload["status"] == "ok"
+    assert semantic_payload["data"]["anchor"]["symbol"] == "mod_assign\\external\\start_submission::execute"
+    assert semantic_payload["data"]["primary_semantic_context"][0]["chunk_id"] == (
+        "symbol:mod_assign\\external\\start_submission::execute"
+    )
+    semantic_primary_paths = [item["path"] for item in semantic_payload["data"]["primary_semantic_context"]]
+    assert "mod/assign/db/services.php" in semantic_primary_paths
+    assert "mod/assign/tests/external/start_submission_test.php" in semantic_primary_paths
+    assert semantic_payload["data"]["secondary_semantic_context"]
