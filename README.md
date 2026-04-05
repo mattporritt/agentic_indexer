@@ -1,6 +1,6 @@
 # Moodle AI Indexer
 
-Moodle AI Indexer is a Phase 1, SQLite-backed code indexer for a local Moodle LMS checkout. It is aimed at agentic coding systems and engineers who need Moodle-aware navigation and retrieval, not a speculative universal code graph.
+Moodle AI Indexer is a SQLite-backed code indexer for a local Moodle LMS checkout. It is aimed at agentic coding systems and engineers who need Moodle-aware navigation, retrieval, change planning, and bounded safety guidance, not a speculative universal code graph.
 
 The project focuses on practical structure that matters in Moodle work:
 
@@ -31,7 +31,7 @@ Plain text search can find files, but it does not reliably answer:
 
 This tool builds a compact local index so those questions become cheap and machine-friendly to answer.
 
-## What Phase 1 Includes
+## Current Capability Surface
 
 - full rebuild indexing into SQLite
 - explicit Moodle component inference for common plugin families and core subsystems
@@ -56,9 +56,9 @@ This tool builds a compact local index so those questions become cheap and machi
 - PHPUnit and Behat discovery
 - related-file suggestions with explanation strings
 - IDE-like definition lookup for PHP symbols and Moodle JS modules, with signatures, modifiers, docblocks, inheritance hints, and bounded usage examples
-- JSON CLI commands for indexing and querying
+- JSON CLI commands for indexing, querying, semantic retrieval, bounded planning, and safety guidance
 
-## What Phase 1 Does Not Include
+## Deliberate Non-Goals
 
 - embeddings or vector search
 - incremental indexing
@@ -68,6 +68,14 @@ This tool builds a compact local index so those questions become cheap and machi
 - a precise call graph
 - runtime tracing
 - background workers
+
+The project intentionally stays bounded and explainable:
+
+- structural navigation remains the spine
+- semantic retrieval is constrained by structural anchors
+- planning outputs are conservative and confidence-aware
+- safety outputs prefer concrete tests and local risks over broad generic advice
+- the tool does not claim a complete call graph, execution planner, or repository-wide test-impact engine
 
 ## High-Level Design
 
@@ -81,8 +89,22 @@ The package lives under `src/moodle_indexer/` and keeps responsibilities separat
 - `php_parser.py`: parser-first PHP symbol extraction with fallback logic
 - `extractors.py`: Moodle-specific extraction for PHP, JS modules, relationships, capabilities, strings, and tests
 - `store.py`: SQLite schema and persistence helpers
-- `queries.py`: query services used by the CLI
+- `queries.py`: current query/planning/safety services used by the CLI
 - `suggestions.py`: deterministic related-file heuristics
+
+Today the architecture is best understood as layered synthesis:
+
+1. indexing and extraction
+   - parse Moodle-aware structural facts into SQLite
+2. structural navigation
+   - `find-definition`, `file-context`, `suggest-related`, `find-related-definitions`
+3. bounded neighborhood and retrieval
+   - `suggest-edit-surface`, `dependency-neighborhood`, `semantic-context`
+4. planning and safety
+   - `propose-change-plan`, `assess-test-impact`, `execution-guardrails`
+
+Those higher layers reuse the same trusted structural anchors rather than
+inventing disconnected ranking systems for each endpoint.
 
 The SQLite schema stays intentionally small and extensible:
 
@@ -381,6 +403,46 @@ The package can still be run directly for debugging:
 python -m moodle_indexer --help
 ```
 
+## Testing And Validation
+
+The project uses two complementary safety nets:
+
+- automated tests under [tests/](/Users/mattp/projects/agentic_indexer/tests)
+- human-review validation bundles under [validation_runs/](/Users/mattp/projects/agentic_indexer/validation_runs)
+
+The automated suite now covers:
+
+- component inference and file-role classification
+- extractor behavior for PHP, services, JavaScript, capabilities, and strings
+- end-to-end query behavior on a realistic Moodle-style fixture tree
+- CLI JSON contracts for structural, semantic, planning, and safety endpoints
+- focused helper coverage for representative free-text service patterns and
+  agent-oriented safety synthesis
+
+Run the full suite with:
+
+```bash
+python3 -m pytest -q
+```
+
+The `validation_runs/` directory is intentionally kept as review evidence
+rather than as executable tests. Those bundles capture real-command outputs for
+high-value Moodle slices such as:
+
+- service definition -> implementation -> PHPUnit coverage
+- legacy rendering entrypoints -> output/renderers/templates
+- provider -> form -> framework chains
+- AMD source -> imports -> superclass -> build artifacts
+- free-text change-goal planning and safety patterns
+
+When changing ranking, planning, or safety behavior, the safest workflow is:
+
+1. extend regression tests first
+2. update docs for any behavior or contract changes
+3. refactor behind that test net
+4. rerun both the automated suite and any focused validation bundle relevant
+   to the changed slice
+
 ## Example Output
 
 `find-symbol` returns a compact summary of symbol definitions plus structural context:
@@ -436,37 +498,33 @@ For supported PHP functions, classes, methods, and Moodle AMD source modules it 
   expose one or two trusted next steps without turning into an open-ended graph
 - a small number of ranked usage examples plus a compact `usage_summary`
 
-Phase 4A adds two agent-oriented navigation endpoints on top of those same
-relationships:
+Agent-oriented navigation builds on those same relationships:
 
 - `find-related-definitions`: bounded related symbols and artifacts around a
   symbol or file
 - `suggest-edit-surface`: the likely primary and secondary files/definitions an
   agent would inspect or edit next
 
-Phase 4B adds one more bounded, graph-like view:
+Bounded graph-like navigation adds:
 
 - `dependency-neighborhood`: a small confidence-aware neighborhood around a
   symbol or file, split into ranked sections such as likely callers, likely
   callees, linked tests, and linked artifact companion sections where the
   current index has strong local evidence
 
-Phase 4D adds one bounded hybrid retrieval endpoint on top of the same
-structural anchors:
+Hybrid retrieval adds:
 
 - `semantic-context`: hybrid lexical + hashed-vector retrieval constrained by a
   resolved symbol/file anchor when available
 
-Phase 4E adds one conservative planning endpoint on top of those same
-structural and semantic signals:
+Conservative planning adds:
 
 - `propose-change-plan`: a bounded edit-set synthesis that separates
   `required_edits`, `likely_edits`, and `optional_edits`, adds a compact
   `validation_impact` view, and suggests a short `recommended_sequence`
   without modifying code automatically
 
-Phase 5B adds a bounded safety layer on top of the same plan and structural
-signals:
+The bounded safety layer adds:
 
 - `assess-test-impact`: a compact validation view that separates
   `direct_tests`, `likely_tests`, `environment_steps`, `contract_checks`, and
