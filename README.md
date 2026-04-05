@@ -306,6 +306,22 @@ moodle-indexer semantic-context \
   --query 'examples of Moodle external API methods with PHPUnit coverage'
 ```
 
+Synthesize a bounded change plan around a symbol, file, or free-text change goal:
+
+```bash
+moodle-indexer propose-change-plan \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol mod_assign\\external\\start_submission::execute
+
+moodle-indexer propose-change-plan \
+  --db-path /path/to/moodle-index.sqlite \
+  --file mod/assign/db/services.php
+
+moodle-indexer propose-change-plan \
+  --db-path /path/to/moodle-index.sqlite \
+  --query 'add a parameter to a Moodle external API method and update its tests'
+```
+
 Find a definition:
 
 ```bash
@@ -416,6 +432,14 @@ structural anchors:
 
 - `semantic-context`: hybrid lexical + hashed-vector retrieval constrained by a
   resolved symbol/file anchor when available
+
+Phase 4E adds one conservative planning endpoint on top of those same
+structural and semantic signals:
+
+- `propose-change-plan`: a bounded edit-set synthesis that separates
+  `required_edits`, `likely_edits`, and `optional_edits`, adds a compact
+  `validation_impact` view, and suggests a short `recommended_sequence`
+  without modifying code automatically
 
 These agent-oriented navigation endpoints are intentionally confidence-aware:
 

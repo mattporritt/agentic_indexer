@@ -469,3 +469,22 @@ def test_find_definition_cli_returns_ide_style_metadata(tmp_path: Path, capsys) 
     assert "mod/assign/db/services.php" in semantic_primary_paths
     assert "mod/assign/tests/external/start_submission_test.php" in semantic_primary_paths
     assert semantic_payload["data"]["secondary_semantic_context"]
+
+    exit_code = main(
+        [
+            "propose-change-plan",
+            "--db-path",
+            str(db_path),
+            "--symbol",
+            "mod_assign\\external\\start_submission::execute",
+        ]
+    )
+    assert exit_code == 0
+    plan_payload = json.loads(capsys.readouterr().out)
+    assert plan_payload["status"] == "ok"
+    required_paths = [item["path"] for item in plan_payload["data"]["required_edits"]]
+    assert required_paths[0] == "mod/assign/classes/external/start_submission.php"
+    assert "mod/assign/db/services.php" in required_paths
+    assert "mod/assign/tests/external/start_submission_test.php" in required_paths
+    assert plan_payload["data"]["validation_impact"]
+    assert plan_payload["data"]["recommended_sequence"][0]["target"] == "mod/assign/classes/external/start_submission.php"

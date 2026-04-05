@@ -24,6 +24,7 @@ from moodle_indexer.queries import (
     find_definition,
     find_related_definitions,
     find_symbol,
+    propose_change_plan,
     semantic_context,
     suggest_edit_surface,
     suggest_related,
@@ -1159,6 +1160,58 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         secondary_service_paths = [item["path"] for item in service_file_semantic["secondary_semantic_context"]]
         assert len(secondary_service_paths) == len(set(secondary_service_paths))
         assert "mod/assign/db/services.php" not in secondary_service_paths
+
+        service_plan = propose_change_plan(
+            connection,
+            symbol_query="mod_assign\\external\\start_submission::execute",
+        )
+        required_service_paths = [item["path"] for item in service_plan["required_edits"]]
+        assert required_service_paths[0] == "mod/assign/classes/external/start_submission.php"
+        assert "mod/assign/db/services.php" in required_service_paths
+        assert "mod/assign/tests/external/start_submission_test.php" in required_service_paths
+        assert service_plan["validation_impact"]
+        assert service_plan["recommended_sequence"][0]["target"] == "mod/assign/classes/external/start_submission.php"
+
+        rendering_plan = propose_change_plan(
+            connection,
+            symbol_query="assign::view",
+        )
+        assert rendering_plan["required_edits"][0]["path"] == "mod/assign/locallib.php"
+        rendering_likely_paths = [item["path"] for item in rendering_plan["likely_edits"]]
+        rendering_optional_paths = [item["path"] for item in rendering_plan["optional_edits"]]
+        assert "mod/assign/classes/output/grading_app.php" in rendering_likely_paths
+        assert "mod/assign/classes/output/renderer.php" in rendering_likely_paths
+        assert "mod/assign/templates/grading_app.mustache" in rendering_optional_paths
+
+        provider_plan = propose_change_plan(
+            connection,
+            symbol_query="aiprovider_openai\\provider::get_action_settings",
+        )
+        provider_required_paths = [item["path"] for item in provider_plan["required_edits"]]
+        provider_likely_paths = [item["path"] for item in provider_plan["likely_edits"]]
+        assert "ai/provider/openai/classes/provider.php" in provider_required_paths
+        assert "ai/provider/openai/classes/form/action_generate_image_form.php" in provider_required_paths
+        assert "ai/provider/openai/classes/form/action_form.php" in provider_likely_paths
+        assert "ai/classes/form/action_settings_form.php" in provider_likely_paths
+
+        js_plan = propose_change_plan(
+            connection,
+            symbol_query="core_ai/aiprovider_action_management_table",
+        )
+        assert js_plan["required_edits"][0]["path"] == "ai/amd/src/aiprovider_action_management_table.js"
+        js_likely_paths = [item["path"] for item in js_plan["likely_edits"]]
+        js_optional_paths = [item["path"] for item in js_plan["optional_edits"]]
+        assert "admin/amd/src/plugin_management_table.js" in js_likely_paths
+        assert "ai/amd/build/aiprovider_action_management_table.min.js" in js_optional_paths
+
+        free_text_plan = propose_change_plan(
+            connection,
+            query_text="add a parameter to a Moodle external API method and update its tests",
+        )
+        free_text_required_paths = [item["path"] for item in free_text_plan["required_edits"]]
+        assert any("/classes/external/" in path or path.endswith("/externallib.php") for path in free_text_required_paths)
+        assert any(path.endswith("_test.php") for path in free_text_required_paths)
+        assert len(free_text_plan["required_edits"]) <= 5
     finally:
         connection.close()
 

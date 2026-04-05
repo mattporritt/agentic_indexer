@@ -884,6 +884,276 @@ def semantic_context(
     return _semantic_context_for_query(connection, query_text or "", bounded_limit)
 
 
+def propose_change_plan(
+    connection: sqlite3.Connection,
+    *,
+    symbol_query: str | None = None,
+    file_path: str | None = None,
+    query_text: str | None = None,
+    limit: int = 10,
+) -> dict[str, object]:
+    """Return a bounded, agent-usable change plan around a symbol, file, or goal.
+
+    Phase 4E keeps planning intentionally conservative:
+    - reuse the existing structural and semantic endpoints as the substrate
+    - classify the strongest local artifacts into required/likely/optional edits
+    - derive a compact validation impact view from concrete tests/build surfaces
+    - suggest a short recommended inspection/update sequence without executing it
+    """
+
+    targets = [bool(symbol_query), bool(file_path), bool(query_text)]
+    if sum(targets) != 1:
+        raise ValidationError("Provide exactly one of --symbol, --file, or --query.")
+
+    bounded_limit = max(1, min(limit, 10))
+    if symbol_query:
+        return _change_plan_for_symbol(connection, symbol_query, bounded_limit)
+    if file_path:
+        return _change_plan_for_file(connection, file_path, bounded_limit)
+    return _change_plan_for_query(connection, query_text or "", bounded_limit)
+
+
+def _change_plan_for_symbol(
+    connection: sqlite3.Connection,
+    symbol_query: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return a change plan anchored on one resolved symbol."""
+
+    definition_data = find_definition(connection, symbol_query, limit=max(1, min(limit, 4)), include_usages=True)
+    matches = definition_data["matches"]
+    if not matches:
+        return _empty_change_plan(symbol_query, "symbol")
+
+    anchor_match = matches[0]
+    profile = _plan_profile_for_symbol(anchor_match)
+    edit_surface = suggest_edit_surface(connection, symbol_query=symbol_query, limit=limit)
+    neighborhood = dependency_neighborhood(connection, symbol_query=symbol_query, limit=min(6, limit))
+    semantic = semantic_context(connection, symbol_query=symbol_query, limit=min(6, limit))
+    plan = _synthesize_change_plan(
+        query=symbol_query,
+        query_kind="symbol",
+        anchor=_compact_match_summary(anchor_match),
+        matched_definitions=[_compact_match_summary(item) for item in matches],
+        total_matches=definition_data["total_matches"],
+        profile=profile,
+        edit_surface=edit_surface,
+        neighborhood=neighborhood,
+        semantic=semantic,
+        limit=limit,
+    )
+    return plan
+
+
+def _change_plan_for_file(
+    connection: sqlite3.Connection,
+    file_path: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return a change plan anchored on one indexed file."""
+
+    context = file_context(connection, file_path)
+    profile = _plan_profile_for_file(context)
+    edit_surface = suggest_edit_surface(connection, file_path=file_path, limit=limit)
+    neighborhood = dependency_neighborhood(connection, file_path=file_path, limit=min(6, limit))
+    semantic = semantic_context(connection, file_path=file_path, limit=min(6, limit))
+    plan = _synthesize_change_plan(
+        query=context["moodle_path"],
+        query_kind="file",
+        anchor={
+            "path": context["moodle_path"],
+            "file_role": context["file_role"],
+            "component": context["component"],
+        },
+        matched_definitions=[],
+        total_matches=1,
+        profile=profile,
+        edit_surface=edit_surface,
+        neighborhood=neighborhood,
+        semantic=semantic,
+        limit=limit,
+    )
+    return plan
+
+
+def _change_plan_for_query(
+    connection: sqlite3.Connection,
+    query_text: str,
+    limit: int,
+) -> dict[str, object]:
+    """Return a conservative change plan for a free-text change goal."""
+
+    semantic = semantic_context(connection, query_text=query_text, limit=min(6, limit))
+    profile = _plan_profile_for_query(query_text)
+    plan = _synthesize_change_plan(
+        query=query_text,
+        query_kind="query",
+        anchor=None,
+        matched_definitions=[],
+        total_matches=int(semantic.get("total_matches", 0) or 0),
+        profile=profile,
+        edit_surface=None,
+        neighborhood=None,
+        semantic=semantic,
+        limit=limit,
+    )
+    return plan
+
+
+def _empty_change_plan(query: str, query_kind: str) -> dict[str, object]:
+    """Return an empty change-plan payload."""
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": None,
+        "matched_definitions": [],
+        "total_matches": 0,
+        "required_edits": [],
+        "likely_edits": [],
+        "optional_edits": [],
+        "validation_impact": [],
+        "recommended_sequence": [],
+        "notes": [
+            "No matching anchor was found, so the planner could not synthesize a bounded edit set.",
+        ],
+    }
+
+
+def _synthesize_change_plan(
+    *,
+    query: str,
+    query_kind: str,
+    anchor: dict[str, object] | None,
+    matched_definitions: list[dict[str, object]],
+    total_matches: int,
+    profile: dict[str, object],
+    edit_surface: dict[str, object] | None,
+    neighborhood: dict[str, object] | None,
+    semantic: dict[str, object] | None,
+    limit: int,
+) -> dict[str, object]:
+    """Combine trusted structural and semantic signals into one bounded plan."""
+
+    candidates: list[dict[str, object]] = []
+    anchor_path = str(profile.get("anchor_path") or "")
+    anchor_symbol = str(profile.get("anchor_symbol") or "") or None
+    if anchor_path:
+        candidates.append(
+            _change_plan_candidate(
+                path=anchor_path,
+                symbol=anchor_symbol,
+                confidence="high",
+                reason=_anchor_change_reason(profile),
+                profile=profile,
+                relationship="anchor_definition",
+                item_type="definition_file" if query_kind == "symbol" else "anchor_file",
+                source_rank=0,
+            )
+        )
+
+    if edit_surface:
+        for item in edit_surface.get("primary_edit_surface", []):
+            candidate = _change_plan_candidate(
+                path=str(item["path"]),
+                symbol=_none_if_empty(item.get("symbol")),
+                confidence=str(item.get("confidence") or "medium"),
+                reason=str(item.get("reason") or ""),
+                profile=profile,
+                relationship=str(item.get("relationship") or "edit_surface"),
+                item_type=str(item.get("type") or _artifact_item_type(str(item["path"]), None)),
+                source_rank=1,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        for item in edit_surface.get("secondary_edit_surface", []):
+            candidate = _change_plan_candidate(
+                path=str(item["path"]),
+                symbol=_none_if_empty(item.get("symbol")),
+                confidence=str(item.get("confidence") or "medium"),
+                reason=str(item.get("reason") or ""),
+                profile=profile,
+                relationship=str(item.get("relationship") or "edit_surface"),
+                item_type=str(item.get("type") or _artifact_item_type(str(item["path"]), None)),
+                source_rank=3,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    if neighborhood:
+        for section_name, payload in neighborhood.get("sections", {}).items():
+            for item in payload.get("items", []):
+                candidate = _change_plan_candidate(
+                    path=str(item["path"]),
+                    symbol=_none_if_empty(item.get("symbol")),
+                    confidence=str(item.get("confidence") or "medium"),
+                    reason=str(item.get("explanation") or item.get("reason") or ""),
+                    profile=profile,
+                    relationship=str(item.get("relationship") or section_name),
+                    item_type=str(item.get("type") or _artifact_item_type(str(item["path"]), None)),
+                    source_rank=2,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+
+    if semantic:
+        for item in semantic.get("primary_semantic_context", []):
+            candidate = _change_plan_candidate(
+                path=str(item["path"]),
+                symbol=_none_if_empty(item.get("symbol")),
+                confidence=str(item.get("confidence") or "medium"),
+                reason=str(item.get("explanation") or ""),
+                profile=profile,
+                relationship="semantic_primary",
+                item_type=_artifact_item_type(str(item["path"]), None),
+                source_rank=4,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        for item in semantic.get("secondary_semantic_context", []):
+            candidate = _change_plan_candidate(
+                path=str(item["path"]),
+                symbol=_none_if_empty(item.get("symbol")),
+                confidence=str(item.get("confidence") or "medium"),
+                reason=str(item.get("explanation") or ""),
+                profile=profile,
+                relationship="semantic_secondary",
+                item_type=_artifact_item_type(str(item["path"]), None),
+                source_rank=5,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+
+    merged = _merge_change_plan_candidates(candidates)
+    required_edits = _ordered_change_candidates(merged, bucket="required", limit=min(limit, 5))
+    likely_edits = _ordered_change_candidates(merged, bucket="likely", limit=min(limit, 6))
+    optional_edits = _ordered_change_candidates(merged, bucket="optional", limit=min(limit, 6))
+    validation_impact = _derive_validation_impact(profile, required_edits, likely_edits, optional_edits, limit=min(limit, 6))
+    recommended_sequence = _derive_recommended_sequence(
+        profile,
+        required_edits,
+        likely_edits,
+        validation_impact,
+        limit=min(6, limit),
+    )
+
+    return {
+        "query": query,
+        "query_kind": query_kind,
+        "anchor": anchor,
+        "matched_definitions": matched_definitions,
+        "total_matches": total_matches,
+        "required_edits": required_edits,
+        "likely_edits": likely_edits,
+        "optional_edits": optional_edits,
+        "validation_impact": validation_impact,
+        "recommended_sequence": recommended_sequence,
+        "notes": [
+            "This plan is bounded and confidence-aware. It prioritizes direct structural companions over distant semantic examples.",
+        ],
+    }
+
+
 def _semantic_context_for_symbol(
     connection: sqlite3.Connection,
     symbol_query: str,
@@ -3816,6 +4086,458 @@ def _prune_generic_service_framework_sections(
     )
     if only_generic_class_files:
         finalized_sections.pop("linked_framework", None)
+
+
+def _plan_profile_for_symbol(match: dict[str, object]) -> dict[str, object]:
+    """Return a lightweight planning profile for one symbol anchor."""
+
+    path = str(match.get("file") or "")
+    linked_artifacts = match.get("linked_artifacts", {}) or {}
+    return {
+        "anchor_path": path,
+        "anchor_symbol": str(match.get("fqname") or match.get("module_name") or ""),
+        "anchor_type": str(match.get("symbol_type") or ""),
+        "anchor_file_role": _file_role_for_plan_path(path),
+        "service": bool(linked_artifacts.get("services")) or _file_role_for_plan_path(path) in {"external_api_class", "services_definition"},
+        "rendering": bool(linked_artifacts.get("rendering")) or _file_role_for_plan_path(path) in {"locallib_file", "output_class", "renderer_file", "template_file"},
+        "provider_form": "provider" in path and "/form/" not in path,
+        "js": str(match.get("symbol_type") or "") == "js_module" or "/amd/src/" in path,
+        "query_intent": {},
+    }
+
+
+def _plan_profile_for_file(context: dict[str, object]) -> dict[str, object]:
+    """Return a lightweight planning profile for one file anchor."""
+
+    path = str(context["moodle_path"])
+    file_role = str(context.get("file_role") or _file_role_for_plan_path(path))
+    linked_artifacts = context.get("linked_artifacts", {}) or {}
+    return {
+        "anchor_path": path,
+        "anchor_symbol": None,
+        "anchor_type": "file",
+        "anchor_file_role": file_role,
+        "service": file_role == "services_definition" or bool(linked_artifacts.get("services")),
+        "rendering": file_role in {"locallib_file", "output_class", "renderer_file", "template_file"} or bool(linked_artifacts.get("rendering")),
+        "provider_form": "provider" in path,
+        "js": file_role == "amd_source" or "/amd/src/" in path,
+        "query_intent": {},
+    }
+
+
+def _plan_profile_for_query(query_text: str) -> dict[str, object]:
+    """Return a lightweight planning profile for one free-text change goal."""
+
+    tokens = _semantic_focus_tokens(query_text)
+    intent = _semantic_query_intent(tokens)
+    return {
+        "anchor_path": "",
+        "anchor_symbol": None,
+        "anchor_type": "query",
+        "anchor_file_role": "",
+        "service": intent["external_api"],
+        "rendering": intent["rendering"],
+        "provider_form": intent["forms"],
+        "js": bool({"javascript", "js", "amd", "module"} & set(tokens)),
+        "query_intent": intent,
+    }
+
+
+def _anchor_change_reason(profile: dict[str, object]) -> str:
+    """Return the anchor-file explanation for change planning."""
+
+    anchor_symbol = str(profile.get("anchor_symbol") or "")
+    anchor_path = str(profile.get("anchor_path") or "")
+    if anchor_symbol:
+        return f"Defines the queried symbol {anchor_symbol}; inspect and update this implementation first."
+    return f"Defines the queried file anchor {anchor_path}; inspect and update this file first."
+
+
+def _change_plan_candidate(
+    *,
+    path: str,
+    symbol: str | None,
+    confidence: str,
+    reason: str,
+    profile: dict[str, object],
+    relationship: str,
+    item_type: str,
+    source_rank: int,
+) -> dict[str, object] | None:
+    """Classify one trusted navigation item into a plan candidate."""
+
+    if not path:
+        return None
+    bucket, change_role = _classify_change_plan_item(
+        path=path,
+        symbol=symbol,
+        relationship=relationship,
+        item_type=item_type,
+        profile=profile,
+    )
+    if bucket is None or change_role is None:
+        return None
+    return {
+        "path": path,
+        "symbol": symbol,
+        "change_role": change_role,
+        "confidence": confidence,
+        "reason": _change_plan_reason(
+            reason,
+            change_role=change_role,
+            relationship=relationship,
+            path=path,
+            profile=profile,
+        ),
+        "bucket": bucket,
+        "_source_rank": source_rank,
+    }
+
+
+def _classify_change_plan_item(
+    *,
+    path: str,
+    symbol: str | None,
+    relationship: str,
+    item_type: str,
+    profile: dict[str, object],
+) -> tuple[str | None, str | None]:
+    """Return required/likely/optional and one stable change role."""
+
+    anchor_path = str(profile.get("anchor_path") or "")
+    service = bool(profile.get("service"))
+    rendering = bool(profile.get("rendering"))
+    provider_form = bool(profile.get("provider_form"))
+    js = bool(profile.get("js"))
+    anchor_type = str(profile.get("anchor_type") or "")
+    intent = dict(profile.get("query_intent") or {})
+    file_role = _file_role_for_plan_path(path)
+
+    if path == anchor_path or relationship == "anchor_definition":
+        return "required", "implementation"
+
+    if item_type in {"service_implementation", "definition_file"} or relationship in {"definition_file", "service_implementation"}:
+        return "required", "implementation"
+
+    if item_type == "service_definition" or relationship == "service_definition" or path.endswith("/db/services.php"):
+        if anchor_type == "query":
+            return ("likely" if intent.get("external_api") else "optional"), "entrypoint"
+        return ("required" if service or intent.get("external_api") else "likely"), "entrypoint"
+
+    if item_type == "service_test" or "test" in relationship or path.endswith("_test.php") or path.endswith("_advanced_testcase.php"):
+        return ("required" if service or intent.get("tests") else "likely"), "validation"
+
+    if item_type == "output_class":
+        return ("likely" if rendering else "optional"), "rendering_companion"
+    if item_type == "renderer_file":
+        return ("likely" if rendering else "optional"), "rendering_companion"
+    if item_type == "template_file":
+        return "optional", "rendering_companion"
+
+    if item_type == "form_class":
+        if provider_form and "/provider/" in path:
+            if path.endswith("/action_form.php"):
+                return "likely", "form_companion"
+            return "required", "form_companion"
+        if provider_form or intent.get("forms"):
+            return "likely", "form_companion"
+        return "optional", "form_companion"
+
+    if item_type in {"framework_base", "class_file"} or file_role in {"lib_file", "settings_file"}:
+        if provider_form or rendering:
+            return "likely", "framework_context"
+        return "optional", "framework_context"
+
+    if item_type == "js_build_artifact" or "/amd/build/" in path:
+        return "optional", "build_artifact"
+
+    if item_type == "js_module" or "/amd/src/" in path:
+        if js:
+            return "likely", "implementation"
+        return "optional", "example_reference"
+
+    if intent.get("external_api") and ("/classes/external/" in path or path.endswith("/externallib.php")):
+        return "required", "implementation"
+
+    if relationship.startswith("semantic_"):
+        return "optional", "example_reference"
+    if service:
+        return "likely", "framework_context"
+    if rendering or provider_form or js:
+        return "optional", "example_reference"
+    return None, None
+
+
+def _change_plan_reason(
+    existing_reason: str,
+    *,
+    change_role: str,
+    relationship: str,
+    path: str,
+    profile: dict[str, object],
+) -> str:
+    """Return a decision-ready reason for one plan target."""
+
+    anchor_symbol = str(profile.get("anchor_symbol") or "")
+    anchor_label = anchor_symbol or str(profile.get("anchor_path") or "this change")
+    if change_role == "implementation":
+        if relationship in {"anchor_definition", "definition_file", "service_implementation"}:
+            return f"Defines the implementation for {anchor_label}; update this file first when behavior, parameters, or return shape changes."
+        if "/amd/src/" in path:
+            return f"Defines a directly linked source module for {anchor_label}; inspect it if dependency contracts or inherited client-side behavior must change."
+        return existing_reason or f"Implements behavior directly tied to {anchor_label}; inspect it when the core logic changes."
+    if change_role == "entrypoint":
+        return f"Registers or exposes {anchor_label} as an entrypoint; update it if signatures, routing, or service registration details change."
+    if change_role == "validation":
+        return f"Validates expected behavior around {anchor_label}; update this test or verification surface when outputs, parameters, or side effects change."
+    if change_role == "rendering_companion":
+        return f"Participates in the rendering flow around {anchor_label}; inspect it if rendered data, renderer logic, or template structure changes."
+    if change_role == "form_companion":
+        return f"Defines a concrete or inherited form used around {anchor_label}; update it if fields, defaults, or validation rules change."
+    if change_role == "framework_context":
+        return f"Provides framework or base-class context for {anchor_label}; inspect it if the change touches shared contracts or inherited behavior."
+    if change_role == "build_artifact":
+        return f"Generated build artifact for {anchor_label}; regenerate it only if the workflow commits built assets."
+    return existing_reason or f"Provides a comparable supporting example for {anchor_label}; inspect it if you need a reference implementation."
+
+
+def _merge_change_plan_candidates(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Deduplicate and keep the strongest plan classification for each path."""
+
+    merged: dict[str, dict[str, object]] = {}
+    for item in candidates:
+        path = str(item["path"])
+        existing = merged.get(path)
+        if existing is None:
+            merged[path] = dict(item)
+            continue
+        if _change_bucket_rank(str(item["bucket"])) < _change_bucket_rank(str(existing["bucket"])):
+            existing["bucket"] = item["bucket"]
+            existing["change_role"] = item["change_role"]
+            existing["reason"] = item["reason"]
+        elif (
+            _change_bucket_rank(str(item["bucket"])) == _change_bucket_rank(str(existing["bucket"]))
+            and _change_role_rank(str(item["change_role"])) < _change_role_rank(str(existing["change_role"]))
+        ):
+            existing["change_role"] = item["change_role"]
+            existing["reason"] = item["reason"]
+        if _confidence_rank(str(item["confidence"])) < _confidence_rank(str(existing["confidence"])):
+            existing["confidence"] = item["confidence"]
+        existing["_source_rank"] = min(int(existing.get("_source_rank", 99)), int(item.get("_source_rank", 99)))
+        if not existing.get("symbol") and item.get("symbol"):
+            existing["symbol"] = item["symbol"]
+    return list(merged.values())
+
+
+def _ordered_change_candidates(
+    candidates: list[dict[str, object]],
+    *,
+    bucket: str,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return one bounded ordered bucket of change-plan targets."""
+
+    ordered = sorted(
+        [item for item in candidates if str(item["bucket"]) == bucket],
+        key=lambda item: (
+            _change_role_rank(str(item["change_role"])),
+            _confidence_rank(str(item["confidence"])),
+            int(item.get("_source_rank", 99)),
+            str(item["path"]),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    return [
+        {
+            "path": str(item["path"]),
+            "symbol": item.get("symbol"),
+            "change_role": str(item["change_role"]),
+            "confidence": str(item["confidence"]),
+            "reason": str(item["reason"]),
+        }
+        for item in ordered[:limit]
+    ]
+
+
+def _derive_validation_impact(
+    profile: dict[str, object],
+    required_edits: list[dict[str, object]],
+    likely_edits: list[dict[str, object]],
+    optional_edits: list[dict[str, object]],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded validation surfaces likely affected by the change."""
+
+    items: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
+    for source in (required_edits, likely_edits, optional_edits):
+        for item in source:
+            path = str(item["path"])
+            if path in seen_paths:
+                continue
+            if str(item.get("change_role")) == "validation":
+                items.append(dict(item))
+                seen_paths.add(path)
+            elif str(item.get("change_role")) == "build_artifact":
+                items.append(
+                    {
+                        "path": path,
+                        "symbol": item.get("symbol"),
+                        "change_role": "build_artifact",
+                        "confidence": item.get("confidence", "medium"),
+                        "reason": f"Rebuild or verify this generated artifact after changing {anchor_label} if your workflow commits built assets.",
+                    }
+                )
+                seen_paths.add(path)
+    if profile.get("service"):
+        for item in required_edits + likely_edits:
+            if str(item.get("change_role")) == "entrypoint" and str(item["path"]) not in seen_paths:
+                items.append(
+                    {
+                        "path": str(item["path"]),
+                        "symbol": item.get("symbol"),
+                        "change_role": "validation",
+                        "confidence": item.get("confidence", "high"),
+                        "reason": f"Confirm the web-service registration still matches the updated API contract for {anchor_label}.",
+                    }
+                )
+                break
+    return items[:limit]
+
+
+def _derive_recommended_sequence(
+    profile: dict[str, object],
+    required_edits: list[dict[str, object]],
+    likely_edits: list[dict[str, object]],
+    validation_impact: list[dict[str, object]],
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return a concise recommended inspection/update sequence."""
+
+    steps: list[dict[str, object]] = []
+    step_number = 1
+    implementation = next((item for item in required_edits if item["change_role"] == "implementation"), None)
+    if implementation is not None:
+        steps.append(
+            {
+                "step": step_number,
+                "action": "inspect_and_update",
+                "target": implementation["path"],
+                "why": implementation["reason"],
+            }
+        )
+        step_number += 1
+    entrypoint = next((item for item in required_edits + likely_edits if item["change_role"] == "entrypoint"), None)
+    if entrypoint is not None:
+        steps.append(
+            {
+                "step": step_number,
+                "action": "update_entrypoint",
+                "target": entrypoint["path"],
+                "why": entrypoint["reason"],
+            }
+        )
+        step_number += 1
+    companion = next(
+        (
+            item
+            for item in required_edits + likely_edits
+            if item["change_role"] in {"rendering_companion", "form_companion", "framework_context"}
+        ),
+        None,
+    )
+    if companion is not None:
+        steps.append(
+            {
+                "step": step_number,
+                "action": "inspect_companion",
+                "target": companion["path"],
+                "why": companion["reason"],
+            }
+        )
+        step_number += 1
+    validation = next((item for item in validation_impact if item["change_role"] in {"validation", "build_artifact"}), None)
+    if validation is not None:
+        steps.append(
+            {
+                "step": step_number,
+                "action": "validate_change",
+                "target": validation["path"],
+                "why": validation["reason"],
+            }
+        )
+        step_number += 1
+    optional_example = next((item for item in likely_edits if item["change_role"] == "example_reference"), None)
+    if optional_example is not None:
+        steps.append(
+            {
+                "step": step_number,
+                "action": "review_reference_example",
+                "target": optional_example["path"],
+                "why": optional_example["reason"],
+            }
+        )
+    return steps[:limit]
+
+
+def _change_bucket_rank(bucket: str) -> int:
+    """Return sortable rank for one plan bucket."""
+
+    return {"required": 0, "likely": 1, "optional": 2}.get(bucket, 3)
+
+
+def _change_role_rank(role: str) -> int:
+    """Return sortable rank for one plan change role."""
+
+    return {
+        "implementation": 0,
+        "entrypoint": 1,
+        "validation": 2,
+        "rendering_companion": 3,
+        "form_companion": 4,
+        "framework_context": 5,
+        "build_artifact": 6,
+        "example_reference": 7,
+    }.get(role, 8)
+
+
+def _file_role_for_plan_path(path: str) -> str:
+    """Return a coarse file role for conservative planning heuristics."""
+
+    if path.endswith("/db/services.php"):
+        return "services_definition"
+    if "/classes/external/" in path or path.endswith("/externallib.php"):
+        return "external_api_class"
+    if path.endswith("/renderer.php"):
+        return "renderer_file"
+    if path.endswith(".mustache"):
+        return "template_file"
+    if "/classes/output/" in path:
+        return "output_class"
+    if "/classes/form/" in path or path.endswith("_form.php"):
+        return "form_class"
+    if "/amd/src/" in path:
+        return "amd_source"
+    if "/amd/build/" in path:
+        return "amd_build"
+    if path.endswith("/locallib.php"):
+        return "locallib_file"
+    if path.endswith("/lib.php"):
+        return "lib_file"
+    if path.endswith("/settings.php"):
+        return "settings_file"
+    return "unknown"
+
+
+def _none_if_empty(value: object) -> str | None:
+    """Return ``None`` for empty values and a string otherwise."""
+
+    if value in {None, ""}:
+        return None
+    return str(value)
 
 
 def _merge_dependency_section_items(

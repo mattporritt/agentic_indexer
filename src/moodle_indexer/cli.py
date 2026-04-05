@@ -23,6 +23,7 @@ from moodle_indexer.queries import (
     find_definition,
     find_related_definitions,
     find_symbol,
+    propose_change_plan,
     semantic_context,
     suggest_edit_surface,
     suggest_related,
@@ -154,6 +155,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of primary or secondary semantic-context items to return.",
     )
 
+    change_plan_parser = subparsers.add_parser(
+        "propose-change-plan",
+        help="Return a bounded, confidence-aware proposed edit set and change plan.",
+    )
+    change_plan_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
+    change_plan_target = change_plan_parser.add_mutually_exclusive_group(required=True)
+    change_plan_target.add_argument("--symbol", help="Definition query such as assign::view or core/ajax.")
+    change_plan_target.add_argument(
+        "--file",
+        help="Moodle-native, repository-relative, or absolute file path.",
+    )
+    change_plan_target.add_argument(
+        "--query",
+        help="Free-text change goal such as add a parameter to a Moodle external API method and update its tests.",
+    )
+    change_plan_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of required, likely, or optional plan items to return.",
+    )
+
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
     file_parser.add_argument(
@@ -205,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = run_dependency_neighborhood(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "semantic-context":
             payload = run_semantic_context(args.db_path, args.symbol, args.file, args.query, args.limit)
+        elif args.command == "propose-change-plan":
+            payload = run_propose_change_plan(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -319,6 +344,31 @@ def run_file_context(db_path: str, file_path: str) -> dict:
     connection = open_database(Path(db_path).expanduser().resolve())
     try:
         return success_payload("file-context", file_context(connection, file_path))
+    finally:
+        connection.close()
+
+
+def run_propose_change_plan(
+    db_path: str,
+    symbol: str | None,
+    file_path: str | None,
+    query: str | None,
+    limit: int,
+) -> dict:
+    """Execute the ``propose-change-plan`` command."""
+
+    connection = open_database(Path(db_path).expanduser().resolve())
+    try:
+        return success_payload(
+            "propose-change-plan",
+            propose_change_plan(
+                connection,
+                symbol_query=symbol,
+                file_path=file_path,
+                query_text=query,
+                limit=limit,
+            ),
+        )
     finally:
         connection.close()
 
