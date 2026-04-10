@@ -161,6 +161,15 @@ moodle-indexer build-context-bundle \
   --query 'add a parameter to a Moodle external API method and update its tests'
 ```
 
+Query the runtime-facing contract wrapper:
+
+```bash
+moodle-indexer find-definition \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol 'mod_assign\external\start_submission::execute' \
+  --json-contract
+```
+
 ## Core Commands
 
 The commands below are the main public surface for v1.
@@ -337,6 +346,118 @@ Returns:
 - `bundle_stats`
 
 Call this when an agent is about to start a task and needs a bounded context package that is safe to load into a working context window.
+
+## Runtime-Facing Contract
+
+The indexer now exposes a small runtime-facing contract mode aligned to the
+shared outer-envelope style used by the related internal tools.
+
+Currently supported commands:
+
+- `find-definition`
+- `semantic-context`
+- `build-context-bundle`
+
+Enable it with:
+
+- `--json-contract`
+
+This mode is intentionally narrow:
+
+- it reuses the existing command logic
+- it leaves the current human-oriented output modes unchanged
+- it only changes the outer wrapper, not the inner meaning of the command
+
+### Contract Envelope
+
+The outer envelope is:
+
+```json
+{
+  "tool": "agentic_indexer",
+  "version": "v1",
+  "query": "...",
+  "normalized_query": "...",
+  "intent": {
+    "command": "...",
+    "query_kind": "...",
+    "response_mode": "...",
+    "symbol_type_filter": null,
+    "include_usages": null,
+    "limit": 10
+  },
+  "results": []
+}
+```
+
+### Provenance Semantics
+
+Every runtime result includes a normalized `source` object:
+
+- `name`: always `code_index`
+- `type`: always `indexed_codebase`
+- `url`: `null`
+- `canonical_url`: `null`
+- `path`: relevant indexed file path when applicable
+- `document_title`: `null`
+- `section_title`: `null`
+- `heading_path`: always a list, usually `[]` for code results
+
+This keeps provenance explicit and predictable for runtime callers.
+
+### Confidence Semantics
+
+Confidence is intentionally coarse:
+
+- `high`: direct structural anchor or high-confidence indexed companion
+- `medium`: useful but less direct structural or semantic support
+- `low`: reserved for weaker cases and used sparingly
+
+### Stable IDs
+
+The runtime contract adds deterministic IDs derived from stable identifying
+fields such as:
+
+- command
+- file path
+- symbol or module name
+- chunk ID
+- nested role/step identity where practical
+
+These IDs are intended for:
+
+- deduping
+- traceability
+- runtime-side merging across repeated calls
+
+### Examples
+
+Definition lookup:
+
+```bash
+moodle-indexer find-definition \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol 'mod_assign\external\start_submission::execute' \
+  --json-contract
+```
+
+Semantic context:
+
+```bash
+moodle-indexer semantic-context \
+  --db-path /path/to/moodle-index.sqlite \
+  --symbol 'mod_assign\external\start_submission::execute' \
+  --json-contract
+```
+
+Context bundle:
+
+```bash
+moodle-indexer build-context-bundle \
+  --db-path /path/to/moodle-index.sqlite \
+  --query 'add a parameter to a Moodle external API method and update its tests' \
+  --json-contract
+```
 
 ## Architecture And Mental Model
 

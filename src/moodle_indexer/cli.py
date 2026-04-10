@@ -39,6 +39,7 @@ from moodle_indexer.queries import (
     suggest_edit_surface,
     suggest_related,
 )
+from moodle_indexer.runtime_contract import build_runtime_contract
 from moodle_indexer.store import open_database
 
 
@@ -88,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Include a small number of usage examples.",
+    )
+    definition_parser.add_argument(
+        "--json-contract",
+        action="store_true",
+        help="Emit the stable runtime-facing JSON contract envelope.",
     )
 
     related_definitions_parser = subparsers.add_parser(
@@ -164,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Maximum number of primary or secondary semantic-context items to return.",
+    )
+    semantic_parser.add_argument(
+        "--json-contract",
+        action="store_true",
+        help="Emit the stable runtime-facing JSON contract envelope.",
     )
 
     change_plan_parser = subparsers.add_parser(
@@ -253,6 +264,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Maximum number of supporting or optional bundle items to return.",
     )
+    bundle_parser.add_argument(
+        "--json-contract",
+        action="store_true",
+        help="Emit the stable runtime-facing JSON contract envelope.",
+    )
 
     file_parser = subparsers.add_parser("file-context", help="Return indexed metadata for one file.")
     file_parser.add_argument("--db-path", required=True, help="Path to an existing SQLite index.")
@@ -296,7 +312,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "find-symbol":
             payload = run_find_symbol(args.db_path, args.symbol)
         elif args.command == "find-definition":
-            payload = run_find_definition(args.db_path, args.symbol, args.type, args.limit, args.include_usages)
+            payload = run_find_definition(
+                args.db_path,
+                args.symbol,
+                args.type,
+                args.limit,
+                args.include_usages,
+                json_contract=args.json_contract,
+            )
         elif args.command == "find-related-definitions":
             payload = run_find_related_definitions(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "suggest-edit-surface":
@@ -304,7 +327,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dependency-neighborhood":
             payload = run_dependency_neighborhood(args.db_path, args.symbol, args.file, args.limit)
         elif args.command == "semantic-context":
-            payload = run_semantic_context(args.db_path, args.symbol, args.file, args.query, args.limit)
+            payload = run_semantic_context(
+                args.db_path,
+                args.symbol,
+                args.file,
+                args.query,
+                args.limit,
+                json_contract=args.json_contract,
+            )
         elif args.command == "propose-change-plan":
             payload = run_propose_change_plan(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "assess-test-impact":
@@ -312,7 +342,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "execution-guardrails":
             payload = run_execution_guardrails(args.db_path, args.symbol, args.file, args.query, args.limit)
         elif args.command == "build-context-bundle":
-            payload = run_build_context_bundle(args.db_path, args.symbol, args.file, args.query, args.limit)
+            payload = run_build_context_bundle(
+                args.db_path,
+                args.symbol,
+                args.file,
+                args.query,
+                args.limit,
+                json_contract=args.json_contract,
+            )
         elif args.command == "file-context":
             payload = run_file_context(args.db_path, args.file)
         elif args.command == "component-summary":
@@ -322,9 +359,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise IndexerError(f"Unsupported command: {args.command}")
     except IndexerError as exc:
+        if getattr(args, "json_contract", False) and args.command in {"find-definition", "semantic-context", "build-context-bundle"}:
+            print(dumps_json(_runtime_error_contract(args, str(exc))))
+            return 2
         print(dumps_json(error_payload(args.command, str(exc), error_type=type(exc).__name__)))
         return 2
     except FileNotFoundError as exc:
+        if getattr(args, "json_contract", False) and args.command in {"find-definition", "semantic-context", "build-context-bundle"}:
+            print(dumps_json(_runtime_error_contract(args, str(exc))))
+            return 2
         print(dumps_json(error_payload(args.command, str(exc), error_type="FileNotFoundError")))
         return 2
 
@@ -350,15 +393,31 @@ def run_find_symbol(db_path: str, symbol: str) -> dict:
         connection.close()
 
 
-def run_find_definition(db_path: str, symbol: str, symbol_type: str, limit: int, include_usages: bool) -> dict:
+def run_find_definition(
+    db_path: str,
+    symbol: str,
+    symbol_type: str,
+    limit: int,
+    include_usages: bool,
+    *,
+    json_contract: bool = False,
+) -> dict:
     """Execute the ``find-definition`` command."""
 
     connection = open_database(Path(db_path).expanduser().resolve())
     try:
-        return success_payload(
-            "find-definition",
-            find_definition(connection, symbol, symbol_type=symbol_type, limit=limit, include_usages=include_usages),
-        )
+        data = find_definition(connection, symbol, symbol_type=symbol_type, limit=limit, include_usages=include_usages)
+        if json_contract:
+            return build_runtime_contract(
+                command="find-definition",
+                data=data,
+                query=symbol,
+                query_kind="symbol",
+                limit=limit,
+                symbol_type=symbol_type,
+                include_usages=include_usages,
+            )
+        return success_payload("find-definition", data)
     finally:
         connection.close()
 
@@ -408,15 +467,23 @@ def run_semantic_context(
     file_path: str | None,
     query_text: str | None,
     limit: int,
+    *,
+    json_contract: bool = False,
 ) -> dict:
     """Execute the ``semantic-context`` command."""
 
     connection = open_database(Path(db_path).expanduser().resolve())
     try:
-        return success_payload(
-            "semantic-context",
-            semantic_context(connection, symbol_query=symbol, file_path=file_path, query_text=query_text, limit=limit),
-        )
+        data = semantic_context(connection, symbol_query=symbol, file_path=file_path, query_text=query_text, limit=limit)
+        if json_contract:
+            return build_runtime_contract(
+                command="semantic-context",
+                data=data,
+                query=symbol or file_path or query_text or "",
+                query_kind=_runtime_query_kind(symbol=symbol, file_path=file_path, query_text=query_text),
+                limit=limit,
+            )
+        return success_payload("semantic-context", data)
     finally:
         connection.close()
 
@@ -512,21 +579,29 @@ def run_build_context_bundle(
     file_path: str | None,
     query_text: str | None,
     limit: int,
+    *,
+    json_contract: bool = False,
 ) -> dict:
     """Return a compact agent-ready context bundle around a symbol, file, or goal."""
 
     connection = open_database(Path(db_path))
     try:
-        return success_payload(
-            "build-context-bundle",
-            build_context_bundle(
-                connection,
-                symbol_query=symbol,
-                file_path=file_path,
-                query_text=query_text,
-                limit=limit,
-            ),
+        data = build_context_bundle(
+            connection,
+            symbol_query=symbol,
+            file_path=file_path,
+            query_text=query_text,
+            limit=limit,
         )
+        if json_contract:
+            return build_runtime_contract(
+                command="build-context-bundle",
+                data=data,
+                query=symbol or file_path or query_text or "",
+                query_kind=_runtime_query_kind(symbol=symbol, file_path=file_path, query_text=query_text),
+                limit=limit,
+            )
+        return success_payload("build-context-bundle", data)
     finally:
         connection.close()
 
@@ -539,6 +614,35 @@ def run_component_summary(db_path: str, component: str) -> dict:
         return success_payload("component-summary", component_summary(connection, component))
     finally:
         connection.close()
+
+
+def _runtime_query_kind(*, symbol: str | None, file_path: str | None, query_text: str | None) -> str:
+    """Return the stable runtime query-kind label for one command invocation."""
+
+    if symbol:
+        return "symbol"
+    if file_path:
+        return "file"
+    return "query"
+
+
+def _runtime_error_contract(args: argparse.Namespace, message: str) -> dict:
+    """Return an empty runtime envelope for supported command errors."""
+
+    query = getattr(args, "symbol", None) or getattr(args, "file", None) or getattr(args, "query", None) or ""
+    return build_runtime_contract(
+        command=args.command,
+        data={},
+        query=query,
+        query_kind=_runtime_query_kind(
+            symbol=getattr(args, "symbol", None),
+            file_path=getattr(args, "file", None),
+            query_text=getattr(args, "query", None),
+        ),
+        limit=int(getattr(args, "limit", 0) or 0),
+        symbol_type=getattr(args, "type", None),
+        include_usages=getattr(args, "include_usages", None),
+    )
 
 
 def run_suggest_related(db_path: str, file_path: str) -> dict:
