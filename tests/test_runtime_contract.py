@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from importlib.resources import files
 from pathlib import Path
 
 from moodle_indexer.cli import main
-from moodle_indexer.runtime_contract import runtime_contract_schema
+from moodle_indexer.runtime_contract import runtime_contract_schema, validate_runtime_contract
 
 
 def _assert_runtime_envelope(payload: dict) -> None:
@@ -18,6 +19,7 @@ def _assert_runtime_envelope(payload: dict) -> None:
     assert isinstance(payload["normalized_query"], str)
     assert isinstance(payload["intent"], dict)
     assert isinstance(payload["results"], list)
+    assert validate_runtime_contract(payload) == payload
 
 
 def _assert_runtime_result(result: dict) -> None:
@@ -32,6 +34,16 @@ def _assert_runtime_result(result: dict) -> None:
     assert isinstance(result["source"], dict)
     assert set(schema["required_source_fields"]).issubset(result["source"].keys())
     assert result["source"]["heading_path"] == list(result["source"]["heading_path"])
+
+
+def test_vendored_canonical_outer_schema_artifact_exists() -> None:
+    schema_path = files("moodle_indexer").joinpath("contracts/runtime_outer_schema_v1.json")
+    assert schema_path.is_file()
+    payload = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert payload["schema_name"] == "shared_outer_runtime_contract"
+    assert payload["version"] == "v1"
+    assert payload["adopted_from"] == "agentic_devdocs"
+    assert payload["required_top_level_fields"] == runtime_contract_schema()["required_top_level_fields"]
 
 
 def test_find_definition_json_contract_has_stable_outer_envelope(classic_db_path: Path, capsys) -> None:

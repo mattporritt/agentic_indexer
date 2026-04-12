@@ -30,5 +30,8 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+moodle_indexer = ["contracts/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,43 @@
+{
+  "schema_name": "shared_outer_runtime_contract",
+  "version": "v1",
+  "adopted_from": "agentic_devdocs",
+  "description": "Canonical shared outer runtime schema for runtime-facing tool envelopes. Tool-specific content payloads remain internal to each tool.",
+  "required_top_level_fields": [
+    "tool",
+    "version",
+    "query",
+    "normalized_query",
+    "intent",
+    "results"
+  ],
+  "required_result_fields": [
+    "id",
+    "type",
+    "rank",
+    "confidence",
+    "source",
+    "content",
+    "diagnostics"
+  ],
+  "required_source_fields": [
+    "name",
+    "type",
+    "url",
+    "canonical_url",
+    "path",
+    "document_title",
+    "section_title",
+    "heading_path"
+  ],
+  "presence_semantics": {
+    "required_fields_always_present": true,
+    "lists_always_present": true,
+    "nullable_fields_remain_present_as_null": true
+  },
+  "allowed_confidence_values": [
+    "high",
+    "medium",
+    "low"
+  ]
+}

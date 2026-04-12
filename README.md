@@ -350,7 +350,12 @@ Call this when an agent is about to start a task and needs a bounded context pac
 ## Runtime-Facing Contract
 
 The indexer now exposes a small runtime-facing contract mode aligned to the
-shared outer-envelope style used by the related internal tools.
+canonical shared outer runtime schema owned by `agentic_devdocs`.
+
+`agentic_indexer` vendors that shared outer schema artifact and validates live
+`--json-contract` output against it. The outer envelope, result shell, and
+provenance semantics are shared; the inner `results[].content` payload remains
+tool-specific to preserve useful indexer semantics.
 
 Currently supported commands:
 
@@ -369,6 +374,13 @@ This mode is intentionally narrow:
 - it only changes the outer wrapper, not the inner meaning of the command
 - it validates the final envelope so required fields, null semantics, and list
   semantics stay stable across runtime calls
+
+Conformance is checked in two places:
+
+- the runtime contract builder validates live output against the vendored
+  canonical outer schema
+- focused tests exercise live `--json-contract` responses for the supported
+  commands
 
 ### Contract Envelope
 

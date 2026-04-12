@@ -1,59 +1,31 @@
 """Stable runtime-facing contract builders for selected CLI commands.
 
-This module aligns ``agentic_indexer`` with the shared outer-envelope style
-used by the broader agentic toolchain. The contract intentionally wraps
-existing command outputs rather than replacing their internal semantics.
-
-The contract builder also validates the final envelope before it reaches the
-CLI so drift is caught in one place instead of being left solely to tests.
+This module adopts the canonical shared outer runtime schema used by
+``agentic_devdocs`` and applies it to ``agentic_indexer`` results. The shared
+schema governs the outer envelope, result shell, and provenance semantics while
+tool-specific ``content`` payloads remain indexer-specific.
 """
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
+from functools import lru_cache
 from hashlib import sha1
+from importlib.resources import files
 from typing import Any
 
 
 RUNTIME_TOOL_NAME = "agentic_indexer"
 RUNTIME_VERSION = "v1"
-ALLOWED_CONFIDENCE_VALUES = {"high", "medium", "low"}
-RUNTIME_CONTRACT_SCHEMA_V1 = {
-    "tool": RUNTIME_TOOL_NAME,
-    "version": RUNTIME_VERSION,
-    "required_top_level_fields": [
-        "tool",
-        "version",
-        "query",
-        "normalized_query",
-        "intent",
-        "results",
-    ],
-    "required_result_fields": [
-        "id",
-        "type",
-        "rank",
-        "confidence",
-        "source",
-        "content",
-        "diagnostics",
-    ],
-    "required_source_fields": [
-        "name",
-        "type",
-        "url",
-        "canonical_url",
-        "path",
-        "document_title",
-        "section_title",
-        "heading_path",
-    ],
-    "presence_semantics": {
-        "required_fields_always_present": True,
-        "lists_always_present": True,
-        "nullable_fields_remain_present_as_null": True,
-    },
-}
+
+
+@lru_cache(maxsize=1)
+def _canonical_outer_schema() -> dict[str, Any]:
+    """Load the vendored canonical shared outer runtime schema artifact."""
+
+    schema_path = files("moodle_indexer").joinpath("contracts/runtime_outer_schema_v1.json")
+    return json.loads(schema_path.read_text(encoding="utf-8"))
 
 
 def normalize_contract_query(value: str | None) -> str:
@@ -119,9 +91,9 @@ def build_runtime_contract(
 
 
 def runtime_contract_schema() -> dict[str, Any]:
-    """Return the shared runtime-envelope schema artifact for review/tooling."""
+    """Return the vendored canonical shared outer runtime schema artifact."""
 
-    return deepcopy(RUNTIME_CONTRACT_SCHEMA_V1)
+    return deepcopy(_canonical_outer_schema())
 
 
 def validate_runtime_contract(payload: dict[str, Any]) -> dict[str, Any]:
@@ -133,7 +105,9 @@ def validate_runtime_contract(payload: dict[str, Any]) -> dict[str, Any]:
     """
 
     _require_mapping(payload, "runtime contract")
-    _require_fields(payload, RUNTIME_CONTRACT_SCHEMA_V1["required_top_level_fields"], context="runtime contract")
+    schema = _canonical_outer_schema()
+    allowed_confidence_values = set(schema["allowed_confidence_values"])
+    _require_fields(payload, schema["required_top_level_fields"], context="runtime contract")
 
     if payload["tool"] != RUNTIME_TOOL_NAME:
         raise ValueError(f"Invalid runtime contract tool: {payload['tool']!r}")
@@ -149,7 +123,10 @@ def validate_runtime_contract(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload["results"], list):
         raise ValueError("Runtime contract field 'results' must be a list.")
 
-    validated_results = [_validate_runtime_result(result, rank=index) for index, result in enumerate(payload["results"], start=1)]
+    validated_results = [
+        _validate_runtime_result(result, rank=index, schema=schema, allowed_confidence_values=allowed_confidence_values)
+        for index, result in enumerate(payload["results"], start=1)
+    ]
 
     return {
         "tool": payload["tool"],
@@ -408,8 +385,9 @@ def _contract_source(*, path: str | None) -> dict[str, Any]:
 def _normalize_confidence(value: Any) -> str:
     """Return one of the shared coarse confidence labels."""
 
+    allowed_confidence_values = set(_canonical_outer_schema()["allowed_confidence_values"])
     normalized = str(value or "medium").strip().lower()
-    if normalized in ALLOWED_CONFIDENCE_VALUES:
+    if normalized in allowed_confidence_values:
         return normalized
     return "medium"
 
@@ -438,15 +416,21 @@ def _require_fields(mapping: dict[str, Any], fields: list[str], *, context: str)
         raise ValueError(f"{context} is missing required fields: {', '.join(missing)}")
 
 
-def _validate_runtime_result(result: Any, *, rank: int) -> dict[str, Any]:
+def _validate_runtime_result(
+    result: Any,
+    *,
+    rank: int,
+    schema: dict[str, Any],
+    allowed_confidence_values: set[str],
+) -> dict[str, Any]:
     """Validate and normalize one runtime contract result."""
 
     _require_mapping(result, f"runtime contract result #{rank}")
-    _require_fields(result, RUNTIME_CONTRACT_SCHEMA_V1["required_result_fields"], context=f"runtime contract result #{rank}")
+    _require_fields(result, schema["required_result_fields"], context=f"runtime contract result #{rank}")
     _require_mapping(result["source"], f"runtime contract result #{rank} source")
     _require_fields(
         result["source"],
-        RUNTIME_CONTRACT_SCHEMA_V1["required_source_fields"],
+        schema["required_source_fields"],
         context=f"runtime contract result #{rank} source",
     )
     _require_mapping(result["content"], f"runtime contract result #{rank} content")
@@ -458,7 +442,7 @@ def _validate_runtime_result(result: Any, *, rank: int) -> dict[str, Any]:
         raise ValueError(f"runtime contract result #{rank} must include a non-empty string type")
     if not isinstance(result["rank"], int):
         raise ValueError(f"runtime contract result #{rank} must include an integer rank")
-    if result["confidence"] not in ALLOWED_CONFIDENCE_VALUES:
+    if result["confidence"] not in allowed_confidence_values:
         raise ValueError(f"runtime contract result #{rank} has invalid confidence {result['confidence']!r}")
     if not isinstance(result["source"]["heading_path"], list):
         raise ValueError(f"runtime contract result #{rank} source heading_path must be a list")
