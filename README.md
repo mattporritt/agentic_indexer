@@ -367,6 +367,8 @@ This mode is intentionally narrow:
 - it reuses the existing command logic
 - it leaves the current human-oriented output modes unchanged
 - it only changes the outer wrapper, not the inner meaning of the command
+- it validates the final envelope so required fields, null semantics, and list
+  semantics stay stable across runtime calls
 
 ### Contract Envelope
 

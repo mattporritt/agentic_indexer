@@ -3,16 +3,57 @@
 This module aligns ``agentic_indexer`` with the shared outer-envelope style
 used by the broader agentic toolchain. The contract intentionally wraps
 existing command outputs rather than replacing their internal semantics.
+
+The contract builder also validates the final envelope before it reaches the
+CLI so drift is caught in one place instead of being left solely to tests.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 from hashlib import sha1
 from typing import Any
 
 
 RUNTIME_TOOL_NAME = "agentic_indexer"
 RUNTIME_VERSION = "v1"
+ALLOWED_CONFIDENCE_VALUES = {"high", "medium", "low"}
+RUNTIME_CONTRACT_SCHEMA_V1 = {
+    "tool": RUNTIME_TOOL_NAME,
+    "version": RUNTIME_VERSION,
+    "required_top_level_fields": [
+        "tool",
+        "version",
+        "query",
+        "normalized_query",
+        "intent",
+        "results",
+    ],
+    "required_result_fields": [
+        "id",
+        "type",
+        "rank",
+        "confidence",
+        "source",
+        "content",
+        "diagnostics",
+    ],
+    "required_source_fields": [
+        "name",
+        "type",
+        "url",
+        "canonical_url",
+        "path",
+        "document_title",
+        "section_title",
+        "heading_path",
+    ],
+    "presence_semantics": {
+        "required_fields_always_present": True,
+        "lists_always_present": True,
+        "nullable_fields_remain_present_as_null": True,
+    },
+}
 
 
 def normalize_contract_query(value: str | None) -> str:
@@ -66,13 +107,57 @@ def build_runtime_contract(
     else:
         raise ValueError(f"Unsupported runtime contract command: {command}")
 
-    return {
+    payload = {
         "tool": RUNTIME_TOOL_NAME,
         "version": RUNTIME_VERSION,
         "query": query,
         "normalized_query": normalize_contract_query(query),
         "intent": intent,
         "results": results,
+    }
+    return validate_runtime_contract(payload)
+
+
+def runtime_contract_schema() -> dict[str, Any]:
+    """Return the shared runtime-envelope schema artifact for review/tooling."""
+
+    return deepcopy(RUNTIME_CONTRACT_SCHEMA_V1)
+
+
+def validate_runtime_contract(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize one runtime contract envelope.
+
+    The validation here is intentionally small and strict around the shared
+    outer shape. Tool-specific ``content`` payloads remain flexible, but the
+    runtime can rely on stable top-level/result/source semantics.
+    """
+
+    _require_mapping(payload, "runtime contract")
+    _require_fields(payload, RUNTIME_CONTRACT_SCHEMA_V1["required_top_level_fields"], context="runtime contract")
+
+    if payload["tool"] != RUNTIME_TOOL_NAME:
+        raise ValueError(f"Invalid runtime contract tool: {payload['tool']!r}")
+    if payload["version"] != RUNTIME_VERSION:
+        raise ValueError(f"Invalid runtime contract version: {payload['version']!r}")
+
+    if not isinstance(payload["query"], str):
+        raise ValueError("Runtime contract field 'query' must be a string.")
+    if not isinstance(payload["normalized_query"], str):
+        raise ValueError("Runtime contract field 'normalized_query' must be a string.")
+
+    _require_mapping(payload["intent"], "runtime contract intent")
+    if not isinstance(payload["results"], list):
+        raise ValueError("Runtime contract field 'results' must be a list.")
+
+    validated_results = [_validate_runtime_result(result, rank=index) for index, result in enumerate(payload["results"], start=1)]
+
+    return {
+        "tool": payload["tool"],
+        "version": payload["version"],
+        "query": payload["query"],
+        "normalized_query": payload["normalized_query"],
+        "intent": payload["intent"],
+        "results": validated_results,
     }
 
 
@@ -81,14 +166,14 @@ def _definition_contract_results(data: dict[str, Any]) -> list[dict[str, Any]]:
 
     results: list[dict[str, Any]] = []
     for rank, match in enumerate(list(data.get("matches", [])), start=1):
-        path = str(match.get("file") or "")
+        path = _normalize_nullable_string(match.get("file"))
         fqname = str(match.get("fqname") or match.get("module_name") or match.get("name") or "")
         results.append(
             {
                 "id": _stable_id("definition_match", path, fqname, str(match.get("line") or "")),
                 "type": "definition_match",
                 "rank": rank,
-                "confidence": _definition_confidence(match),
+                "confidence": _normalize_confidence(_definition_confidence(match)),
                 "source": _contract_source(path=path),
                 "content": {
                     "symbol_type": match.get("symbol_type"),
@@ -139,14 +224,14 @@ def _semantic_contract_results(data: dict[str, Any]) -> list[dict[str, Any]]:
     items = list(data.get("primary_semantic_context", [])) + list(data.get("secondary_semantic_context", []))
     results: list[dict[str, Any]] = []
     for rank, item in enumerate(items, start=1):
-        path = str(item.get("path") or "")
+        path = _normalize_nullable_string(item.get("path"))
         symbol = str(item.get("symbol") or "")
         results.append(
             {
                 "id": _stable_id("semantic_context", str(item.get("chunk_id") or ""), path, symbol),
                 "type": "semantic_context",
                 "rank": rank,
-                "confidence": str(item.get("confidence") or "medium"),
+                "confidence": _normalize_confidence(item.get("confidence")),
                 "source": _contract_source(path=path),
                 "content": {
                     "path": item.get("path"),
@@ -179,7 +264,7 @@ def _context_bundle_contract_results(data: dict[str, Any]) -> list[dict[str, Any
         "id": _stable_id("context_bundle", query_kind, source_path, str(data.get("query") or "")),
         "type": "context_bundle",
         "rank": 1,
-        "confidence": confidence,
+        "confidence": _normalize_confidence(confidence),
         "source": _contract_source(path=source_path or None),
         "content": {
             "anchor": _bundle_anchor(data.get("anchor")),
@@ -313,10 +398,90 @@ def _contract_source(*, path: str | None) -> dict[str, Any]:
         "type": "indexed_codebase",
         "url": None,
         "canonical_url": None,
-        "path": path,
+        "path": _normalize_nullable_string(path),
         "document_title": None,
         "section_title": None,
         "heading_path": [],
+    }
+
+
+def _normalize_confidence(value: Any) -> str:
+    """Return one of the shared coarse confidence labels."""
+
+    normalized = str(value or "medium").strip().lower()
+    if normalized in ALLOWED_CONFIDENCE_VALUES:
+        return normalized
+    return "medium"
+
+
+def _normalize_nullable_string(value: Any) -> str | None:
+    """Normalize empty/blank strings to ``None`` for stable nullable fields."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _require_mapping(value: Any, context: str) -> None:
+    """Raise if a runtime contract section is not a mapping."""
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be an object.")
+
+
+def _require_fields(mapping: dict[str, Any], fields: list[str], *, context: str) -> None:
+    """Raise if any required runtime contract fields are missing."""
+
+    missing = [field for field in fields if field not in mapping]
+    if missing:
+        raise ValueError(f"{context} is missing required fields: {', '.join(missing)}")
+
+
+def _validate_runtime_result(result: Any, *, rank: int) -> dict[str, Any]:
+    """Validate and normalize one runtime contract result."""
+
+    _require_mapping(result, f"runtime contract result #{rank}")
+    _require_fields(result, RUNTIME_CONTRACT_SCHEMA_V1["required_result_fields"], context=f"runtime contract result #{rank}")
+    _require_mapping(result["source"], f"runtime contract result #{rank} source")
+    _require_fields(
+        result["source"],
+        RUNTIME_CONTRACT_SCHEMA_V1["required_source_fields"],
+        context=f"runtime contract result #{rank} source",
+    )
+    _require_mapping(result["content"], f"runtime contract result #{rank} content")
+    _require_mapping(result["diagnostics"], f"runtime contract result #{rank} diagnostics")
+
+    if not isinstance(result["id"], str) or not result["id"]:
+        raise ValueError(f"runtime contract result #{rank} must include a non-empty string id")
+    if not isinstance(result["type"], str) or not result["type"]:
+        raise ValueError(f"runtime contract result #{rank} must include a non-empty string type")
+    if not isinstance(result["rank"], int):
+        raise ValueError(f"runtime contract result #{rank} must include an integer rank")
+    if result["confidence"] not in ALLOWED_CONFIDENCE_VALUES:
+        raise ValueError(f"runtime contract result #{rank} has invalid confidence {result['confidence']!r}")
+    if not isinstance(result["source"]["heading_path"], list):
+        raise ValueError(f"runtime contract result #{rank} source heading_path must be a list")
+
+    source = {
+        "name": result["source"]["name"],
+        "type": result["source"]["type"],
+        "url": result["source"]["url"],
+        "canonical_url": result["source"]["canonical_url"],
+        "path": _normalize_nullable_string(result["source"]["path"]),
+        "document_title": result["source"]["document_title"],
+        "section_title": result["source"]["section_title"],
+        "heading_path": list(result["source"]["heading_path"]),
+    }
+
+    return {
+        "id": result["id"],
+        "type": result["type"],
+        "rank": result["rank"],
+        "confidence": result["confidence"],
+        "source": source,
+        "content": result["content"],
+        "diagnostics": result["diagnostics"],
     }
 
 

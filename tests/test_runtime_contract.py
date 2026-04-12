@@ -6,6 +6,32 @@ import json
 from pathlib import Path
 
 from moodle_indexer.cli import main
+from moodle_indexer.runtime_contract import runtime_contract_schema
+
+
+def _assert_runtime_envelope(payload: dict) -> None:
+    schema = runtime_contract_schema()
+    assert set(schema["required_top_level_fields"]).issubset(payload.keys())
+    assert payload["tool"] == "agentic_indexer"
+    assert payload["version"] == "v1"
+    assert isinstance(payload["query"], str)
+    assert isinstance(payload["normalized_query"], str)
+    assert isinstance(payload["intent"], dict)
+    assert isinstance(payload["results"], list)
+
+
+def _assert_runtime_result(result: dict) -> None:
+    schema = runtime_contract_schema()
+    assert set(schema["required_result_fields"]).issubset(result.keys())
+    assert isinstance(result["id"], str)
+    assert isinstance(result["type"], str)
+    assert isinstance(result["rank"], int)
+    assert result["confidence"] in {"high", "medium", "low"}
+    assert isinstance(result["content"], dict)
+    assert isinstance(result["diagnostics"], dict)
+    assert isinstance(result["source"], dict)
+    assert set(schema["required_source_fields"]).issubset(result["source"].keys())
+    assert result["source"]["heading_path"] == list(result["source"]["heading_path"])
 
 
 def test_find_definition_json_contract_has_stable_outer_envelope(classic_db_path: Path, capsys) -> None:
@@ -22,8 +48,7 @@ def test_find_definition_json_contract_has_stable_outer_envelope(classic_db_path
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["tool"] == "agentic_indexer"
-    assert payload["version"] == "v1"
+    _assert_runtime_envelope(payload)
     assert payload["query"] == "mod_assign\\external\\start_submission::execute"
     assert payload["normalized_query"] == "mod_assign\\external\\start_submission::execute"
     assert payload["intent"] == {
@@ -34,8 +59,8 @@ def test_find_definition_json_contract_has_stable_outer_envelope(classic_db_path
         "include_usages": True,
         "limit": 10,
     }
-    assert isinstance(payload["results"], list)
     result = payload["results"][0]
+    _assert_runtime_result(result)
     assert result["type"] == "definition_match"
     assert result["rank"] == 1
     assert result["confidence"] == "high"
@@ -69,12 +94,12 @@ def test_semantic_context_json_contract_has_consistent_provenance_and_lists(clas
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["tool"] == "agentic_indexer"
+    _assert_runtime_envelope(payload)
     assert payload["intent"]["command"] == "semantic-context"
     assert payload["intent"]["query_kind"] == "symbol"
     assert payload["intent"]["response_mode"] == "semantic_context"
-    assert isinstance(payload["results"], list)
     first = payload["results"][0]
+    _assert_runtime_result(first)
     assert first["type"] == "semantic_context"
     assert first["source"]["name"] == "code_index"
     assert first["source"]["type"] == "indexed_codebase"
@@ -105,11 +130,12 @@ def test_build_context_bundle_json_contract_packages_bundle_as_single_result(cla
     second_payload = json.loads(capsys.readouterr().out)
 
     assert first_payload == second_payload
-    assert first_payload["tool"] == "agentic_indexer"
+    _assert_runtime_envelope(first_payload)
     assert first_payload["intent"]["command"] == "build-context-bundle"
     assert first_payload["intent"]["query_kind"] == "query"
     assert first_payload["results"][0]["id"] == second_payload["results"][0]["id"]
     result = first_payload["results"][0]
+    _assert_runtime_result(result)
     assert result["type"] == "context_bundle"
     assert result["confidence"] == "medium"
     assert result["source"]["path"] == "mod/assign/classes/external/remove_submission.php"
@@ -140,8 +166,28 @@ def test_find_definition_json_contract_empty_results_stays_stable(classic_db_pat
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["tool"] == "agentic_indexer"
-    assert payload["version"] == "v1"
+    _assert_runtime_envelope(payload)
     assert payload["results"] == []
     assert payload["intent"]["command"] == "find-definition"
     assert payload["intent"]["symbol_type_filter"] == "any"
+
+
+def test_semantic_context_json_contract_error_path_keeps_full_envelope(classic_db_path: Path, capsys) -> None:
+    exit_code = main(
+        [
+            "semantic-context",
+            "--db-path",
+            str(classic_db_path),
+            "--file",
+            "missing/path/not_in_index.php",
+            "--json-contract",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    _assert_runtime_envelope(payload)
+    assert payload["query"] == "missing/path/not_in_index.php"
+    assert payload["normalized_query"] == "missing/path/not_in_index.php"
+    assert payload["intent"]["command"] == "semantic-context"
+    assert payload["results"] == []
