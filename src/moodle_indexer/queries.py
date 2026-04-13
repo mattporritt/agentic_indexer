@@ -1830,34 +1830,138 @@ def _rebalance_rendering_bundle_contexts(
     as root-level fallback renderers or generic base classes.
     """
 
-    if not any(item.get("role") == "rendering_companion" for item in primary_context + supporting_context):
+    component_root = _bundle_rendering_component_root(primary_context, supporting_context, optional_context)
+    if not component_root:
         return supporting_context[:supporting_limit], optional_context[:optional_limit]
 
-    template_index = next(
-        (index for index, item in enumerate(optional_context) if str(item.get("path") or "").endswith(".mustache")),
-        None,
-    )
-    if template_index is None:
-        return supporting_context[:supporting_limit], optional_context[:optional_limit]
+    pooled_supporting = list(supporting_context)
+    retained_optional: list[dict[str, object]] = []
+    for item in optional_context:
+        if _rendering_bundle_priority(item, component_root) < 20:
+            pooled_supporting.append(item)
+        else:
+            retained_optional.append(item)
 
-    template_item = optional_context.pop(template_index)
-    demote_index = next(
-        (
-            index
-            for index, item in enumerate(supporting_context)
-            if (
-                str(item.get("path") or "").endswith("/renderer.php")
-                and "/classes/output/" not in str(item.get("path") or "")
-            )
-            or "assign_base.php" in str(item.get("path") or "")
+    ordered_supporting = sorted(
+        pooled_supporting,
+        key=lambda item: (
+            _rendering_bundle_priority(item, component_root),
+            str(item.get("path") or ""),
         ),
-        None,
     )
-    if demote_index is not None:
-        demoted = supporting_context.pop(demote_index)
-        optional_context.insert(0, demoted)
-    supporting_context.append(template_item)
-    return supporting_context[:supporting_limit], optional_context[:optional_limit]
+
+    rebalanced_supporting: list[dict[str, object]] = []
+    demoted_optional: list[dict[str, object]] = []
+    local_render_chain_present = any(_rendering_bundle_priority(item, component_root) < 4 for item in ordered_supporting)
+    for item in ordered_supporting:
+        if _is_cross_component_render_noise(item, component_root):
+            demoted_optional.append(item)
+            continue
+        if local_render_chain_present and _is_generic_render_support(item, component_root):
+            demoted_optional.append(item)
+            continue
+        rebalanced_supporting.append(item)
+
+    return (
+        _dedupe_bundle_items(rebalanced_supporting)[:supporting_limit],
+        _dedupe_bundle_items(demoted_optional + retained_optional)[:optional_limit],
+    )
+
+
+def _bundle_rendering_component_root(
+    primary_context: list[dict[str, object]],
+    supporting_context: list[dict[str, object]],
+    optional_context: list[dict[str, object]],
+) -> str | None:
+    """Return the local component root for rendering-heavy bundles when clear."""
+
+    all_items = primary_context + supporting_context + optional_context
+    if not any(_is_rendering_bundle_item(item) for item in all_items):
+        return None
+
+    for item in primary_context + supporting_context:
+        path = str(item.get("path") or "")
+        if path:
+            return _component_root_for_path(path)
+    return None
+
+
+def _is_rendering_bundle_item(item: dict[str, object]) -> bool:
+    """Return whether one bundle item belongs to a local rendering chain."""
+
+    role = str(item.get("role") or "")
+    path = str(item.get("path") or "")
+    return role == "rendering_companion" or _rendering_path_kind(path) is not None
+
+
+def _rendering_path_kind(path: str) -> str | None:
+    """Return the rendering artifact kind for one Moodle path."""
+
+    if "/classes/output/" in path and path.endswith(".php") and not path.endswith("/renderer.php"):
+        return "output_class"
+    if path.endswith("/classes/output/renderer.php"):
+        return "component_renderer"
+    if path.endswith("/renderer.php"):
+        return "root_renderer"
+    if path.endswith(".mustache") and "/templates/" in path:
+        return "template"
+    return None
+
+
+def _rendering_bundle_priority(item: dict[str, object], component_root: str) -> int:
+    """Return a rendering-specific bundle priority for local promotion."""
+
+    path = str(item.get("path") or "")
+    if not path:
+        return 50
+
+    kind = _rendering_path_kind(path)
+    same_component = _same_component_root(component_root, path)
+    if kind == "output_class":
+        return 0 if same_component else 20
+    if kind == "component_renderer":
+        return 1 if same_component else 21
+    if kind == "template":
+        return 2 if same_component else 22
+    if kind == "root_renderer":
+        return 8 if same_component else 30
+    if "assign_base.php" in path or path.endswith("/viewable.php") or path.endswith("/simple_view.php"):
+        return 12 if same_component else 35
+    if same_component:
+        return 10
+    return 40
+
+
+def _is_cross_component_render_noise(item: dict[str, object], component_root: str) -> bool:
+    """Return whether one rendering item is a weaker cross-component companion."""
+
+    path = str(item.get("path") or "")
+    kind = _rendering_path_kind(path)
+    return bool(kind) and not _same_component_root(component_root, path)
+
+
+def _is_generic_render_support(item: dict[str, object], component_root: str) -> bool:
+    """Return whether one same-component rendering item should stay optional."""
+
+    path = str(item.get("path") or "")
+    if not _same_component_root(component_root, path):
+        return False
+    kind = _rendering_path_kind(path)
+    return kind == "root_renderer" or "assign_base.php" in path or path.endswith("/viewable.php") or path.endswith("/simple_view.php")
+
+
+def _dedupe_bundle_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return bundle items deduplicated by path while preserving order."""
+
+    seen: set[str] = set()
+    deduped: list[dict[str, object]] = []
+    for item in items:
+        path = str(item.get("path") or "")
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        deduped.append(item)
+    return deduped
 
 
 def _bundle_canonical_query_pattern(

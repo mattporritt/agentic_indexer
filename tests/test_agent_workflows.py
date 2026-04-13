@@ -137,12 +137,40 @@ def test_build_context_bundle_rendering_slice_stays_local_and_high_risk(classic_
 
     assert bundle["guardrails"]["change_risk"]["level"] == "high"
     assert bundle["recommended_reading_order"][0]["target"] == "mod/assign/locallib.php"
-    assert supporting_paths[:2] == [
+    assert supporting_paths[:3] == [
         "mod/assign/classes/output/grading_app.php",
         "mod/assign/classes/output/renderer.php",
+        "mod/assign/templates/grading_app.mustache",
     ]
-    assert "mod/assign/templates/grading_app.mustache" in supporting_paths
+    assert "mod/assign/classes/local/assign_base.php" not in supporting_paths[:3]
     assert bundle["bundle_stats"]["supporting_count"] <= 5
+
+
+def test_build_context_bundle_rendering_file_bundle_prioritizes_local_render_chain(classic_connection) -> None:
+    bundle = build_context_bundle(classic_connection, file_path="mod/assign/locallib.php")
+
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+
+    assert supporting_paths[:3] == [
+        "mod/assign/classes/output/grading_app.php",
+        "mod/assign/classes/output/renderer.php",
+        "mod/assign/templates/grading_app.mustache",
+    ]
+    assert supporting_paths.index("mod/assign/db/services.php") > supporting_paths.index("mod/assign/templates/grading_app.mustache")
+
+
+def test_build_context_bundle_output_class_stays_same_component_and_honest(classic_connection) -> None:
+    bundle = build_context_bundle(classic_connection, symbol_query="mod_assign\\output\\grading_app")
+
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+    optional_paths = [item["path"] for item in bundle["optional_context"]]
+
+    assert supporting_paths[:2] == [
+        "mod/assign/classes/output/renderer.php",
+        "mod/assign/templates/grading_app.mustache",
+    ]
+    assert "mod/demo/classes/output/renderer.php" not in supporting_paths
+    assert "mod/demo/classes/output/renderer.php" in optional_paths
 
 
 def test_build_context_bundle_provider_form_slice_packages_form_chain(classic_connection) -> None:
