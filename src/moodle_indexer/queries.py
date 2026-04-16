@@ -1,3 +1,8 @@
+# Copyright (c) Moodle Pty Ltd. All rights reserved.
+# Licensed under the Moodle Community License v1.3.
+# See LICENSE.md in the repository root for full terms.
+# Commercial use requires a separate written agreement with Moodle.
+
 """Query, retrieval, planning, and safety services over the SQLite index.
 
 This module is the current composition layer for the project. It sits on top of

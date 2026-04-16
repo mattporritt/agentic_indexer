@@ -1,3 +1,8 @@
+# Copyright (c) Moodle Pty Ltd. All rights reserved.
+# Licensed under the Moodle Community License v1.3.
+# See LICENSE.md in the repository root for full terms.
+# Commercial use requires a separate written agreement with Moodle.
+
 """Subplugin discovery from Moodle ``db/subplugins.json`` files.
 
 Moodle plugins can declare nested subplugin families whose files live inside

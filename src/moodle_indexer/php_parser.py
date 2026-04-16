@@ -1,3 +1,8 @@
+# Copyright (c) Moodle Pty Ltd. All rights reserved.
+# Licensed under the Moodle Community License v1.3.
+# See LICENSE.md in the repository root for full terms.
+# Commercial use requires a separate written agreement with Moodle.
+
 """PHP parsing and fallback extraction helpers.
 
 The parser uses ``phply`` where practical and adds light regex fallback logic
