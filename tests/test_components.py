@@ -94,6 +94,7 @@ def test_infer_component_uses_subplugin_mounts_for_child_plugin_paths() -> None:
         ("mod/forum/db/upgrade.php", "upgrade_file"),
         ("mod/forum/lang/en/mod_forum.php", "lang_file"),
         ("mod/forum/templates/discussion_list.mustache", "template_file"),
+        ("theme/boost/scss/moodle/login.scss", "scss_source"),
         ("mod/forum/amd/src/forum.js", "amd_source"),
         ("mod/forum/amd/build/forum.min.js", "amd_build"),
         ("mod/forum/tests/discussion_exporter_test.php", "phpunit_test"),

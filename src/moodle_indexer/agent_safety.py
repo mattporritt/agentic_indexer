@@ -738,6 +738,33 @@ def _collect_post_edit_checks(
 
     items: list[dict[str, object]] = []
     items.extend(list(test_impact.get("direct_tests", [])))
+    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
+        representative_component_root = str(
+            dict(profile.get("representative_pattern") or {}).get("component_root") or ""
+        )
+        seen_paths = {
+            str(item.get("path") or "")
+            for item in items
+            if item.get("path")
+        }
+        for item in list(plan.get("required_edits", [])) + list(plan.get("likely_edits", [])):
+            path = str(item.get("path") or "")
+            if not path or _component_root_for_path(path) != representative_component_root:
+                continue
+            if "/classes/external/" not in path:
+                continue
+            candidate = f"{representative_component_root}/tests/external/{Path(path).stem}_test.php"
+            if candidate in seen_paths:
+                continue
+            items.append(
+                _safety_item(
+                    path=candidate,
+                    confidence=str(item.get("confidence") or "medium"),
+                    reason="Nearest sibling PHPUnit coverage for the same external-service slice; review it after editing to catch parameter or contract drift across related endpoints.",
+                )
+            )
+            seen_paths.add(candidate)
+        items.extend(list(test_impact.get("likely_tests", []))[:2])
     items.extend(list(test_impact.get("environment_steps", [])))
     if bool(profile.get("service")):
         for item in test_impact.get("contract_checks", []):

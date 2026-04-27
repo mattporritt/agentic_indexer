@@ -1666,6 +1666,15 @@ def _synthesize_context_bundle(
                 limit=max(0, min(4, limit) - len(primary_context)),
             )
         )
+        if len(primary_context) < min(3, limit):
+            primary_context.extend(
+                _bundle_context_from_semantic_primary(
+                    semantic,
+                    semantic_lookup,
+                    seen_paths=seen_paths,
+                    limit=max(0, min(4, limit) - len(primary_context)),
+                )
+            )
     else:
         primary_context = _bundle_context_from_plan_items(
             list(plan.get("required_edits", [])),
@@ -2070,6 +2079,54 @@ def _bundle_context_from_semantic_examples(
     return bundled
 
 
+def _bundle_context_from_semantic_primary(
+    semantic: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    *,
+    seen_paths: set[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return bounded exact-file candidates from free-text semantic primaries."""
+
+    bundled: list[dict[str, object]] = []
+    if limit <= 0:
+        return bundled
+    for item in list(semantic.get("primary_semantic_context", [])):
+        path = str(item.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        bundled.append(
+            _bundle_context_item(
+                {
+                    "path": path,
+                    "symbol": item.get("symbol"),
+                    "change_role": _bundle_query_role_for_path(path),
+                    "confidence": item.get("confidence", "medium"),
+                    "reason": str(item.get("explanation") or "High-signal exact file candidate for this free-text query."),
+                },
+                semantic_lookup,
+            )
+        )
+        if len(bundled) >= limit:
+            break
+    return bundled
+
+
+def _bundle_query_role_for_path(path: str) -> str:
+    """Return the most useful bundle role for a free-text exact-file hit."""
+
+    if _test_file_path(path) or path.endswith(".feature"):
+        return "validation"
+    if path.endswith(".mustache") or path.endswith("/renderer.php") or "/classes/output/" in path or path.endswith(".scss"):
+        return "rendering_companion"
+    if path.endswith("/db/services.php") or path.endswith("/db/access.php") or path.endswith("/settings.php"):
+        return "entrypoint"
+    if path.endswith("/version.php") or "/lang/en/" in path:
+        return "framework_context"
+    return "implementation"
+
+
 def _bundle_context_item(
     item: dict[str, object],
     semantic_lookup: dict[tuple[str, str], dict[str, object]],
@@ -2391,13 +2448,16 @@ def _semantic_context_for_query(
 ) -> dict[str, object]:
     """Return bounded semantic context for a free-text query."""
 
+    query_terms = _semantic_tokens(query_text)
     query_tokens = _semantic_focus_tokens(query_text)
-    query_intent = _semantic_query_intent(query_tokens)
+    query_intent = _semantic_query_intent(query_terms)
     candidates = _collect_matching_semantic_chunks(connection, query_tokens, language=None, limit=80)
     ranked = _semantic_rank_query_candidates(
         connection,
         query_text,
         query_tokens,
+        query_terms,
+        query_intent,
         candidates,
         limit=limit * 2,
     )
@@ -2647,13 +2707,14 @@ def _semantic_rank_query_candidates(
     connection: sqlite3.Connection,
     query_text: str,
     query_tokens: list[str],
+    query_terms: list[str],
+    query_intent: dict[str, bool],
     candidates: list[SemanticChunk],
     *,
     limit: int,
 ) -> list[dict[str, object]]:
     """Return bounded free-text semantic matches."""
 
-    query_intent = _semantic_query_intent(query_tokens)
     prepared: list[tuple[SemanticChunk, float, float, dict[str, object]]] = []
     candidate_paths = {chunk.path for chunk in _deduplicate_semantic_chunks(candidates)}
     for chunk in _deduplicate_semantic_chunks(candidates):
@@ -2665,7 +2726,7 @@ def _semantic_rank_query_candidates(
             lexical * 0.35
             + semantic * 0.32
             + (0.1 if any(token in chunk.text.lower() for token in query_tokens[:2]) else 0.0)
-            + _semantic_query_kind_bonus(query_tokens, chunk)
+            + _semantic_query_kind_bonus(query_terms, chunk)
         )
         score = _semantic_soft_score(raw_score, cap=0.9)
         score *= _semantic_query_intent_multiplier(query_intent, chunk)
@@ -2673,6 +2734,26 @@ def _semantic_rank_query_candidates(
         score += _semantic_query_pair_bonus(query_intent, chunk, pair_meta)
         score = round(min(0.9, score), 3)
         minimum_score = 0.33 if pair_meta["has_pair"] else 0.35
+        if (
+            query_intent["exact_files"]
+            and chunk.file_role
+            in {
+                "template_file",
+                "renderer_file",
+                "output_class",
+                "scss_source",
+                "settings_file",
+                "access_definition",
+                "lang_file",
+                "version_file",
+                "services_definition",
+                "amd_source",
+                "external_api_class",
+                "behat_feature",
+                "phpunit_test",
+            }
+        ):
+            minimum_score = min(minimum_score, 0.3)
         if score < minimum_score:
             continue
         prepared.append(
@@ -3553,7 +3634,20 @@ def _semantic_file_chunks_for_component(
         FROM files f
         JOIN components c ON c.id = f.component_id
         WHERE c.name = ?
-          AND f.file_role IN ('template_file', 'renderer_file', 'output_class', 'services_definition', 'amd_build', 'locallib_file', 'settings_file')
+          AND f.file_role IN (
+              'template_file',
+              'renderer_file',
+              'output_class',
+              'services_definition',
+              'amd_build',
+              'locallib_file',
+              'settings_file',
+              'access_definition',
+              'lang_file',
+              'version_file',
+              'scss_source',
+              'amd_source'
+          )
           {extension_clause}
         ORDER BY f.moodle_path
         LIMIT ?
@@ -3764,6 +3858,9 @@ def _semantic_file_chunks_for_tokens(
         extension_clause = "AND f.extension = '.php'"
     elif language == "template":
         extension_clause = "AND f.extension = '.mustache'"
+    elif language == "scss":
+        extension_clause = "AND f.extension = '.scss'"
+    fetch_limit = max(limit * 4, 24)
     rows = connection.execute(
         f"""
         SELECT
@@ -3775,14 +3872,52 @@ def _semantic_file_chunks_for_tokens(
         FROM files f
         JOIN components c ON c.id = f.component_id
         WHERE ({clause})
-          AND f.file_role IN ('template_file', 'renderer_file', 'output_class', 'services_definition', 'amd_build', 'amd_source', 'locallib_file', 'settings_file', 'external_api_class')
+          AND f.file_role IN (
+              'template_file',
+              'renderer_file',
+              'output_class',
+              'services_definition',
+              'amd_build',
+              'amd_source',
+              'locallib_file',
+              'settings_file',
+              'external_api_class',
+              'access_definition',
+              'lang_file',
+              'version_file',
+              'scss_source'
+          )
           {extension_clause}
         ORDER BY f.moodle_path
         LIMIT ?
         """,
-        (*params, limit),
+        (*params, fetch_limit),
     ).fetchall()
-    return [_semantic_chunk_from_file_row(connection, row) for row in rows]
+    ranked_rows = sorted(
+        rows,
+        key=lambda row: (
+            -_semantic_file_row_token_score(row, query_tokens),
+            str(row["moodle_path"]),
+        ),
+    )
+    return [_semantic_chunk_from_file_row(connection, row) for row in ranked_rows[:limit]]
+
+
+def _semantic_file_row_token_score(row: sqlite3.Row, query_tokens: list[str]) -> int:
+    """Return a simple lexical priority score for one file-level fallback row."""
+
+    path = str(row["moodle_path"]).lower()
+    file_role = str(row["file_role"]).lower()
+    component = str(row["component_name"]).lower()
+    score = 0
+    for token in query_tokens:
+        if token in path:
+            score += 3
+        if token in file_role:
+            score += 2
+        if token in component:
+            score += 1
+    return score
 
 
 def _semantic_chunk_from_symbol_row(row: sqlite3.Row) -> SemanticChunk:
@@ -4039,15 +4174,185 @@ def _semantic_like_clause(columns: list[str], query_tokens: list[str]) -> tuple[
 def _semantic_focus_tokens(text: str) -> list[str]:
     """Return a bounded list of informative tokens for hybrid retrieval."""
 
-    counts = Counter(_semantic_tokens(text))
-    ranked = sorted(counts, key=lambda token: (-counts[token], -len(token), token))
-    return ranked[:6]
+    tokens = _semantic_tokens(text)
+    if not tokens:
+        return []
+
+    hint_tokens = {
+        "access",
+        "api",
+        "behat",
+        "capability",
+        "capabilities",
+        "config",
+        "configuration",
+        "coverage",
+        "external",
+        "feature",
+        "form",
+        "forms",
+        "lang",
+        "language",
+        "mustache",
+        "output",
+        "path",
+        "paths",
+        "phpunit",
+        "renderer",
+        "rendering",
+        "scss",
+        "service",
+        "services",
+        "setting",
+        "settings",
+        "string",
+        "strings",
+        "style",
+        "styles",
+        "template",
+        "templates",
+        "test",
+        "tests",
+        "upgrade",
+        "validation",
+        "version",
+    }
+    strong_hint_tokens = {
+        "access",
+        "capability",
+        "capabilities",
+        "config",
+        "configuration",
+        "lang",
+        "language",
+        "mustache",
+        "renderer",
+        "scss",
+        "service",
+        "services",
+        "setting",
+        "settings",
+        "string",
+        "strings",
+        "template",
+        "templates",
+        "upgrade",
+        "version",
+    }
+    component_marker_tokens = {
+        "component",
+        "components",
+        "editor",
+        "module",
+        "plugin",
+        "plugins",
+        "provider",
+        "providers",
+        "subplugin",
+        "subplugins",
+        "theme",
+        "tool",
+    }
+    generic_tokens = {
+        "add",
+        "best",
+        "change",
+        "changes",
+        "control",
+        "docs",
+        "exact",
+        "existing",
+        "files",
+        "find",
+        "goal",
+        "helper",
+        "implement",
+        "implementation",
+        "its",
+        "locate",
+        "moodle",
+        "nearest",
+        "page",
+        "pattern",
+        "patterns",
+        "plugin",
+        "plugins",
+        "primary",
+        "query",
+        "relevant",
+        "show",
+        "styles",
+        "support",
+        "surface",
+        "this",
+        "update",
+    }
+
+    counts = Counter(tokens)
+    first_positions: dict[str, int] = {}
+    for index, token in enumerate(tokens):
+        first_positions.setdefault(token, index)
+
+    component_anchors: list[str] = []
+    anchors: list[str] = []
+    strong_hints: list[str] = []
+    hints: list[str] = []
+    fallback: list[str] = []
+    seen: set[str] = set()
+    component_marker_indexes = [
+        index for index, token in enumerate(tokens)
+        if token in component_marker_tokens
+    ]
+    for token in tokens:
+        if token in seen or token == "mdl" or token.isdigit():
+            continue
+        seen.add(token)
+        position = first_positions[token]
+        near_component_marker = any(position == index - 1 for index in component_marker_indexes)
+        if token in strong_hint_tokens:
+            strong_hints.append(token)
+            continue
+        if token in hint_tokens:
+            hints.append(token)
+            continue
+        if token not in generic_tokens and near_component_marker:
+            component_anchors.append(token)
+        elif token not in generic_tokens:
+            anchors.append(token)
+        fallback.append(token)
+
+    ranked_fallback = sorted(
+        fallback,
+        key=lambda token: (
+            -counts[token],
+            first_positions[token],
+            -len(token),
+            token,
+        ),
+    )
+
+    selected: list[str] = []
+    for group in (component_anchors, strong_hints, anchors, hints):
+        for token in group:
+            if token in selected:
+                continue
+            selected.append(token)
+            if len(selected) >= 8:
+                return selected[:8]
+
+    for token in ranked_fallback:
+        if token in selected:
+            continue
+        selected.append(token)
+        if len(selected) >= 8:
+            break
+    return selected[:8]
 
 
 def _semantic_tokens(text: str) -> list[str]:
     """Return normalized tokens with light code-aware splitting."""
 
-    prepared = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    prepared = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text).replace("_", " ")
     raw = re.split(r"[^A-Za-z0-9_]+", prepared.lower())
     stopwords = {
         "the",
@@ -4138,12 +4443,17 @@ def _semantic_role_tags(file_role: str) -> str:
         "external_api_class": "external api web service execute parameters returns",
         "services_definition": "db services registration external api entrypoint",
         "phpunit_test": "phpunit test coverage assertions",
+        "behat_feature": "behat acceptance test scenario feature coverage",
         "output_class": "renderable output renderer template rendering",
         "renderer_file": "renderer rendering template output",
         "template_file": "mustache template rendering output context",
+        "scss_source": "scss styling styles login theme css source",
         "amd_source": "javascript amd source module import export frontend",
         "amd_build": "javascript built amd artifact generated",
         "settings_file": "admin settings framework configuration",
+        "access_definition": "capability permissions access definition",
+        "lang_file": "language strings labels display text",
+        "version_file": "version upgrade install metadata",
         "locallib_file": "feature entrypoint local business logic rendering",
     }
     return tags.get(file_role, file_role.replace("_", " "))
@@ -4168,6 +4478,22 @@ def _semantic_query_kind_bonus(query_tokens: list[str], chunk: SemanticChunk) ->
             bonus += 0.06
     if {"template", "renderer", "rendering"} & token_set and chunk.file_role in {"template_file", "renderer_file", "output_class"}:
         bonus += 0.06
+    if {"mustache", "template", "templates"} & token_set and chunk.file_role == "template_file":
+        bonus += 0.12
+    if {"scss", "style", "styles", "styling"} & token_set and chunk.file_role == "scss_source":
+        bonus += 0.16
+    if {"capability", "capabilities", "permission", "permissions", "access"} & token_set and chunk.file_role == "access_definition":
+        bonus += 0.15
+    if {"lang", "language", "string", "strings"} & token_set and chunk.file_role == "lang_file":
+        bonus += 0.14
+    if {"version", "upgrade"} & token_set and chunk.file_role in {"version_file", "upgrade_file"}:
+        bonus += 0.12
+    if {"setting", "settings"} & token_set and chunk.file_role == "settings_file":
+        bonus += 0.12
+    if {"config", "configuration"} & token_set and (chunk.path.endswith("configuration.js") or chunk.file_role in {"amd_source", "settings_file"}):
+        bonus += 0.12
+    if {"behat", "scenario", "feature"} & token_set and (chunk.file_role == "behat_feature" or chunk.source_kind == "test"):
+        bonus += 0.14
     if {"form", "forms", "validation"} & token_set and chunk.file_role in {"unknown", "phpunit_test"} and "\\form\\" in (chunk.symbol or ""):
         bonus += 0.04
     return bonus
@@ -4183,6 +4509,30 @@ def _semantic_query_intent(query_tokens: list[str]) -> dict[str, bool]:
         "examples": bool({"examples", "example", "similar", "pattern"} & token_set),
         "rendering": bool({"rendering", "renderer", "template", "output"} & token_set),
         "forms": bool({"form", "forms", "validation"} & token_set),
+        "exact_files": bool(
+            {
+                "file",
+                "files",
+                "path",
+                "paths",
+                "mustache",
+                "template",
+                "templates",
+                "scss",
+                "renderer",
+                "setting",
+                "settings",
+                "configuration",
+                "config",
+                "version",
+                "access",
+                "capability",
+                "capabilities",
+                "lang",
+                "language",
+            }
+            & token_set
+        ),
     }
 
 
@@ -4212,6 +4562,27 @@ def _semantic_query_intent_multiplier(
             multiplier *= 0.9
     if intent["rendering"] and chunk.file_role in {"output_class", "renderer_file", "template_file"}:
         multiplier *= 1.15
+    if intent["rendering"] and chunk.file_role == "scss_source":
+        multiplier *= 1.16
+    if intent["exact_files"]:
+        if chunk.source_kind in {"file", "test", "js_module", "service"}:
+            multiplier *= 1.12
+        elif chunk.source_kind == "symbol":
+            multiplier *= 0.95
+    if intent["exact_files"] and chunk.file_role in {
+        "template_file",
+        "renderer_file",
+        "output_class",
+        "scss_source",
+        "settings_file",
+        "access_definition",
+        "lang_file",
+        "version_file",
+        "services_definition",
+        "amd_source",
+        "external_api_class",
+    }:
+        multiplier *= 1.12
     if intent["forms"] and chunk.file_role in {"form_class", "phpunit_test"} and "\\form\\" in (chunk.symbol or ""):
         multiplier *= 1.12
     if intent["examples"] and chunk.source_kind in {"symbol", "service", "test"}:
@@ -4226,6 +4597,8 @@ def _language_for_path(path: str) -> str:
         return "js"
     if path.endswith(".mustache"):
         return "template"
+    if path.endswith(".scss"):
+        return "scss"
     return "php"
 
 
@@ -6528,8 +6901,18 @@ def _artifact_item_type(path: str, artifact_type: str | None) -> str:
         return artifact_type
     if path.endswith(".mustache"):
         return "template_file"
+    if path.endswith(".scss"):
+        return "scss_source"
     if path.endswith("/renderer.php"):
         return "renderer_file"
+    if path.endswith("/settings.php"):
+        return "settings_file"
+    if path.endswith("/db/access.php"):
+        return "access_definition"
+    if "/lang/en/" in path and path.endswith(".php"):
+        return "lang_file"
+    if path.endswith("/version.php"):
+        return "version_file"
     if "/amd/src/" in path:
         return "js_module"
     if "/amd/build/" in path:

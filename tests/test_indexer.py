@@ -284,6 +284,18 @@ def test_classic_layout_indexing_and_queries(tmp_path: Path) -> None:
         assert mod_forum_row["moodle_path"] == "mod/forum/lib.php"
         assert mod_forum_row["component_name"] == "mod_forum"
 
+        boost_login_scss = connection.execute(
+            """
+            SELECT f.moodle_path, f.file_role, c.name AS component_name
+            FROM files f
+            JOIN components c ON c.id = f.component_id
+            WHERE f.moodle_path = 'theme/boost/scss/moodle/login.scss'
+            """
+        ).fetchone()
+        assert boost_login_scss is not None
+        assert boost_login_scss["file_role"] == "scss_source"
+        assert boost_login_scss["component_name"] == "theme_boost"
+
         stored_components = {
             row["name"]
             for row in connection.execute("SELECT name FROM components ORDER BY name").fetchall()

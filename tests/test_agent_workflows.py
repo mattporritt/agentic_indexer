@@ -243,3 +243,53 @@ def test_build_context_bundle_free_text_materializes_canonical_service_pattern(c
         for item in bundle["guardrails"]["pre_edit_checks"] + bundle["guardrails"]["post_edit_checks"]
     )
     assert bundle["bundle_stats"]["primary_count"] <= 4
+
+
+def test_semantic_context_free_text_boost_login_query_prefers_exact_local_files(classic_connection) -> None:
+    semantic = semantic_context(
+        classic_connection,
+        query_text="Moodle login form helper icons for username/password fields in Boost theme. Find relevant template, SCSS, and nearby test pattern for asserting rendered icons or login form UI.",
+    )
+
+    primary_paths = [item["path"] for item in semantic["primary_semantic_context"]]
+    secondary_paths = [item["path"] for item in semantic["secondary_semantic_context"]]
+    combined = primary_paths + secondary_paths
+
+    assert "theme/boost/templates/core/loginform.mustache" in combined
+    assert "theme/boost/scss/moodle/login.scss" in combined
+    assert "login/tests/behat/login_render.feature" in combined
+
+
+def test_build_context_bundle_free_text_boost_login_query_surfaces_exact_files(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        query_text="For MDL-88194, find the exact Moodle files that control the Boost primary login form UI, the SCSS that styles it, and the nearest existing Behat tests for login-page rendering.",
+    )
+
+    primary_paths = [item["path"] for item in bundle["primary_context"]]
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+    test_paths = [item["path"] for item in bundle["tests_to_consider"]]
+    combined = primary_paths + supporting_paths
+
+    assert "theme/boost/templates/core/loginform.mustache" in combined
+    assert "theme/boost/scss/moodle/login.scss" in combined
+    assert "login/tests/behat/login_render.feature" in test_paths
+
+
+def test_build_context_bundle_free_text_tiny_premium_query_surfaces_exact_wiring_files(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        query_text="MDL-88547 tiny_premium markdown plugin support existing Moodle patterns capability setting tests docs",
+    )
+
+    primary_paths = [item["path"] for item in bundle["primary_context"]]
+    supporting_paths = [item["path"] for item in bundle["supporting_context"]]
+    optional_paths = [item["path"] for item in bundle["optional_context"]]
+    test_paths = [item["path"] for item in bundle["tests_to_consider"]]
+    combined = primary_paths + supporting_paths + optional_paths
+
+    assert "editor/tiny/plugins/premium/db/access.php" in combined
+    assert "editor/tiny/plugins/premium/lang/en/tiny_premium.php" in combined
+    assert "editor/tiny/plugins/premium/amd/src/configuration.js" in combined
+    assert "editor/tiny/plugins/premium/version.php" in combined
+    assert "editor/tiny/plugins/premium/tests/manager_test.php" in test_paths or "editor/tiny/plugins/premium/tests/behat/markdown.feature" in test_paths

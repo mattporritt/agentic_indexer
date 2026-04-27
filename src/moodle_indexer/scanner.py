@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SUPPORTED_EXTENSIONS = {".php", ".mustache", ".js", ".feature", ".xml"}
+SUPPORTED_EXTENSIONS = {".php", ".mustache", ".js", ".feature", ".xml", ".scss"}
 SKIP_DIRECTORIES = {
     ".git",
     ".hg",

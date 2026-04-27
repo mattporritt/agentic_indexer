@@ -52,6 +52,8 @@ def classify_file_role(relative_path: str) -> str:
         return "lang_file"
     if "/templates/" in path and path.endswith(".mustache"):
         return "template_file"
+    if "/scss/" in path and path.endswith(".scss"):
+        return "scss_source"
     if "/amd/src/" in path and path.endswith(".js"):
         return "amd_source"
     if "/amd/build/" in path and path.endswith(".min.js"):
