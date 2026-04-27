@@ -276,6 +276,20 @@ def test_build_context_bundle_free_text_boost_login_query_surfaces_exact_files(c
     assert "login/tests/behat/login_render.feature" in test_paths
 
 
+def test_semantic_context_explicit_theme_boost_login_anchor_prefers_template_and_scss_over_bootstrap_js(classic_connection) -> None:
+    semantic = semantic_context(
+        classic_connection,
+        query_text="theme/boost login loginform.mustache login.scss login/tests/behat login_render.feature",
+    )
+
+    primary_paths = [item["path"] for item in semantic["primary_semantic_context"]]
+    assert primary_paths[:2] == [
+        "theme/boost/scss/moodle/login.scss",
+        "theme/boost/templates/core/loginform.mustache",
+    ]
+    assert "theme/boost/amd/src/bootstrap/tab.js" not in primary_paths[:3]
+
+
 def test_build_context_bundle_free_text_tiny_premium_query_surfaces_exact_wiring_files(classic_connection) -> None:
     bundle = build_context_bundle(
         classic_connection,

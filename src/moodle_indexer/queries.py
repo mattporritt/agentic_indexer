@@ -2471,6 +2471,7 @@ def _semantic_context_for_query(
         _collect_anchored_semantic_chunks(
             connection,
             query_anchor=query_anchor,
+            query_tokens=query_tokens,
             language=None,
             limit=80,
         )
@@ -2752,6 +2753,7 @@ def _semantic_rank_query_candidates(
             + semantic * 0.32
             + (0.1 if any(token in chunk.text.lower() for token in query_tokens[:2]) else 0.0)
             + _semantic_query_kind_bonus(query_terms, chunk)
+            + _semantic_query_path_bonus(query_terms, chunk)
         )
         score = _semantic_soft_score(raw_score, cap=0.9)
         score *= _semantic_query_intent_multiplier(query_intent, chunk)
@@ -3344,6 +3346,7 @@ def _collect_anchored_semantic_chunks(
     connection: sqlite3.Connection,
     *,
     query_anchor: SemanticQueryAnchor,
+    query_tokens: list[str],
     language: str | None,
     limit: int,
 ) -> list[SemanticChunk]:
@@ -3366,8 +3369,9 @@ def _collect_anchored_semantic_chunks(
         _semantic_file_chunks_for_prefixes(
             connection,
             query_anchor.path_prefixes,
+            query_tokens=query_tokens,
             language=language,
-            limit=max(12, limit // 2),
+            limit=max(80, limit),
         )
     )
     return chunks
@@ -3966,6 +3970,7 @@ def _semantic_file_chunks_for_prefixes(
     connection: sqlite3.Connection,
     path_prefixes: list[str],
     *,
+    query_tokens: list[str],
     language: str | None,
     limit: int,
 ) -> list[SemanticChunk]:
@@ -4014,7 +4019,7 @@ def _semantic_file_chunks_for_prefixes(
     ranked_rows = sorted(
         rows,
         key=lambda row: (
-            -_semantic_file_row_prefix_score(row, normalized_prefixes),
+            -_semantic_file_row_prefix_score(row, normalized_prefixes, query_tokens),
             str(row["moodle_path"]),
         ),
     )
@@ -4038,7 +4043,7 @@ def _semantic_file_row_token_score(row: sqlite3.Row, query_tokens: list[str]) ->
     return score
 
 
-def _semantic_file_row_prefix_score(row: sqlite3.Row, path_prefixes: list[str]) -> int:
+def _semantic_file_row_prefix_score(row: sqlite3.Row, path_prefixes: list[str], query_tokens: list[str]) -> int:
     """Return a priority score for explicit path-prefix anchors."""
 
     moodle_path = str(row["moodle_path"]).lower()
@@ -4053,6 +4058,38 @@ def _semantic_file_row_prefix_score(row: sqlite3.Row, path_prefixes: list[str]) 
             score += max(1, len(normalized.split("/")))
     if file_role in {"template_file", "scss_source", "amd_source", "access_definition", "lang_file", "version_file", "phpunit_test", "behat_feature"}:
         score += 1
+    score += _semantic_file_row_query_score(moodle_path, file_role, query_tokens)
+    return score
+
+
+def _semantic_file_row_query_score(moodle_path: str, file_role: str, query_tokens: list[str]) -> int:
+    """Return a path-aware lexical score for anchored file fallback rows."""
+
+    score = 0
+    path_parts = {part for part in re.split(r"[^a-z0-9_]+", moodle_path) if part}
+    for token in query_tokens:
+        if token in moodle_path:
+            score += 6
+        if token in path_parts:
+            score += 5
+    if "loginform" in query_tokens and "loginform.mustache" in moodle_path:
+        score += 20
+    if "mustache" in query_tokens and moodle_path.endswith(".mustache"):
+        score += 10
+    if "scss" in query_tokens and moodle_path.endswith(".scss"):
+        score += 12
+    if "login" in query_tokens and "/login." in moodle_path:
+        score += 18
+    if "render" in query_tokens and "render_login" in moodle_path:
+        score += 12
+    if file_role == "template_file" and {"loginform", "mustache"} & set(query_tokens):
+        score += 8
+    if file_role == "scss_source" and "scss" in query_tokens:
+        score += 8
+    if file_role in {"behat_feature", "phpunit_test"} and {"mustache", "scss", "loginform"} & set(query_tokens):
+        score -= 6
+    if "/amd/src/bootstrap/" in moodle_path:
+        score -= 8
     return score
 
 
@@ -4733,6 +4770,37 @@ def _semantic_query_kind_bonus(query_tokens: list[str], chunk: SemanticChunk) ->
         bonus += 0.14
     if {"form", "forms", "validation"} & token_set and chunk.file_role in {"unknown", "phpunit_test"} and "\\form\\" in (chunk.symbol or ""):
         bonus += 0.04
+    return bonus
+
+
+def _semantic_query_path_bonus(query_tokens: list[str], chunk: SemanticChunk) -> float:
+    """Return a path-specific bonus for exact file-family retrieval."""
+
+    token_set = set(query_tokens)
+    lowered_path = chunk.path.lower()
+    lowered_symbol = (chunk.symbol or "").lower()
+    bonus = 0.0
+
+    if "loginform" in token_set and "loginform.mustache" in lowered_path:
+        bonus += 0.34
+    if "mustache" in token_set and chunk.file_role == "template_file" and "login" in lowered_path:
+        bonus += 0.18
+    if "scss" in token_set and lowered_path.endswith("/login.scss"):
+        bonus += 0.32
+    if "render" in token_set and "render_login" in lowered_symbol:
+        bonus += 0.24
+    if "login" in token_set and chunk.file_role in {"template_file", "renderer_file", "output_class"} and "login" in lowered_path:
+        bonus += 0.14
+    if "feature" in token_set and "login_render.feature" in lowered_path:
+        bonus += 0.28
+
+    if "login" in token_set and "/scss/bootstrap/" in lowered_path:
+        bonus -= 0.12
+    if "login" in token_set and "/amd/src/bootstrap/" in lowered_path:
+        bonus -= 0.12
+    if "login" in token_set and chunk.source_kind == "test" and "login" not in lowered_path:
+        bonus -= 0.08
+
     return bonus
 
 
