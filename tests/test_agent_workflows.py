@@ -10,12 +10,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from moodle_indexer.queries import (
+    _bundle_query_test_candidate_score,
     _classify_change_risk,
     _collect_contract_checks,
     _collect_post_edit_checks,
     _collect_pre_edit_checks,
     _plan_profile_for_query,
     _representative_service_pattern,
+    _semantic_query_anchor,
+    _semantic_tokens,
     assess_test_impact,
     build_context_bundle,
     execution_guardrails,
@@ -257,7 +260,22 @@ def test_semantic_context_free_text_boost_login_query_prefers_exact_local_files(
 
     assert "theme/boost/templates/core/loginform.mustache" in combined
     assert "theme/boost/scss/moodle/login.scss" in combined
-    assert "login/tests/behat/login_render.feature" in combined
+    assert primary_paths[:2] == [
+        "theme/boost/scss/moodle/login.scss",
+        "theme/boost/templates/core/loginform.mustache",
+    ]
+    assert not any(path.startswith("admin/tool/componentlibrary/") for path in primary_paths[:3])
+
+
+def test_semantic_query_anchor_infers_boost_and_tiny_premium_prefixes() -> None:
+    boost_query = "For MDL-88194, find the exact Moodle files that control the Boost primary login form UI, the SCSS that styles it, and the nearest existing Behat tests for login-page rendering."
+    tiny_query = "MDL-88547 tiny_premium markdown plugin support existing Moodle patterns capability setting tests docs"
+
+    boost_anchor = _semantic_query_anchor(boost_query, _semantic_tokens(boost_query))
+    tiny_anchor = _semantic_query_anchor(tiny_query, _semantic_tokens(tiny_query))
+
+    assert "theme/boost" in boost_anchor.path_prefixes
+    assert "editor/tiny/plugins/premium" in tiny_anchor.path_prefixes
 
 
 def test_build_context_bundle_free_text_boost_login_query_surfaces_exact_files(classic_connection) -> None:
@@ -274,6 +292,28 @@ def test_build_context_bundle_free_text_boost_login_query_surfaces_exact_files(c
     assert "theme/boost/templates/core/loginform.mustache" in combined
     assert "theme/boost/scss/moodle/login.scss" in combined
     assert "login/tests/behat/login_render.feature" in test_paths
+    assert test_paths[0] == "login/tests/behat/login_render.feature"
+    assert primary_paths[0].startswith("theme/boost/")
+
+
+def test_login_query_test_scoring_prefers_loginform_feature_over_unrelated_login_features() -> None:
+    query_tokens = ["login", "loginform", "mustache", "scss", "behat", "feature", "render"]
+    anchor_tokens = ["loginform", "login"]
+
+    loginform_score = _bundle_query_test_candidate_score(
+        "auth/tests/behat/loginform.feature",
+        "behat_feature",
+        query_tokens,
+        anchor_tokens,
+    )
+    mfa_score = _bundle_query_test_candidate_score(
+        "admin/tool/mfa/factor/sms/tests/behat/factor_sms_login.feature",
+        "behat_feature",
+        query_tokens,
+        anchor_tokens,
+    )
+
+    assert loginform_score > mfa_score
 
 
 def test_semantic_context_explicit_theme_boost_login_anchor_prefers_template_and_scss_over_bootstrap_js(classic_connection) -> None:
@@ -307,6 +347,11 @@ def test_build_context_bundle_free_text_tiny_premium_query_surfaces_exact_wiring
     assert "editor/tiny/plugins/premium/amd/src/configuration.js" in combined
     assert "editor/tiny/plugins/premium/version.php" in combined
     assert "editor/tiny/plugins/premium/tests/manager_test.php" in test_paths or "editor/tiny/plugins/premium/tests/behat/markdown.feature" in test_paths
+    assert primary_paths[0].startswith("editor/tiny/plugins/premium/")
+    assert not any(path.startswith("admin/") for path in primary_paths[:4])
+    assert "editor/tiny/plugins/premium/db/access.php" in primary_paths[:4]
+    assert "editor/tiny/plugins/premium/lang/en/tiny_premium.php" in primary_paths[:4]
+    assert "editor/tiny/plugins/premium/amd/src/configuration.js" in primary_paths[:4]
 
 
 def test_semantic_context_explicit_theme_boost_anchor_keeps_top_hits_in_subtree(classic_connection) -> None:
