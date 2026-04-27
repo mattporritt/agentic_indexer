@@ -293,3 +293,32 @@ def test_build_context_bundle_free_text_tiny_premium_query_surfaces_exact_wiring
     assert "editor/tiny/plugins/premium/amd/src/configuration.js" in combined
     assert "editor/tiny/plugins/premium/version.php" in combined
     assert "editor/tiny/plugins/premium/tests/manager_test.php" in test_paths or "editor/tiny/plugins/premium/tests/behat/markdown.feature" in test_paths
+
+
+def test_semantic_context_explicit_theme_boost_anchor_keeps_top_hits_in_subtree(classic_connection) -> None:
+    semantic = semantic_context(
+        classic_connection,
+        query_text="theme/boost login tests mustache scss behat",
+    )
+
+    primary_paths = [item["path"] for item in semantic["primary_semantic_context"]]
+
+    assert primary_paths[:2] == [
+        "theme/boost/scss/moodle/login.scss",
+        "theme/boost/templates/core/loginform.mustache",
+    ]
+    assert not any(path.startswith("mod/assign/tests/") for path in primary_paths[:3])
+
+
+def test_semantic_context_explicit_lib_editor_tiny_premium_anchor_stays_local(classic_connection) -> None:
+    semantic = semantic_context(
+        classic_connection,
+        query_text="lib/editor/tiny/plugins/premium tests configuration",
+    )
+
+    primary_paths = [item["path"] for item in semantic["primary_semantic_context"]]
+    secondary_paths = [item["path"] for item in semantic["secondary_semantic_context"]]
+
+    assert primary_paths
+    assert all(path.startswith("editor/tiny/plugins/premium/") for path in primary_paths)
+    assert secondary_paths[0].startswith("editor/tiny/plugins/premium/")

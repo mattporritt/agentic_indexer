@@ -47,7 +47,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
-from moodle_indexer.components import resolve_classname_to_file_path, resolve_framework_class_to_file_path
+from moodle_indexer.components import (
+    component_root_from_name,
+    infer_component,
+    resolve_classname_to_file_path,
+    resolve_framework_class_to_file_path,
+)
 from moodle_indexer.errors import ValidationError
 from moodle_indexer.js_modules import JsModuleResolution, resolve_js_module
 from moodle_indexer.paths import normalize_relative_lookup_path
@@ -114,6 +119,15 @@ class SemanticChunk:
     summary: str
     text: str
     snippet: str | None = None
+
+
+@dataclass(slots=True)
+class SemanticQueryAnchor:
+    """Explicit component or path anchors extracted from a free-text query."""
+
+    component_names: list[str]
+    component_roots: list[str]
+    path_prefixes: list[str]
 
 
 def find_symbol(connection: sqlite3.Connection, symbol_name: str) -> dict:
@@ -2451,13 +2465,23 @@ def _semantic_context_for_query(
     query_terms = _semantic_tokens(query_text)
     query_tokens = _semantic_focus_tokens(query_text)
     query_intent = _semantic_query_intent(query_terms)
+    query_anchor = _semantic_query_anchor(query_text, query_terms)
     candidates = _collect_matching_semantic_chunks(connection, query_tokens, language=None, limit=80)
+    candidates.extend(
+        _collect_anchored_semantic_chunks(
+            connection,
+            query_anchor=query_anchor,
+            language=None,
+            limit=80,
+        )
+    )
     ranked = _semantic_rank_query_candidates(
         connection,
         query_text,
         query_tokens,
         query_terms,
         query_intent,
+        query_anchor,
         candidates,
         limit=limit * 2,
     )
@@ -2709,6 +2733,7 @@ def _semantic_rank_query_candidates(
     query_tokens: list[str],
     query_terms: list[str],
     query_intent: dict[str, bool],
+    query_anchor: SemanticQueryAnchor,
     candidates: list[SemanticChunk],
     *,
     limit: int,
@@ -2730,6 +2755,7 @@ def _semantic_rank_query_candidates(
         )
         score = _semantic_soft_score(raw_score, cap=0.9)
         score *= _semantic_query_intent_multiplier(query_intent, chunk)
+        score *= _semantic_query_anchor_multiplier(query_anchor, chunk, query_intent)
         pair_meta = _semantic_query_pair_metadata(connection, chunk, candidate_paths)
         score += _semantic_query_pair_bonus(query_intent, chunk, pair_meta)
         score = round(min(0.9, score), 3)
@@ -3311,6 +3337,39 @@ def _collect_matching_semantic_chunks(
     chunks.extend(_semantic_test_chunks_for_tokens(connection, query_tokens, language=language, limit=max(10, limit // 3)))
     chunks.extend(_semantic_service_chunks_for_tokens(connection, query_tokens, limit=max(10, limit // 4)))
     chunks.extend(_semantic_file_chunks_for_tokens(connection, query_tokens, language=language, limit=max(10, limit // 3)))
+    return chunks
+
+
+def _collect_anchored_semantic_chunks(
+    connection: sqlite3.Connection,
+    *,
+    query_anchor: SemanticQueryAnchor,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Collect a bounded anchor-local candidate pool for explicit query anchors."""
+
+    if not query_anchor.component_names and not query_anchor.path_prefixes:
+        return []
+
+    chunks: list[SemanticChunk] = []
+    for component_name in query_anchor.component_names:
+        chunks.extend(
+            _collect_component_semantic_chunks(
+                connection,
+                component_name=component_name,
+                language=language,
+                limit=max(10, limit // 2),
+            )
+        )
+    chunks.extend(
+        _semantic_file_chunks_for_prefixes(
+            connection,
+            query_anchor.path_prefixes,
+            language=language,
+            limit=max(12, limit // 2),
+        )
+    )
     return chunks
 
 
@@ -3903,6 +3962,65 @@ def _semantic_file_chunks_for_tokens(
     return [_semantic_chunk_from_file_row(connection, row) for row in ranked_rows[:limit]]
 
 
+def _semantic_file_chunks_for_prefixes(
+    connection: sqlite3.Connection,
+    path_prefixes: list[str],
+    *,
+    language: str | None,
+    limit: int,
+) -> list[SemanticChunk]:
+    """Return file-level fallback chunks for explicit path-prefix anchors."""
+
+    normalized_prefixes = [prefix.rstrip("/") for prefix in path_prefixes if prefix]
+    if not normalized_prefixes:
+        return []
+
+    clauses: list[str] = []
+    params: list[object] = []
+    for prefix in normalized_prefixes:
+        pattern = f"{prefix}%"
+        clauses.append("(f.moodle_path LIKE ? OR f.repository_relative_path LIKE ?)")
+        params.extend([pattern, pattern])
+
+    extension_clause = ""
+    if language == "js":
+        extension_clause = "AND f.extension = '.js'"
+    elif language == "php":
+        extension_clause = "AND f.extension = '.php'"
+    elif language == "template":
+        extension_clause = "AND f.extension = '.mustache'"
+    elif language == "scss":
+        extension_clause = "AND f.extension = '.scss'"
+
+    fetch_limit = max(limit * 4, 24)
+    rows = connection.execute(
+        f"""
+        SELECT
+            f.id,
+            f.moodle_path,
+            f.repository_relative_path,
+            f.file_role,
+            f.absolute_path,
+            c.name AS component_name
+        FROM files f
+        JOIN components c ON c.id = f.component_id
+        WHERE ({' OR '.join(clauses)})
+          {extension_clause}
+        ORDER BY f.moodle_path
+        LIMIT ?
+        """,
+        (*params, fetch_limit),
+    ).fetchall()
+    ranked_rows = sorted(
+        rows,
+        key=lambda row: (
+            -_semantic_file_row_prefix_score(row, normalized_prefixes),
+            str(row["moodle_path"]),
+        ),
+    )
+    return [_semantic_chunk_from_file_row(connection, row) for row in ranked_rows[:limit]]
+
+
 def _semantic_file_row_token_score(row: sqlite3.Row, query_tokens: list[str]) -> int:
     """Return a simple lexical priority score for one file-level fallback row."""
 
@@ -3917,6 +4035,24 @@ def _semantic_file_row_token_score(row: sqlite3.Row, query_tokens: list[str]) ->
             score += 2
         if token in component:
             score += 1
+    return score
+
+
+def _semantic_file_row_prefix_score(row: sqlite3.Row, path_prefixes: list[str]) -> int:
+    """Return a priority score for explicit path-prefix anchors."""
+
+    moodle_path = str(row["moodle_path"]).lower()
+    repository_relative_path = str(row["repository_relative_path"]).lower()
+    file_role = str(row["file_role"]).lower()
+    score = 0
+    for prefix in path_prefixes:
+        normalized = prefix.lower().rstrip("/")
+        if moodle_path.startswith(normalized) or repository_relative_path.startswith(normalized):
+            score += max(1, len(normalized.split("/"))) * 3
+        elif normalized in moodle_path or normalized in repository_relative_path:
+            score += max(1, len(normalized.split("/")))
+    if file_role in {"template_file", "scss_source", "amd_source", "access_definition", "lang_file", "version_file", "phpunit_test", "behat_feature"}:
+        score += 1
     return score
 
 
@@ -4169,6 +4305,107 @@ def _semantic_like_clause(columns: list[str], query_tokens: list[str]) -> tuple[
             clauses.append(f"lower({column}) LIKE ?")
             params.append(pattern)
     return " OR ".join(clauses), params
+
+
+def _semantic_query_anchor(query_text: str, query_terms: list[str]) -> SemanticQueryAnchor:
+    """Return explicit component and subtree anchors extracted from query text."""
+
+    component_names: list[str] = []
+    component_roots: list[str] = []
+    seen_components: set[str] = set()
+    for token in query_terms:
+        component_root = component_root_from_name(token)
+        if component_root is None or token in seen_components:
+            continue
+        seen_components.add(token)
+        component_names.append(token)
+        component_roots.append(component_root)
+
+    path_prefixes = _semantic_query_path_prefixes(query_text)
+    for prefix in path_prefixes:
+        if prefix.startswith("lib/") and prefix.count("/") >= 2:
+            candidate = prefix.removeprefix("lib/")
+            inferred = infer_component(candidate)
+        else:
+            inferred = infer_component(prefix)
+        if inferred.name not in seen_components:
+            seen_components.add(inferred.name)
+            component_names.append(inferred.name)
+        if inferred.root_path not in component_roots:
+            component_roots.append(inferred.root_path)
+
+    return SemanticQueryAnchor(
+        component_names=component_names,
+        component_roots=component_roots,
+        path_prefixes=path_prefixes,
+    )
+
+
+def _semantic_query_path_prefixes(query_text: str) -> list[str]:
+    """Return normalized Moodle-like path prefixes explicitly present in query text."""
+
+    raw_matches = re.findall(r"(?:[A-Za-z0-9_.-]+/){1,}[A-Za-z0-9_.-]+", query_text)
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    for raw_match in raw_matches:
+        normalized = raw_match.strip().strip("'\"`()[]{}<>,.;:!?").strip("/")
+        if not normalized:
+            continue
+        variants = [normalized]
+        if normalized.startswith("./"):
+            variants.append(normalized.removeprefix("./"))
+        if normalized.startswith("public/"):
+            variants.append(normalized.removeprefix("public/"))
+        if normalized.startswith("lib/") and normalized.count("/") >= 2:
+            variants.append(normalized.removeprefix("lib/"))
+        for variant in variants:
+            cleaned = variant.strip("/")
+            if not cleaned or cleaned in seen or not _looks_like_moodle_query_path(cleaned):
+                continue
+            seen.add(cleaned)
+            prefixes.append(cleaned)
+    return prefixes
+
+
+def _looks_like_moodle_query_path(path: str) -> bool:
+    """Return whether one explicit query fragment looks like a Moodle path anchor."""
+
+    parts = [part for part in path.lower().split("/") if part]
+    if len(parts) < 2:
+        return False
+    allowed_roots = {
+        "admin",
+        "ai",
+        "auth",
+        "availability",
+        "backup",
+        "badges",
+        "blocks",
+        "calendar",
+        "contentbank",
+        "course",
+        "editor",
+        "enrol",
+        "files",
+        "filter",
+        "grade",
+        "group",
+        "lib",
+        "local",
+        "media",
+        "message",
+        "mod",
+        "payment",
+        "plagiarism",
+        "portfolio",
+        "question",
+        "repository",
+        "report",
+        "tag",
+        "theme",
+        "user",
+    }
+    return parts[0] in allowed_roots or (parts[0] == "public" and len(parts) >= 3 and parts[1] in allowed_roots)
 
 
 def _semantic_focus_tokens(text: str) -> list[str]:
@@ -4588,6 +4825,40 @@ def _semantic_query_intent_multiplier(
     if intent["examples"] and chunk.source_kind in {"symbol", "service", "test"}:
         multiplier *= 1.05
     return multiplier
+
+
+def _semantic_query_anchor_multiplier(
+    query_anchor: SemanticQueryAnchor,
+    chunk: SemanticChunk,
+    query_intent: dict[str, bool],
+) -> float:
+    """Return a subtree-aware multiplier for explicit path or component anchors."""
+
+    if not query_anchor.path_prefixes and not query_anchor.component_roots:
+        return 1.0
+
+    if _semantic_chunk_matches_query_anchor(chunk, query_anchor):
+        multiplier = 1.18
+        if query_intent["exact_files"]:
+            multiplier *= 1.08
+        return multiplier
+
+    multiplier = 0.68 if query_anchor.path_prefixes else 0.82
+    if query_intent["tests"] and chunk.source_kind == "test":
+        multiplier *= 0.92
+    return multiplier
+
+
+def _semantic_chunk_matches_query_anchor(
+    chunk: SemanticChunk,
+    query_anchor: SemanticQueryAnchor,
+) -> bool:
+    """Return whether one semantic chunk matches the extracted query anchor."""
+
+    lowered_path = chunk.path.lower()
+    if any(lowered_path.startswith(prefix.lower().rstrip("/")) for prefix in query_anchor.path_prefixes):
+        return True
+    return any(_same_component_root(component_root, chunk.path) for component_root in query_anchor.component_roots)
 
 
 def _language_for_path(path: str) -> str:
@@ -5666,8 +5937,9 @@ def _plan_profile_for_file(context: dict[str, object]) -> dict[str, object]:
 def _plan_profile_for_query(query_text: str) -> dict[str, object]:
     """Return a lightweight planning profile for one free-text change goal."""
 
+    query_terms = _semantic_tokens(query_text)
     tokens = _semantic_focus_tokens(query_text)
-    intent = _semantic_query_intent(tokens)
+    intent = _semantic_query_intent(query_terms)
     return {
         "anchor_path": "",
         "anchor_symbol": None,
