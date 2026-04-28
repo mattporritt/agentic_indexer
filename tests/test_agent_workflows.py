@@ -18,6 +18,7 @@ from moodle_indexer.queries import (
     _plan_profile_for_query,
     _representative_service_pattern,
     _semantic_query_anchor,
+    _semantic_query_intent,
     _semantic_tokens,
     assess_test_impact,
     build_context_bundle,
@@ -278,6 +279,14 @@ def test_semantic_query_anchor_infers_boost_and_tiny_premium_prefixes() -> None:
     assert "editor/tiny/plugins/premium" in tiny_anchor.path_prefixes
 
 
+def test_semantic_query_intent_does_not_treat_tiny_premium_pattern_contrast_as_external_api() -> None:
+    query = "MDL-88547: show existing tiny_premium plugins that are enablement-only and explain the pattern to follow for adding another one. Include the relevant files and the differences between enablement-only plugins and server-side-service plugins."
+    intent = _semantic_query_intent(_semantic_tokens(query))
+
+    assert intent["examples"] is True
+    assert intent["external_api"] is False
+
+
 def test_build_context_bundle_free_text_boost_login_query_surfaces_exact_files(classic_connection) -> None:
     bundle = build_context_bundle(
         classic_connection,
@@ -352,6 +361,39 @@ def test_build_context_bundle_free_text_tiny_premium_query_surfaces_exact_wiring
     assert "editor/tiny/plugins/premium/db/access.php" in primary_paths[:4]
     assert "editor/tiny/plugins/premium/lang/en/tiny_premium.php" in primary_paths[:4]
     assert "editor/tiny/plugins/premium/amd/src/configuration.js" in primary_paths[:4]
+
+
+def test_build_context_bundle_tiny_premium_pattern_query_prefers_local_pattern_and_contrast(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        query_text="MDL-88547: locate the closest matching existing implementation pattern for a new tiny_premium markdown plugin, plus one useful contrast example.",
+    )
+
+    example_paths = [item["path"] for item in bundle["example_patterns"]]
+    candidate_paths = [item["path"] for item in bundle.get("pattern_candidates", [])]
+    contrast_notes = [item.get("contrast_notes") for item in bundle.get("pattern_candidates", []) if item.get("contrast_notes")]
+
+    assert candidate_paths
+    assert candidate_paths[0] == "editor/tiny/plugins/premium/amd/src/configuration.js"
+    assert "editor/tiny/plugins/premium/db/services.php" in candidate_paths or "editor/tiny/plugins/premium/classes/form/tiny_premium_settings_form.php" in candidate_paths
+    assert "editor/tiny/plugins/premium/amd/src/configuration.js" in example_paths
+    assert not any(path.startswith("mod/assign/") for path in example_paths)
+    assert contrast_notes
+
+
+def test_build_context_bundle_external_api_pattern_query_keeps_canonical_service_pattern(classic_connection) -> None:
+    bundle = build_context_bundle(
+        classic_connection,
+        query_text="show a Moodle external API pattern with service registration and PHPUnit coverage",
+    )
+
+    example_paths = [item["path"] for item in bundle["example_patterns"]]
+
+    assert example_paths[:3] == [
+        "mod/assign/classes/external/remove_submission.php",
+        "mod/assign/db/services.php",
+        "mod/assign/tests/external/remove_submission_test.php",
+    ]
 
 
 def test_semantic_context_explicit_theme_boost_anchor_keeps_top_hits_in_subtree(classic_connection) -> None:

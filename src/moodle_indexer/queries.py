@@ -1683,6 +1683,7 @@ def _synthesize_context_bundle(
         primary_context = _bundle_seed_query_pattern(
             primary_context,
             semantic_lookup,
+            query_intent=query_intent,
             test_impact=test_impact,
             guardrails=guardrails,
             seen_paths=seen_paths,
@@ -1724,6 +1725,7 @@ def _synthesize_context_bundle(
         supporting_context = _bundle_seed_query_pattern(
             supporting_context,
             semantic_lookup,
+            query_intent=query_intent,
             test_impact=test_impact,
             guardrails=guardrails,
             seen_paths=seen_paths,
@@ -1761,12 +1763,25 @@ def _synthesize_context_bundle(
         semantic_lookup=semantic_lookup,
         limit=min(4, limit),
     )
-    example_patterns = _bundle_example_patterns(
+    pattern_candidates = _bundle_pattern_candidates(
+        query=query,
         query_kind=query_kind,
         semantic=semantic,
+        semantic_lookup=semantic_lookup,
+        query_intent=query_intent,
+        test_impact=test_impact,
+        guardrails=guardrails,
+        limit=min(3, limit),
+    )
+    example_patterns = _bundle_example_patterns(
+        query=query,
+        query_kind=query_kind,
+        semantic=semantic,
+        query_intent=query_intent,
         test_impact=test_impact,
         guardrails=guardrails,
         semantic_lookup=semantic_lookup,
+        pattern_candidates=pattern_candidates,
         limit=min(3, limit),
     )
     recommended_reading_order = _bundle_recommended_reading_order(plan, limit=min(5, limit))
@@ -1800,6 +1815,7 @@ def _synthesize_context_bundle(
         "optional_context": optional_context,
         "tests_to_consider": tests_to_consider,
         "guardrails": guardrail_payload,
+        "pattern_candidates": pattern_candidates,
         "example_patterns": example_patterns,
         "recommended_reading_order": recommended_reading_order,
         "recommended_next_actions": recommended_next_actions,
@@ -1848,6 +1864,7 @@ def _bundle_seed_query_pattern(
     items: list[dict[str, object]],
     semantic_lookup: dict[tuple[str, str], dict[str, object]],
     *,
+    query_intent: dict[str, object],
     test_impact: dict[str, object],
     guardrails: dict[str, object],
     seen_paths: set[str],
@@ -1855,6 +1872,8 @@ def _bundle_seed_query_pattern(
 ) -> list[dict[str, object]]:
     """Insert the canonical service pattern into free-text bundles when available."""
 
+    if not bool(query_intent.get("external_api")):
+        return list(items)[:limit]
     seeded = list(items)
     for candidate in _bundle_canonical_query_pattern(test_impact, guardrails):
         path = str(candidate.get("path") or "")
@@ -2531,19 +2550,30 @@ def _bundle_query_test_reason(path: str, file_role: str, query_tokens: list[str]
 
 def _bundle_example_patterns(
     *,
+    query: str,
     query_kind: str,
     semantic: dict[str, object],
+    query_intent: dict[str, object],
     test_impact: dict[str, object],
     guardrails: dict[str, object],
     semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    pattern_candidates: list[dict[str, object]],
     limit: int,
 ) -> list[dict[str, object]]:
     """Return bounded example/reference items for a context bundle."""
 
     examples: list[dict[str, object]] = []
     seen_paths: set[str] = set()
+    for item in pattern_candidates:
+        path = str(item.get("path") or "")
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        examples.append(_bundle_context_item(item, semantic_lookup))
+        if len(examples) >= limit:
+            return examples
     if query_kind == "query":
-        for item in _bundle_canonical_query_pattern(test_impact, guardrails):
+        for item in _bundle_canonical_query_pattern(test_impact, guardrails) if bool(query_intent.get("external_api")) else []:
             path = str(item.get("path") or "")
             if not path or path in seen_paths:
                 continue
@@ -2567,10 +2597,161 @@ def _bundle_example_patterns(
                 },
                 semantic_lookup,
             )
-        )
+            )
         if len(examples) >= limit:
             break
     return examples
+
+
+def _bundle_pattern_candidates(
+    *,
+    query: str | None,
+    query_kind: str,
+    semantic: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    query_intent: dict[str, object],
+    test_impact: dict[str, object],
+    guardrails: dict[str, object],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return structured closest-pattern candidates for free-text discovery queries."""
+
+    if query_kind != "query":
+        return []
+
+    query_text = str(query or "")
+    query_tokens = list(query_intent.get("query_tokens", ()))
+    token_set = set(query_tokens)
+    wants_pattern = bool(query_intent.get("examples")) or bool({"pattern", "patterns", "mirror", "closest"} & token_set)
+    wants_contrast = bool({"contrast", "differences", "difference", "versus", "vs"} & token_set)
+
+    if not (wants_pattern or wants_contrast):
+        return []
+
+    if {"tiny", "premium"} <= token_set:
+        return _bundle_tiny_premium_pattern_candidates(
+            query_text=query_text,
+            semantic=semantic,
+            semantic_lookup=semantic_lookup,
+            wants_contrast=wants_contrast,
+            limit=limit,
+        )
+
+    if bool(query_intent.get("external_api")):
+        candidates: list[dict[str, object]] = []
+        for item in _bundle_canonical_query_pattern(test_impact, guardrails):
+            candidate = dict(item)
+            path = str(candidate.get("path") or "")
+            candidate["pattern_label"] = path.rsplit("/", 1)[-1] if path else "pattern"
+            candidate["why_similar"] = "Canonical Moodle external API implementation pattern with paired registration and PHPUnit coverage."
+            candidate["contrast_notes"] = None
+            candidates.append(candidate)
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    return []
+
+
+def _bundle_tiny_premium_pattern_candidates(
+    *,
+    query_text: str,
+    semantic: dict[str, object],
+    semantic_lookup: dict[tuple[str, str], dict[str, object]],
+    wants_contrast: bool,
+    limit: int,
+) -> list[dict[str, object]]:
+    """Return deterministic pattern candidates for tiny_premium family queries."""
+
+    del semantic_lookup
+    path_map: dict[str, dict[str, object]] = {}
+    ordered_paths: list[str] = []
+    valid_roots = (
+        "editor/tiny/plugins/premium/",
+        "lib/editor/tiny/plugins/premium/",
+    )
+    for bucket in ("primary_semantic_context", "secondary_semantic_context"):
+        for item in list(semantic.get(bucket, [])):
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "")
+            if not path or path in path_map or not path.startswith(valid_roots):
+                continue
+            path_map[path] = item
+            ordered_paths.append(path)
+
+    preferred_suffixes = [
+        "/amd/src/configuration.js",
+        "/db/access.php",
+        "/settings.php",
+        "/lang/en/tiny_premium.php",
+        "/version.php",
+    ]
+    contrast_suffixes = [
+        "/db/services.php",
+        "/classes/external/get_api_key.php",
+        "/classes/form/tiny_premium_settings_form.php",
+    ]
+
+    candidates: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def resolve_suffix(suffix: str) -> str | None:
+        for path in ordered_paths:
+            if path.endswith(suffix):
+                return path
+        return None
+
+    def add_candidate(path: str | None, *, why_similar: str, contrast_notes: str | None) -> None:
+        if not path:
+            return
+        if path in seen:
+            return
+        item = path_map.get(path)
+        if item is None:
+            return
+        seen.add(path)
+        candidates.append(
+            {
+                "path": path,
+                "symbol": item.get("symbol"),
+                "change_role": "example_reference",
+                "confidence": item.get("confidence", "high"),
+                "reason": f"File matched the free-text query '{query_text}'; inspect it if you need a concrete code example or local implementation context.",
+                "pattern_label": path.rsplit("/", 1)[-1],
+                "why_similar": why_similar,
+                "contrast_notes": contrast_notes,
+            }
+        )
+
+    for suffix in preferred_suffixes:
+        add_candidate(
+            resolve_suffix(suffix),
+            why_similar="Same tiny_premium registration and enablement surface used to add premium plugins without a separate Moodle-side service contract.",
+            contrast_notes=None,
+        )
+        if len(candidates) >= max(1, limit - (1 if wants_contrast else 0)):
+            break
+
+    if wants_contrast:
+        for suffix in contrast_suffixes:
+            add_candidate(
+                resolve_suffix(suffix),
+                why_similar="Useful contrast inside the same tiny_premium family when a plugin needs server-side wiring or settings support.",
+                contrast_notes="Contrast candidate: service-backed or server-assisted premium plugins rely on service registration, external API helpers, or extra settings scaffolding beyond simple enablement.",
+            )
+            if len(candidates) >= limit:
+                break
+
+    if not candidates:
+        for path in ordered_paths[:limit]:
+            add_candidate(
+                path,
+                why_similar="Closest same-family tiny_premium implementation artifact found in the anchored subtree.",
+                contrast_notes=None,
+            )
+
+    return candidates[:limit]
 
 
 def _bundle_recommended_reading_order(plan: dict[str, object], *, limit: int) -> list[dict[str, object]]:
@@ -5271,8 +5452,15 @@ def _semantic_query_intent(query_tokens: list[str]) -> dict[str, bool]:
     """Return a small intent profile for bounded free-text ranking."""
 
     token_set = set(query_tokens)
+    tiny_premium_pattern_query = (
+        {"tiny", "premium"} <= token_set
+        and bool({"pattern", "patterns", "example", "examples", "contrast", "difference", "differences"} & token_set)
+    )
+    external_api = bool({"external", "api", "webservice", "webservices"} & token_set)
+    if not external_api and ("service" in token_set or "services" in token_set):
+        external_api = not tiny_premium_pattern_query
     return {
-        "external_api": bool({"external", "api", "service", "services", "webservice", "webservices"} & token_set),
+        "external_api": external_api,
         "tests": bool({"test", "tests", "phpunit", "coverage"} & token_set),
         "examples": bool({"examples", "example", "similar", "pattern"} & token_set),
         "rendering": bool({"rendering", "renderer", "template", "output"} & token_set),
