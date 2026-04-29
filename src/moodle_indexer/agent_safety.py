@@ -26,6 +26,36 @@ import sqlite3
 from pathlib import Path
 
 
+def _profile_flag(profile: dict[str, object], key: str) -> bool:
+    """Return one boolean profile flag using the module's loose profile shape."""
+
+    return bool(profile.get(key))
+
+
+def _anchor_type(profile: dict[str, object]) -> str:
+    """Return the normalized anchor type for one synthesized safety profile."""
+
+    return str(profile.get("anchor_type") or "")
+
+
+def _anchor_label(profile: dict[str, object]) -> str:
+    """Return the best human-readable anchor label for synthesized guidance."""
+
+    return str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
+
+
+def _representative_pattern(profile: dict[str, object]) -> dict[str, object]:
+    """Return the representative pattern mapping attached to one profile."""
+
+    return dict(profile.get("representative_pattern") or {})
+
+
+def _is_free_text_service_profile(profile: dict[str, object]) -> bool:
+    """Return whether this profile represents an unanchored service-style goal."""
+
+    return _profile_flag(profile, "service") and _anchor_type(profile) == "query"
+
+
 def _normalize_php_symbol_name(name: str | None) -> str:
     """Return a normalized PHP symbol name for simple equality checks."""
 
@@ -336,8 +366,8 @@ def _collect_test_impact_tests(
         sources = [plan.get("validation_impact", []), plan.get("likely_edits", []), plan.get("optional_edits", [])]
 
     items: list[dict[str, object]] = []
-    representative_pattern = dict(profile.get("representative_pattern") or {})
-    if bucket == "direct" and bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
+    representative_pattern = _representative_pattern(profile)
+    if bucket == "direct" and _is_free_text_service_profile(profile):
         test_path = str(representative_pattern.get("test_path") or "")
         if test_path:
             items.append(
@@ -378,7 +408,7 @@ def _collect_environment_steps(
 
     items: list[dict[str, object]] = []
     seen_paths: set[str] = set()
-    if bool(profile.get("js")):
+    if _profile_flag(profile, "js"):
         for item in _plan_items(plan):
             path = str(item.get("path") or "")
             if "/amd/build/" not in path or path in seen_paths:
@@ -404,11 +434,10 @@ def _collect_contract_checks(
     """Return bounded contract or schema checks implied by the current slice."""
 
     items: list[dict[str, object]] = []
-    anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
-    anchor_type = str(profile.get("anchor_type") or "")
-    representative_pattern = dict(profile.get("representative_pattern") or {})
+    anchor_label = _anchor_label(profile)
+    representative_pattern = _representative_pattern(profile)
     representative_service_added = False
-    if bool(profile.get("service")) and anchor_type == "query":
+    if _is_free_text_service_profile(profile):
         items.append(
             _safety_item(
                 confidence="high",
@@ -439,7 +468,7 @@ def _collect_contract_checks(
     for item in _plan_items(plan):
         path = str(item.get("path") or "")
         if path.endswith("/db/services.php"):
-            if bool(profile.get("service")) and anchor_type == "query" and representative_service_added:
+            if _is_free_text_service_profile(profile) and representative_service_added:
                 continue
             items.append(
                 _safety_item(
@@ -447,12 +476,12 @@ def _collect_contract_checks(
                     symbol=_none_if_empty(item.get("symbol")),
                     confidence=str(item.get("confidence") or "high"),
                     reason=f"Review the web-service registration for {anchor_label}; API parameter or return-shape changes often require entrypoint/schema updates here.",
-                    priority=1 if bool(profile.get("service")) else 10,
+                    priority=1 if _profile_flag(profile, "service") else 10,
                 )
             )
-            if bool(profile.get("service")) and anchor_type == "query":
+            if _is_free_text_service_profile(profile):
                 representative_service_added = True
-        elif path.endswith("/renderer.php") and bool(profile.get("rendering")) and not bool(profile.get("service")):
+        elif path.endswith("/renderer.php") and _profile_flag(profile, "rendering") and not _profile_flag(profile, "service"):
             items.append(
                 _safety_item(
                     path=path,
@@ -462,7 +491,7 @@ def _collect_contract_checks(
                     priority=12,
                 )
             )
-        elif path.endswith(".mustache") and bool(profile.get("rendering")) and not bool(profile.get("service")):
+        elif path.endswith(".mustache") and _profile_flag(profile, "rendering") and not _profile_flag(profile, "service"):
             items.append(
                 _safety_item(
                     path=path,
@@ -472,7 +501,7 @@ def _collect_contract_checks(
                     priority=13,
                 )
             )
-        elif (path.endswith("/action_settings_form.php") or path.endswith("/action_form.php")) and bool(profile.get("provider_form")):
+        elif (path.endswith("/action_settings_form.php") or path.endswith("/action_form.php")) and _profile_flag(profile, "provider_form"):
             items.append(
                 _safety_item(
                     path=path,
@@ -494,9 +523,9 @@ def _collect_manual_review_points(
     """Return bounded manual review points that are not concrete tests."""
 
     items: list[dict[str, object]] = []
-    anchor_label = str(profile.get("anchor_symbol") or profile.get("anchor_path") or "this change")
-    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
-        representative_pattern = dict(profile.get("representative_pattern") or {})
+    anchor_label = _anchor_label(profile)
+    if _is_free_text_service_profile(profile):
+        representative_pattern = _representative_pattern(profile)
         if representative_pattern.get("implementation_path"):
             items.append(
                 _safety_item(
@@ -526,7 +555,7 @@ def _collect_manual_review_points(
                         priority=0,
                     )
                 )
-    if bool(profile.get("service")):
+    if _profile_flag(profile, "service"):
         items.append(
             _safety_item(
                 confidence="high",
@@ -534,7 +563,7 @@ def _collect_manual_review_points(
                 priority=1,
             )
         )
-    if bool(profile.get("rendering")) and not bool(profile.get("service")):
+    if _profile_flag(profile, "rendering") and not _profile_flag(profile, "service"):
         items.append(
             _safety_item(
                 confidence="high",
@@ -542,7 +571,7 @@ def _collect_manual_review_points(
                 priority=1,
             )
         )
-    if bool(profile.get("provider_form")):
+    if _profile_flag(profile, "provider_form"):
         items.append(
             _safety_item(
                 confidence="medium",
@@ -550,7 +579,7 @@ def _collect_manual_review_points(
                 priority=2,
             )
         )
-    if bool(profile.get("js")):
+    if _profile_flag(profile, "js"):
         items.append(
             _safety_item(
                 confidence="medium",
@@ -570,18 +599,17 @@ def _classify_change_risk(
 
     direct_tests = list(test_impact.get("direct_tests", []))
     anchor_path = str(profile.get("anchor_path") or "")
-    anchor_type = str(profile.get("anchor_type") or "")
-    if bool(profile.get("service")) and anchor_type == "query":
+    if _is_free_text_service_profile(profile):
         return {
             "level": "high",
             "reason": "High risk because this free-text goal implies an external API contract change without one fixed implementation anchor; service registration and compatibility checks need extra care.",
         }
-    if bool(profile.get("rendering")) and (anchor_path.endswith("/locallib.php") or anchor_path.endswith("/lib.php")):
+    if _profile_flag(profile, "rendering") and (anchor_path.endswith("/locallib.php") or anchor_path.endswith("/lib.php")):
         return {
             "level": "high",
             "reason": "High risk because this change touches a broad rendering-oriented legacy entrypoint with renderer/template companions and a wider blast radius.",
         }
-    if bool(profile.get("service")):
+    if _profile_flag(profile, "service"):
         if direct_tests:
             return {
                 "level": "medium",
@@ -591,12 +619,12 @@ def _classify_change_risk(
             "level": "high",
             "reason": "High risk because this change affects an external API surface without strong direct automated coverage in the current bounded context.",
         }
-    if bool(profile.get("provider_form")):
+    if _profile_flag(profile, "provider_form"):
         return {
             "level": "medium",
             "reason": "Medium risk because provider settings changes can affect concrete forms and inherited base contracts even when the slice is structurally well-bounded.",
         }
-    if bool(profile.get("js")):
+    if _profile_flag(profile, "js"):
         return {
             "level": "medium",
             "reason": "Medium risk because source-module changes can affect imports, superclass behavior, and generated build artifacts.",
@@ -619,9 +647,9 @@ def _collect_pre_edit_checks(
     items: list[dict[str, object]] = []
     required = list(plan.get("required_edits", []))
     likely = list(plan.get("likely_edits", []))
-    representative_pattern = dict(profile.get("representative_pattern") or {})
+    representative_pattern = _representative_pattern(profile)
     implementation = next((item for item in required if str(item.get("change_role")) == "implementation"), None)
-    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query" and representative_pattern.get("implementation_path"):
+    if _is_free_text_service_profile(profile) and representative_pattern.get("implementation_path"):
         implementation = {
             "path": str(representative_pattern["implementation_path"]),
             "symbol": representative_pattern.get("implementation_symbol"),
@@ -637,7 +665,7 @@ def _collect_pre_edit_checks(
                 priority=0,
             )
         )
-    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
+    if _is_free_text_service_profile(profile):
         items.append(
             _safety_item(
                 confidence="high",
@@ -665,7 +693,7 @@ def _collect_pre_edit_checks(
                 priority=2,
             )
         )
-    if bool(profile.get("service")):
+    if _profile_flag(profile, "service"):
         entrypoint = next((item for item in required + likely if str(item.get("change_role")) == "entrypoint"), None)
         if entrypoint is not None:
             items.append(
@@ -677,7 +705,7 @@ def _collect_pre_edit_checks(
                     priority=1,
                 )
             )
-    if bool(profile.get("rendering")) and not bool(profile.get("service")):
+    if _profile_flag(profile, "rendering") and not _profile_flag(profile, "service"):
         usage_files = list(profile.get("usage_files") or [])
         usage_file = next((path for path in usage_files if _same_component_root(str(profile.get("anchor_path") or ""), path)), None)
         if usage_file is not None:
@@ -700,7 +728,7 @@ def _collect_pre_edit_checks(
                     priority=2,
                 )
             )
-    if bool(profile.get("provider_form")):
+    if _profile_flag(profile, "provider_form"):
         companion = next((item for item in required + likely if str(item.get("change_role")) == "form_companion"), None)
         if companion is not None:
             items.append(
@@ -712,7 +740,7 @@ def _collect_pre_edit_checks(
                     priority=1,
                 )
             )
-    if bool(profile.get("js")):
+    if _profile_flag(profile, "js"):
         companion = next((item for item in required + likely if str(item.get("path", "")).startswith("lib/amd/") or "/amd/src/" in str(item.get("path", ""))), None)
         if companion is not None and str(companion.get("path")) != str(implementation.get("path") if implementation else ""):
             items.append(
@@ -738,10 +766,8 @@ def _collect_post_edit_checks(
 
     items: list[dict[str, object]] = []
     items.extend(list(test_impact.get("direct_tests", [])))
-    if bool(profile.get("service")) and str(profile.get("anchor_type") or "") == "query":
-        representative_component_root = str(
-            dict(profile.get("representative_pattern") or {}).get("component_root") or ""
-        )
+    if _is_free_text_service_profile(profile):
+        representative_component_root = str(_representative_pattern(profile).get("component_root") or "")
         seen_paths = {
             str(item.get("path") or "")
             for item in items
@@ -766,7 +792,7 @@ def _collect_post_edit_checks(
             seen_paths.add(candidate)
         items.extend(list(test_impact.get("likely_tests", []))[:2])
     items.extend(list(test_impact.get("environment_steps", [])))
-    if bool(profile.get("service")):
+    if _profile_flag(profile, "service"):
         for item in test_impact.get("contract_checks", []):
             path = str(item.get("path") or "")
             if path.endswith("/db/services.php"):
@@ -779,7 +805,7 @@ def _collect_post_edit_checks(
                     )
                 )
                 break
-    if bool(profile.get("rendering")):
+    if _profile_flag(profile, "rendering"):
         items.append(
             _safety_item(
                 confidence="medium",
@@ -798,14 +824,14 @@ def _collect_do_not_assume(
     """Return bounded assumptions an agent should avoid making."""
 
     items: list[dict[str, object]] = []
-    if bool(profile.get("service")):
+    if _profile_flag(profile, "service"):
         items.append(_safety_item(confidence="high", reason="Do not assume service registration updates itself when external API parameters or return structures change."))
         items.append(_safety_item(confidence="medium", reason="Do not assume one direct PHPUnit file covers every external API compatibility edge around this service."))
-    if bool(profile.get("rendering")) and not bool(profile.get("service")):
+    if _profile_flag(profile, "rendering") and not _profile_flag(profile, "service"):
         items.append(_safety_item(confidence="high", reason="Do not assume template impact is absent just because the change starts in PHP; rendering contracts often span output classes, renderers, and Mustache templates."))
-    if bool(profile.get("provider_form")):
+    if _profile_flag(profile, "provider_form"):
         items.append(_safety_item(confidence="medium", reason="Do not assume shared form bases inherit provider-field changes safely without reviewing defaults and validation rules."))
-    if bool(profile.get("js")):
+    if _profile_flag(profile, "js"):
         items.append(_safety_item(confidence="medium", reason="Do not assume generated AMD build artifacts or dependent imports stay correct without verification after source changes."))
     return _dedupe_safety_items(items, limit=limit)
 
@@ -819,13 +845,13 @@ def _collect_watch_points(
     """Return bounded watch-points that deserve extra care while editing."""
 
     items: list[dict[str, object]] = []
-    if bool(profile.get("service")):
+    if _profile_flag(profile, "service"):
         items.append(_safety_item(confidence="high", reason="Watch backwards-compatibility and consumer expectations if external API parameters, warnings, or return structures change."))
-    if bool(profile.get("rendering")) and not bool(profile.get("service")):
+    if _profile_flag(profile, "rendering") and not _profile_flag(profile, "service"):
         items.append(_safety_item(confidence="high", reason="Watch the blast radius of large legacy rendering entrypoints; related output classes and templates may need coordinated updates."))
-    if bool(profile.get("provider_form")):
+    if _profile_flag(profile, "provider_form"):
         items.append(_safety_item(confidence="medium", reason="Watch for drift between concrete provider forms, shared form bases, and provider contract methods."))
-    if bool(profile.get("js")):
+    if _profile_flag(profile, "js"):
         items.append(_safety_item(confidence="medium", reason="Watch import and superclass regressions, especially when the workflow commits generated AMD build artifacts."))
     return _dedupe_safety_items(items, limit=limit)
 

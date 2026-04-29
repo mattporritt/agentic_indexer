@@ -23,6 +23,11 @@ from typing import Any
 
 RUNTIME_TOOL_NAME = "agentic_indexer"
 RUNTIME_VERSION = "v1"
+_COMMAND_RESPONSE_MODES = {
+    "find-definition": "definition_lookup",
+    "semantic-context": "semantic_context",
+    "build-context-bundle": "context_bundle",
+}
 
 
 @lru_cache(maxsize=1)
@@ -53,34 +58,10 @@ def build_runtime_contract(
 
     if command == "find-definition":
         results = _definition_contract_results(data)
-        intent = {
-            "command": command,
-            "query_kind": query_kind,
-            "response_mode": "definition_lookup",
-            "symbol_type_filter": symbol_type,
-            "include_usages": include_usages,
-            "limit": limit,
-        }
     elif command == "semantic-context":
         results = _semantic_contract_results(data)
-        intent = {
-            "command": command,
-            "query_kind": query_kind,
-            "response_mode": "semantic_context",
-            "symbol_type_filter": None,
-            "include_usages": None,
-            "limit": limit,
-        }
     elif command == "build-context-bundle":
         results = _context_bundle_contract_results(data)
-        intent = {
-            "command": command,
-            "query_kind": query_kind,
-            "response_mode": "context_bundle",
-            "symbol_type_filter": None,
-            "include_usages": None,
-            "limit": limit,
-        }
     else:
         raise ValueError(f"Unsupported runtime contract command: {command}")
 
@@ -89,7 +70,13 @@ def build_runtime_contract(
         "version": RUNTIME_VERSION,
         "query": query,
         "normalized_query": normalize_contract_query(query),
-        "intent": intent,
+        "intent": _runtime_contract_intent(
+            command=command,
+            query_kind=query_kind,
+            limit=limit,
+            symbol_type=symbol_type,
+            include_usages=include_usages,
+        ),
         "results": results,
     }
     return validate_runtime_contract(payload)
@@ -254,23 +241,9 @@ def _context_bundle_contract_results(data: dict[str, Any]) -> list[dict[str, Any
             "supporting_context": [_bundle_item_contract(item) for item in list(data.get("supporting_context", []))],
             "optional_context": [_bundle_item_contract(item) for item in list(data.get("optional_context", []))],
             "tests_to_consider": [_bundle_item_contract(item) for item in list(data.get("tests_to_consider", []))],
-            "guardrails": {
-                "change_risk": dict(data.get("guardrails", {}).get("change_risk") or {}),
-                "pre_edit_checks": [_bundle_nested_check(item) for item in list(data.get("guardrails", {}).get("pre_edit_checks", []))],
-                "post_edit_checks": [_bundle_nested_check(item) for item in list(data.get("guardrails", {}).get("post_edit_checks", []))],
-                "do_not_assume": [_bundle_nested_check(item) for item in list(data.get("guardrails", {}).get("do_not_assume", []))],
-                "watch_points": [_bundle_nested_check(item) for item in list(data.get("guardrails", {}).get("watch_points", []))],
-            },
+            "guardrails": _bundle_guardrails_contract(data),
             "example_patterns": [_bundle_item_contract(item) for item in list(data.get("example_patterns", []))],
-            "recommended_reading_order": [
-                {
-                    "id": _stable_id("reading_step", str(item.get("step") or ""), str(item.get("target") or "")),
-                    "step": item.get("step"),
-                    "target": item.get("target"),
-                    "why": item.get("why"),
-                }
-                for item in list(data.get("recommended_reading_order", []))
-            ],
+            "recommended_reading_order": _bundle_reading_order_contract(data),
             "recommended_next_actions": list(data.get("recommended_next_actions", [])),
             "bundle_stats": bundle_stats,
             "notes": list(data.get("notes", [])),
@@ -284,6 +257,55 @@ def _context_bundle_contract_results(data: dict[str, Any]) -> list[dict[str, Any
         },
     }
     return [result]
+
+
+def _runtime_contract_intent(
+    *,
+    command: str,
+    query_kind: str,
+    limit: int,
+    symbol_type: str | None,
+    include_usages: bool | None,
+) -> dict[str, Any]:
+    """Return the shared intent block for one runtime-contract command."""
+
+    if command not in _COMMAND_RESPONSE_MODES:
+        raise ValueError(f"Unsupported runtime contract command: {command}")
+    return {
+        "command": command,
+        "query_kind": query_kind,
+        "response_mode": _COMMAND_RESPONSE_MODES[command],
+        "symbol_type_filter": symbol_type if command == "find-definition" else None,
+        "include_usages": include_usages if command == "find-definition" else None,
+        "limit": limit,
+    }
+
+
+def _bundle_guardrails_contract(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the normalized nested guardrails block for a bundle result."""
+
+    guardrails = dict(data.get("guardrails") or {})
+    return {
+        "change_risk": dict(guardrails.get("change_risk") or {}),
+        "pre_edit_checks": [_bundle_nested_check(item) for item in list(guardrails.get("pre_edit_checks", []))],
+        "post_edit_checks": [_bundle_nested_check(item) for item in list(guardrails.get("post_edit_checks", []))],
+        "do_not_assume": [_bundle_nested_check(item) for item in list(guardrails.get("do_not_assume", []))],
+        "watch_points": [_bundle_nested_check(item) for item in list(guardrails.get("watch_points", []))],
+    }
+
+
+def _bundle_reading_order_contract(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return stable reading-order entries for a context bundle."""
+
+    return [
+        {
+            "id": _stable_id("reading_step", str(item.get("step") or ""), str(item.get("target") or "")),
+            "step": item.get("step"),
+            "target": item.get("target"),
+            "why": item.get("why"),
+        }
+        for item in list(data.get("recommended_reading_order", []))
+    ]
 
 
 def _bundle_anchor(anchor: Any) -> dict[str, Any] | None:

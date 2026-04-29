@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from moodle_indexer.agent_safety import (
+    _anchor_label,
+    _anchor_type,
+    _is_free_text_service_profile,
+    _profile_flag,
+    _representative_pattern,
+)
 from moodle_indexer.queries import (
     _bundle_query_test_candidate_score,
     _classify_change_risk,
@@ -29,6 +36,38 @@ from moodle_indexer.queries import (
 
 
 FREE_TEXT_EXTERNAL_API_QUERY = "add a parameter to a Moodle external API method and update its tests"
+
+
+def test_profile_helpers_normalize_common_safety_profile_access() -> None:
+    profile = {
+        "service": 1,
+        "rendering": "",
+        "anchor_type": "query",
+        "anchor_symbol": "mod_assign\\external\\start_submission::execute",
+        "representative_pattern": {"implementation_path": "mod/assign/classes/external/start_submission.php"},
+    }
+
+    assert _profile_flag(profile, "service") is True
+    assert _profile_flag(profile, "rendering") is False
+    assert _anchor_type(profile) == "query"
+    assert _anchor_label(profile) == "mod_assign\\external\\start_submission::execute"
+    assert _representative_pattern(profile) == {"implementation_path": "mod/assign/classes/external/start_submission.php"}
+    assert _is_free_text_service_profile(profile) is True
+
+
+def test_profile_helpers_keep_non_service_rendering_profiles_distinct() -> None:
+    profile = {
+        "rendering": True,
+        "service": False,
+        "anchor_type": "symbol",
+        "anchor_path": "mod/assign/locallib.php",
+    }
+
+    assert _profile_flag(profile, "rendering") is True
+    assert _anchor_type(profile) == "symbol"
+    assert _anchor_label(profile) == "mod/assign/locallib.php"
+    assert _representative_pattern(profile) == {}
+    assert _is_free_text_service_profile(profile) is False
 
 
 def test_representative_service_pattern_selects_canonical_mod_assign_example(classic_connection) -> None:
